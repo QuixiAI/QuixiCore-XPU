@@ -1,0 +1,50 @@
+# Local reference source mirrors.
+.reference/
+
+# Python environments and caches.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Native build outputs.
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.out
+*.exe
+
+# oneAPI/SYCL/Level Zero build artifacts.
+*.spv
+*.bin
+*.ll
+*.bc
+*.ptx
+*.fatbin
+*.log
+
+# Editor, OS, and local configuration.
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+.env
+.env.*
+
