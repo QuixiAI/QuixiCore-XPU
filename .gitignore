@@ -38,6 +38,8 @@ cmake-build-*/
 *.ptx
 *.fatbin
 *.log
+perf/results/*
+!perf/results/.gitignore
 
 # Editor, OS, and local configuration.
 .vscode/
@@ -47,4 +49,3 @@ cmake-build-*/
 .DS_Store
 .env
 .env.*
-

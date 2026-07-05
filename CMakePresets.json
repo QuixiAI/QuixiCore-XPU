@@ -1,0 +1,56 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "dev",
+      "displayName": "Developer build",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "sycl",
+      "displayName": "SYCL oneAPI build",
+      "inherits": "dev",
+      "binaryDir": "${sourceDir}/build-sycl",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "icpx",
+        "QUIXICORE_XPU_ENABLE_SYCL": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev"
+    },
+    {
+      "name": "sycl",
+      "configurePreset": "sycl"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "sycl",
+      "configurePreset": "sycl",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

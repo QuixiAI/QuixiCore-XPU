@@ -10,7 +10,9 @@ It implements the contract defined by [QuixiAI/QuixiCore](https://github.com/Qui
 
 ## Status
 
-QuixiCore XPU is planned.
+QuixiCore XPU is planned. The repository currently contains the initial backend
+scaffold: compatibility metadata, CMake build files, a small C++ status library,
+smoke tests, and a gated SYCL device probe.
 
 This repository is reserved for the native Intel GPU backend. Implementation work should live here, not in the QuixiCore umbrella repository and not in another backend repository.
 
@@ -33,3 +35,58 @@ This backend is expected to own:
 
 The shared contract lives in [QuixiAI/QuixiCore](https://github.com/QuixiAI/QuixiCore).
 
+## Quick Start
+
+The default build does not require oneAPI. It validates the backend metadata and
+project structure on any host with CMake and a C++20 compiler:
+
+```bash
+cmake --preset dev
+cmake --build --preset dev
+ctest --preset dev
+```
+
+On a machine with oneAPI DPC++ installed, enable the SYCL probe:
+
+```bash
+cmake --preset sycl
+cmake --build --preset sycl
+ctest --preset sycl
+```
+
+The SYCL preset expects `icpx` on `PATH`.
+
+## Project Structure
+
+```text
+.quixicore/backend.yaml      Backend contract metadata
+include/quixicore/xpu/       Public C++ headers
+src/                         Native backend source
+examples/                    Host and SYCL examples
+tests/                       Correctness and smoke tests
+perf/                        Benchmark harness notes and local results
+docs/                        Backend development notes
+```
+
+## Performance Workflow
+
+The XPU performance workflow follows the sibling backend pattern:
+
+- [`perf/perf.md`](perf/perf.md) is the optimization handbook.
+- [`perf/optimization_status.md`](perf/optimization_status.md) is the running
+  implementation and tuning notebook.
+- [`perf/baseline_status.md`](perf/baseline_status.md) records baseline
+  snapshots.
+- `perf/results/` stores raw local runs and is ignored by git.
+
+The current scaffold harness records configure/build/test/probe health:
+
+```bash
+python3 perf/bench_kernels.py --phase all --preset dev
+```
+
+## Current Kernel Coverage
+
+All QuixiCore kernel families are currently planned for XPU. No kernel family is
+claimed complete until native implementation, correctness tests, and benchmark
+coverage are present in this repository.
