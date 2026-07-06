@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+preset="${QUIXICORE_PRESET:-dev}"
+python3 perf/bench_kernels.py --phase all --preset "${preset}" "$@"

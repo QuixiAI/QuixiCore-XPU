@@ -1,0 +1,20 @@
+schema_version: 0.1
+backend: xpu
+formats:
+  gguf:
+    status: planned
+  mx:
+    status: planned
+  fp8:
+    status: planned
+  fp4:
+    status: planned
+  bitnet:
+    status: planned
+status_values:
+  - implemented
+  - partial
+  - experimental
+  - planned
+  - unsupported
+notes: Initial XPU scaffold. Quant format support is planned but not yet claimed.

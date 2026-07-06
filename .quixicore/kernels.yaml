@@ -1,0 +1,51 @@
+schema_version: 0.1
+backend: xpu
+status_values:
+  - implemented
+  - partial
+  - experimental
+  - planned
+  - unsupported
+  - capability_gated
+layout: canonical_scaffold
+families:
+  norms:
+    status: planned
+    paths: []
+  activations:
+    status: planned
+    paths: []
+  attention:
+    status: planned
+    paths: []
+  linear_attention:
+    status: planned
+    paths: []
+  ssm:
+    status: planned
+    paths: []
+  matmul:
+    status: planned
+    paths: []
+  quantization:
+    status: planned
+    paths: []
+  moe:
+    status: planned
+    paths: []
+  sampling:
+    status: planned
+    paths: []
+  serving:
+    status: planned
+    paths: []
+  optimizers:
+    status: planned
+    paths: []
+  collectives:
+    status: planned
+    paths: []
+  utils:
+    status: planned
+    paths: []
+notes: Initial XPU scaffold. No kernel family is claimed implemented until native XPU code, correctness tests, and benchmark coverage land.

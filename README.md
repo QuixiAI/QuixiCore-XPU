@@ -8,6 +8,30 @@ It implements the contract defined by [QuixiAI/QuixiCore](https://github.com/Qui
 
 **Native implementations. Shared contract. No shared code.**
 
+## QuixiCore Standard Files
+
+- Contract metadata: [`.quixicore/backend.yaml`](.quixicore/backend.yaml)
+- Kernel coverage manifest: [`.quixicore/kernels.yaml`](.quixicore/kernels.yaml)
+- Quant format manifest: [`.quixicore/quant-formats.yaml`](.quixicore/quant-formats.yaml)
+- Repository structure: [`docs/repository-structure.md`](docs/repository-structure.md)
+- Contribution workflow: [`CONTRIBUTING.md`](CONTRIBUTING.md)
+- Security policy: [`SECURITY.md`](SECURITY.md)
+- Changelog: [`CHANGELOG.md`](CHANGELOG.md)
+
+Common developer entrypoints:
+
+```bash
+scripts/configure
+scripts/build
+scripts/test
+scripts/bench
+scripts/coverage-report
+scripts/clean
+```
+
+These scripts keep the QuixiCore workflow consistent while wrapping CMake,
+oneAPI/SYCL, Level Zero probes, and benchmark tooling.
+
 ## Status
 
 QuixiCore XPU is planned. The repository currently contains the initial backend

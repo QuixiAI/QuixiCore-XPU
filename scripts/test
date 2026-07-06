@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+preset="${1:-${QUIXICORE_PRESET:-dev}}"
+if [ $# -gt 0 ]; then
+  shift
+fi
+
+ctest --preset "${preset}" "$@"
