@@ -114,3 +114,7 @@ python3 perf/bench_kernels.py --phase all --preset dev
 All QuixiCore kernel families are currently planned for XPU. No kernel family is
 claimed complete until native implementation, correctness tests, and benchmark
 coverage are present in this repository.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
