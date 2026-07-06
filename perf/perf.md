@@ -260,6 +260,49 @@ Use these as templates. Not every kernel needs every experiment.
 - Find crossovers between custom kernels, oneDNN calls, Triton-generated code,
   and framework primitives.
 
+### Branches And Scalar Side Work
+
+- Hoist dtype, causal, format, and dimension decisions out of inner loops through
+  templates, specialization constants, or separate entry points.
+- Precompute base offsets and use simple increments in hot loops.
+- Specialize common dimensions such as `D=64`, `D=128`, aligned K tiles, and
+  supported quant block sizes.
+- Measure decode-only or epilogue-only microkernels when scalar work may hide
+  the true bottleneck.
+
+## Kernel-Specific Starting Hypotheses
+
+Use these as first-pass ideas. Replace them with measured facts as the project
+progresses.
+
+### Row Kernels
+
+`rms_norm`, `layernorm`, `softmax`, `gelu`, and `rotary` should establish the
+first memory-bandwidth and subgroup-reduction baselines.
+
+Experiments: rows per work-group, vectorized loads, subgroup-only reductions for
+small hidden sizes, two-pass versus one-pass variance, reciprocal/sqrt
+placement, hidden-size specialization, and fusion with neighboring ops.
+
+### GEMM And Quant Matmul
+
+Large GEMM shapes should compare custom SYCL, oneDNN, XeTLA, Triton XPU, and
+framework routes. Quant kernels should win only when reduced bytes exceed the
+cost of dequantization and metadata handling.
+
+Experiments: tile size sweep, joint-matrix/XeTLA path selection, local-memory
+staging, dequant-direct-to-matrix versus materialize-then-matmul, split-K,
+library handoff thresholds, and epilogue fusion.
+
+### Attention And Serving
+
+Attention and decode kernels depend on Q/K/V memory traffic, softmax state,
+sequence tiling, routing thresholds, and launch overhead.
+
+Experiments: sequence block size, K/V staging versus direct loads, causal branch
+placement, GQA reuse layout, paged-cache block size, fp8-cache dequant-on-read,
+partition size per context length, and tiny-batch framework routing.
+
 ## First Kernel Targets
 
 Start with deterministic row kernels before serving kernels:
@@ -306,7 +349,29 @@ Each section in `perf/optimization_status.md` should contain:
 - Decision log.
 - Open questions.
 
+Raw results should be stored in a stable location once a harness exists, for
+example:
+
+```text
+perf/results/YYYY-MM-DD/<kernel>/<run-id>.json
+perf/results/YYYY-MM-DD/<kernel>/<run-id>.txt
+```
+
 Do not commit large profiler traces. Record their local path, device, and summary.
+
+## Final Verification Before Landing A Win
+
+Before applying an optimization permanently:
+
+```bash
+python -m pytest <focused kernel test> -q
+python3 perf/bench_kernels.py --phase all --preset dev
+python3 perf/bench_kernels.py --phase all --preset sycl
+```
+
+For substrate changes under `include/quixicore/xpu/` or shared CMake changes,
+also run the broader CTest presets that the host supports. When publishing a
+verified improvement, include the performance table in the PR or commit notes.
 
 ## External References
 

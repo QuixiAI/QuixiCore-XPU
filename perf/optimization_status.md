@@ -3,6 +3,30 @@
 This is the running notebook for XPU kernel implementation and optimization.
 Raw output belongs under `perf/results/`; stable conclusions belong here.
 
+## Entry Template
+
+Use this structure for every kernel family or optimization pass:
+
+```text
+## YYYY-MM-DD: <kernel or pass name>
+
+Status: not started | baselining | experimenting | candidate | landed | deferred.
+Current implementation:
+Current public route:
+References inspected:
+Correctness:
+Baseline:
+Experiments:
+Decision:
+Open questions:
+Raw results:
+```
+
+Record enough context to reproduce the run: Intel GPU target, oneAPI compiler,
+SYCL backend/runtime, Level Zero driver when available, command, git commit or
+working-tree label, dtype, shape, quant format, warmups, iterations, median,
+variance, correctness tolerance, and observed error.
+
 ## 2026-07-05: Initial Scaffold
 
 Status: landed scaffold, no kernel families claimed complete.
