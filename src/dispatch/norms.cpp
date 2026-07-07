@@ -19,11 +19,12 @@ void rms_norm(sycl::queue& q, const void* x, const void* weight, void* out,
 void layernorm(sycl::queue& q, const void* x, const void* weight,
                const void* bias, void* out, std::size_t rows, std::size_t dim,
                float eps, DType dt, Variant variant, bool blocking) {
-  // Data-driven best routing (perf/optimization_status.md 2026-07-06, B60):
-  // native SYCL wins f32 layernorm (387 vs 244 GB/s); oneDNN wins the 16-bit
-  // dtypes (bf16 333 vs 196). No universal winner -- route per dtype.
+  // Data-driven best routing (perf/optimization_status.md 2026-07-06, B60).
+  // After the 16-byte vector-load pass, native SYCL wins layernorm at ALL dtypes
+  // (f32 393 vs 244, bf16 388 vs 333) -- this overturned the pre-vectorization
+  // "route bf16 -> vendor" call. best == sycl for every dtype now.
   if (variant == Variant::best) {
-    variant = (dt == DType::f32) ? Variant::sycl : Variant::vendor;
+    variant = Variant::sycl;
   }
   const Variant v = resolve_variant(variant);
   sycl::event ev;

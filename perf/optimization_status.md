@@ -199,11 +199,56 @@ scalar-16-bit-access bottleneck flagged for a vectorization pass.
 
 Raw results: `perf/results/<date>/<run-id>/`.
 
+## 2026-07-06: 16-byte vector-load pass — bf16/f16 row kernels ~2x, one truism smashed and one own-conclusion reversed
+
+Status: landed across gelu, rms_norm, layernorm, softmax (all dtypes).
+
+Hypothesis (from the earlier entries): the bf16/f16 native row kernels ran ~2x
+slower than f32 despite moving HALF the bytes, at the SAME wall time as f32 —
+i.e. NOT bandwidth-bound. Diagnosis: the kernels read one 2-byte element per
+work-item per step. Even though adjacent items were coalesced, the per-thread
+transaction was too narrow to use the memory pipeline. (This is the exact
+bottleneck the Metal notebook found for gelu_bwd: "scalar bf16 access, not the
+tanh.")
+
+Experiments (8192x4096, median device time; gelu at n=4194304):
+
+1. Unrolled scalar V-block (thread handles V contiguous elements via a scalar
+   loop): REGRESSED — f32 368 -> 209, bf16 184 -> 162. The compiler emitted V
+   STRIDED scalar loads, breaking coalescing. Rejected.
+2. Explicit `sycl::vec<T, V>` with V*sizeof(T) = 16 bytes, reinterpret the row as
+   vectors, thread reads vector vi/vi+threads (adjacent threads -> adjacent
+   vectors = coalesced AND wide): KEPT. `sycl::vec<bfloat16, 8>` compiles and is
+   bit-exact (smashes the "can't vectorize bf16 in SYCL" assumption).
+
+Results (GB/s, before -> after; roofline ~456):
+- rms_norm:  f32 368->393, bf16 184->392 (2.1x), f16 160->393 (2.4x)
+- layernorm: f32 387->393, bf16 196->388 (2.0x)
+- softmax:   f32 316->389, bf16 195->302 (1.5x)
+- gelu:      f32 329->409, bf16 230->406 (1.8x), f16 227->416
+
+Correctness re-verified after each change (all dtypes x variants pass).
+
+Routing consequences (data reversed a prior decision):
+- layernorm bf16: native SYCL 196->388 now BEATS oneDNN 333. This OVERTURNS the
+  2026-07-06 "route bf16 layernorm -> vendor" call. `Variant::best` for layernorm
+  is now sycl at every dtype. (Do not treat even your own measured conclusion as
+  permanent — improve the kernel and re-measure.)
+- gelu f32: native 329->409 now TIES oneDNN 411 (was a 1.25x vendor win).
+- softmax bf16: native 195->302 but oneDNN 348 STILL wins (exp()-bound, not
+  load-bound) — kept `best` bf16 -> vendor. Honest nuance retained, not overclaimed.
+
+Open questions: softmax bf16 vs oneDNN (exp throughput — try a faster exp
+approximation within tolerance, or a single-pass online-softmax to cut one x
+read); a `dim`/occupancy sweep (multiple rows per work-group for small `dim`).
+
+Raw results: `perf/results/<date>/<run-id>/`.
+
 ## First Kernel Plan
 
-Status: in progress — GELU + RMSNorm + LayerNorm + Softmax landed (native, and
-oneDNN where a primitive exists). Next: GLU modes + GELU backward, then the bf16
-row-kernel vectorization pass. After that, Phase 2 quantization surface.
+Status: in progress — GELU + RMSNorm + LayerNorm + Softmax landed, both variants,
+all dtypes vectorized (~90% of roofline). Next: GLU modes + GELU backward, then
+Phase 2 quantization surface (qgemv/qgemm on XMX/DPAS int8).
 
 Priority order:
 

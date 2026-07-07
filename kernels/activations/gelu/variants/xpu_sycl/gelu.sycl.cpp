@@ -27,24 +27,38 @@ inline float gelu_scalar(float x, bool tanh_approx) {
   return 0.5f * x * (1.0f + sycl::erf(x * kInvSqrt2));
 }
 
-// Each work-item processes kVec elements with a COALESCED grid stride: for a
-// fixed k, adjacent work-items touch adjacent addresses (i = tid + k*threads),
-// so each subgroup issues contiguous loads/stores while amortizing launch and
-// index overhead over kVec elements. See perf/optimization_status.md 2026-07-06
-// for the measured comparison against the naive one-element-per-item mapping and
-// the oneDNN baseline.
-constexpr int kVec = 4;
+// 16-byte coalesced vector loads (V*sizeof(T) = 16): each work-item reads one
+// wide vector and adjacent items read adjacent vectors. This beat the earlier
+// coalesced-grid-stride scalar mapping, especially for bf16/f16 where the scalar
+// path was narrow-transaction-bound (perf/optimization_status.md 2026-07-06).
+template <typename T>
+constexpr int vec_width() {
+  return sizeof(T) == 2 ? 8 : 4;
+}
 
 template <typename T>
 sycl::event gelu_typed(sycl::queue& q, const T* in, T* out, std::size_t n,
                        bool tanh_approx) {
-  const std::size_t threads = (n + kVec - 1) / kVec;
-  return q.parallel_for(sycl::range<1>(threads), [=](sycl::id<1> idx) {
-    const std::size_t tid = idx[0];
+  constexpr int V = vec_width<T>();
+  using Vec = sycl::vec<T, V>;
+  const std::size_t nvec = n / V;
+  const std::size_t tail0 = nvec * V;
+  const Vec* iv = reinterpret_cast<const Vec*>(in);
+  Vec* ov = reinterpret_cast<Vec*>(out);
+  return q.parallel_for(sycl::range<1>(nvec + (tail0 < n ? 1 : 0)),
+                        [=](sycl::id<1> idx) {
+    const std::size_t vi = idx[0];
+    if (vi < nvec) {
+      const Vec v = iv[vi];
+      Vec o;
 #pragma unroll
-    for (int k = 0; k < kVec; ++k) {
-      const std::size_t i = tid + static_cast<std::size_t>(k) * threads;
-      if (i < n) {
+      for (int k = 0; k < V; ++k) {
+        o[k] = static_cast<T>(gelu_scalar(static_cast<float>(v[k]), tanh_approx));
+      }
+      ov[vi] = o;
+    } else {
+      // single trailing work-item mops up the [tail0, n) remainder
+      for (std::size_t i = tail0; i < n; ++i) {
         out[i] = static_cast<T>(gelu_scalar(static_cast<float>(in[i]), tanh_approx));
       }
     }

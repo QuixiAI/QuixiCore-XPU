@@ -36,9 +36,11 @@ void gelu(sycl::queue& q, const void* in, void* out, std::size_t n, DType dt,
 
 void softmax(sycl::queue& q, const void* x, void* out, std::size_t rows,
              std::size_t dim, DType dt, Variant variant, bool blocking) {
-  // Data-driven best routing (perf/optimization_status.md 2026-07-06, B60): same
-  // per-dtype split as layernorm -- native SYCL wins f32 softmax (316 vs 223
-  // GB/s), oneDNN wins 16-bit (bf16 346 vs 195).
+  // Data-driven best routing (perf/optimization_status.md 2026-07-06, B60).
+  // Native SYCL wins f32 softmax (389 vs 223 GB/s). For bf16, the vector-load
+  // pass narrowed the gap (195 -> 302) but oneDNN (348) still wins -- softmax is
+  // exp()-bound, unlike layernorm where native now wins bf16 too. Route bf16/f16
+  // to vendor.
   if (variant == Variant::best) {
     variant = (dt == DType::f32) ? Variant::sycl : Variant::vendor;
   }
