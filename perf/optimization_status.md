@@ -462,6 +462,13 @@ f32 + bf16, 0 mismatches. Baseline: embedding bf16 8192x4096 = 258 GB/s
 
 ## 2026-07-07: quantization — act_quant (w8a8 activation quant) + all formats done
 
+### quantization/quantize_int4_group — weight quantization (round-trips qgemv)
+Symmetric group-wise int4 weight quant: per group scale=|max|/7, round+clamp
+[-8,7], pack 2/byte in exactly the layout qgemv_int4 decodes. Correctness:
+quantize -> qgemv_int4 round-trip matches a host decode exactly (excess 0) and
+recon error within half a quant step, f32+bf16. The int4 weight path is now
+end-to-end (quantize weights -> decode GEMV).
+
 ### quantization/act_quant — per-token int8 activation quantization
 Work-group per row: reduce |max|, scale = |max|/127, round each element to int8.
 Produces the int8 activations + per-row scales consumed by qgemm_int8 -> the w8a8

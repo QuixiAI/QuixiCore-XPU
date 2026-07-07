@@ -794,6 +794,49 @@ bool check_gguf_iq1s(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K)
 }
 
 template <typename T>
+bool check_quantize_int4(sycl::queue& q, DType dt, std::size_t N, std::size_t K, std::size_t group) {
+  const std::size_t bpr = K / 2, gpr = K / group;
+  T* W = sycl::malloc_shared<T>(N * K, q);
+  std::uint8_t* wp = sycl::malloc_shared<std::uint8_t>(N * bpr, q);
+  half_t* sc = sycl::malloc_shared<half_t>(N * gpr, q);
+  T* x = sycl::malloc_shared<T>(K, q);
+  T* y = sycl::malloc_shared<T>(N, q);
+  for (std::size_t i = 0; i < N * K; ++i) W[i] = static_cast<T>(sample(i) * 2.0f);
+  for (std::size_t k = 0; k < K; ++k) x[k] = static_cast<T>(sample(k + 161));
+
+  ops::quantize_int4_group(q, W, wp, sc, N, K, group, dt, Variant::sycl, true);
+  ops::qgemv_int4(q, wp, sc, x, y, N, K, group, dt, Variant::sycl, true);
+
+  // Host-decode the packed result and reference-GEMV; must match qgemv exactly
+  // (both consume the same quantized weights). Also bound the recon error.
+  int recon_bad = 0; double worst = 0.0;
+  const Tol tol = tol_for(dt);
+  const double rtol = tol.rtol * std::sqrt((double)K) + 3e-3;
+  for (std::size_t n = 0; n < N; ++n) {
+    double acc = 0.0;
+    for (std::size_t b = 0; b < bpr; ++b) {
+      const std::uint8_t byte = wp[n * bpr + b];
+      int q0 = byte & 0xF; if (q0 >= 8) q0 -= 16;
+      int q1 = byte >> 4;  if (q1 >= 8) q1 -= 16;
+      const std::size_t k0 = 2 * b;
+      const double s = (double)sc[n * gpr + k0 / group];
+      acc += q0 * s * (double)x[k0];
+      acc += q1 * s * (double)x[k0 + 1];
+      // recon error vs original weight <= half a quant step
+      if (std::abs(q0 * s - (double)W[n * K + k0]) > s * 0.51) ++recon_bad;
+      if (std::abs(q1 * s - (double)W[n * K + k0 + 1]) > s * 0.51) ++recon_bad;
+    }
+    const double ref = (double)static_cast<T>(acc);
+    worst = std::max(worst, std::abs((double)y[n] - ref) - (tol.atol + rtol * std::abs(ref)));
+  }
+  sycl::free(W, q); sycl::free(wp, q); sycl::free(sc, q); sycl::free(x, q); sycl::free(y, q);
+  const bool ok = (worst <= 0.0) && (recon_bad == 0);
+  std::cout << "  quantize_int4_group dt=" << dtype_name(dt) << " roundtrip_excess=" << worst
+            << " recon_bad=" << recon_bad << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+template <typename T>
 bool check_act_quant(sycl::queue& q, DType dt, std::size_t rows, std::size_t dim) {
   T* x = sycl::malloc_shared<T>(rows * dim, q);
   signed char* qo = sycl::malloc_shared<signed char>(rows * dim, q);
@@ -1725,6 +1768,10 @@ int main() {
   failures += check_gguf_iquant<float>(q, DType::f32, ops::GgufType::iq3_xxs, "iq3_xxs", 128, 4096) ? 0 : 1;
   failures += check_gguf_iq1s<float>(q, DType::f32, 128, 4096) ? 0 : 1;
   failures += check_gguf_iq1s<bf16_t>(q, DType::bf16, 128, 4096) ? 0 : 1;
+
+  // quantize_int4_group: weight quant round-trip with qgemv_int4.
+  failures += check_quantize_int4<float>(q, DType::f32, 128, 4096, 128) ? 0 : 1;
+  failures += check_quantize_int4<bf16_t>(q, DType::bf16, 128, 4096, 128) ? 0 : 1;
 
   // act_quant: per-token int8 activation quantization (feeds w8a8).
   failures += check_act_quant<float>(q, DType::f32, 128, 4096) ? 0 : 1;

@@ -43,6 +43,7 @@
 #include "norms/norms_kernel.hpp"
 #include "optimizers/adamw/adamw_kernel.hpp"
 #include "quantization/act_quant/act_quant_kernel.hpp"
+#include "quantization/quantize/quantize_kernel.hpp"
 #include "quantization/fp8_gemm/fp8_kernel.hpp"
 #include "quantization/gguf_gemv/gguf_kernel.hpp"
 #include "quantization/mxfp4_gemv/mxfp4_kernel.hpp"
@@ -425,6 +426,17 @@ int main(int argc, char** argv) {
     const double med = time_median([&] { return kernels::sample_categorical_sycl(q, lg, o, rows, dim, 1.0f, 5u, dt); });
     emit(med, static_cast<double>(rows) * dim * elem / (med * 1e-3) / 1e9);
     sycl::free(lg, q); sycl::free(o, q);
+    return 0;
+  }
+  if (kernel == "quantize_int4") {
+    const std::size_t Nn = rows, Kk = dim, group = 128;
+    void* wi = sycl::malloc_device(Nn * Kk * elem, q);
+    void* wp = sycl::malloc_device(Nn * (Kk / 2), q);
+    void* sc = sycl::malloc_device(Nn * (Kk / group) * 2, q);
+    q.memset(wi, 0, Nn * Kk * elem).wait();
+    const double med = time_median([&] { return kernels::quantize_int4_group_sycl(q, wi, wp, sc, Nn, Kk, group, dt); });
+    emit(med, static_cast<double>(Nn) * Kk * elem / (med * 1e-3) / 1e9);
+    sycl::free(wi, q); sycl::free(wp, q); sycl::free(sc, q);
     return 0;
   }
   if (kernel == "act_quant") {

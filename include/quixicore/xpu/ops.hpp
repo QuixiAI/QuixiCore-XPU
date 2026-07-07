@@ -251,6 +251,16 @@ void dense_gemm(sycl::queue& q, const void* a, const void* b, void* c,
 // quantization
 // ----------------------------------------------------------------------------
 
+// Quantize a weight matrix W [N, K] (dtype dt) to symmetric int4, group-wise:
+// per group of `group` columns, scale = groupmax(|W|)/7, q = round(W/scale)
+// clamped to [-8,7], packed 2-per-byte along K (low nibble = even k). Outputs
+// `w_packed` [N*K/2] uint8 and `scales` [N, K/group] fp16 — the exact layout
+// qgemv_int4 consumes (so quantize -> qgemv round-trips). Native.
+void quantize_int4_group(sycl::queue& q, const void* w, void* w_packed,
+                         void* scales, std::size_t N, std::size_t K,
+                         std::size_t group, DType dt,
+                         Variant variant = Variant::sycl, bool blocking = true);
+
 // int4 group-quantized GEMV (batch-1 decode), Marlin/Metal-style dequant on the
 // fly. Weight W is [N, K] symmetric signed int4 packed 2-per-byte along K (low
 // nibble = even k); `scales` is [N, K/group] fp16 (half); activation `x` is [K]
