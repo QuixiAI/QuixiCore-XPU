@@ -361,10 +361,107 @@ sycl::event gguf_iq4nl_typed(sycl::queue& q, const std::uint8_t* w, const T* x,
   });
 }
 
+inline std::uint32_t rd_u32(const std::uint8_t* p) {
+  return static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8) |
+         (static_cast<std::uint32_t>(p[2]) << 16) | (static_cast<std::uint32_t>(p[3]) << 24);
+}
+
+// GGUF legacy 32-element blocks: q4_1 (20B, affine d/m), q5_0 (22B, 5-bit signed
+// -16), q5_1 (24B, 5-bit affine). TYPE: 8=q4_1, 9=q5_0, 10=q5_1.
+template <typename T, int TYPE>
+sycl::event gguf_legacy_typed(sycl::queue& q, const std::uint8_t* w, const T* x,
+                              T* y, std::size_t N, std::size_t K) {
+  constexpr int BB = (TYPE == 8) ? 20 : (TYPE == 9) ? 22 : 24;
+  const std::size_t bpr = K / 32, row_bytes = bpr * BB;
+  const std::size_t nwg = (N + kRowsPerWG - 1) / kRowsPerWG;
+  const sycl::nd_range<1> ndr(sycl::range<1>(nwg * kWG), sycl::range<1>(kWG));
+  return q.parallel_for(ndr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSG)]] {
+    const sycl::sub_group sg = it.get_sub_group();
+    const std::size_t n = it.get_group(0) * kRowsPerWG + sg.get_group_linear_id();
+    const int lane = static_cast<int>(sg.get_local_linear_id());
+    if (n >= N) return;
+    const std::uint8_t* wrow = w + n * row_bytes;
+    float acc = 0.0f;
+    for (std::size_t b = lane; b < bpr; b += kSG) {
+      const std::uint8_t* blk = wrow + b * BB;
+      const float d = load_half(blk);
+      const std::size_t kbase = b * 32;
+      if (TYPE == 8) {  // q4_1
+        const float m = load_half(blk + 2);
+        const std::uint8_t* qs = blk + 4;
+        for (int j = 0; j < 16; ++j) {
+          acc += ((qs[j] & 0xF) * d + m) * static_cast<float>(x[kbase + j]);
+          acc += ((qs[j] >> 4) * d + m) * static_cast<float>(x[kbase + 16 + j]);
+        }
+      } else {  // q5_0 / q5_1
+        const bool affine = (TYPE == 10);
+        const float m = affine ? load_half(blk + 2) : 0.0f;
+        const std::uint8_t* qh_p = blk + (affine ? 4 : 2);
+        const std::uint8_t* qs = blk + (affine ? 8 : 6);
+        const std::uint32_t qh = rd_u32(qh_p);
+        for (int j = 0; j < 16; ++j) {
+          const int xh0 = ((qh >> (j + 0)) << 4) & 0x10;
+          const int xh1 = ((qh >> (j + 12))) & 0x10;
+          int x0 = (qs[j] & 0xF) | xh0;
+          int x1 = (qs[j] >> 4) | xh1;
+          if (!affine) { x0 -= 16; x1 -= 16; }
+          acc += (x0 * d + m) * static_cast<float>(x[kbase + j]);
+          acc += (x1 * d + m) * static_cast<float>(x[kbase + 16 + j]);
+        }
+      }
+    }
+    const float sum = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+    if (lane == 0) y[n] = static_cast<T>(sum);
+  });
+}
+
+// GGUF IQ4_XS: 136-byte super-block (fp16 d, uint16 scales_h, scales_l[4],
+// qs[128]); 8 sub-blocks of 32; 6-bit per-sub scale split across scales_l/h;
+// values via the iq4_nl codebook. Follows ggml dequantize_row_iq4_xs.
+template <typename T>
+sycl::event gguf_iq4xs_typed(sycl::queue& q, const std::uint8_t* w, const T* x,
+                             T* y, std::size_t N, std::size_t K) {
+  const std::size_t sblocks = K / 256, row_bytes = sblocks * 136;
+  const std::size_t nwg = (N + kRowsPerWG - 1) / kRowsPerWG;
+  const sycl::nd_range<1> ndr(sycl::range<1>(nwg * kWG), sycl::range<1>(kWG));
+  return q.parallel_for(ndr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSG)]] {
+    const sycl::sub_group sg = it.get_sub_group();
+    const std::size_t n = it.get_group(0) * kRowsPerWG + sg.get_group_linear_id();
+    const int lane = static_cast<int>(sg.get_local_linear_id());
+    if (n >= N) return;
+    const std::uint8_t* wrow = w + n * row_bytes;
+    float acc = 0.0f;
+    for (std::size_t b = lane; b < sblocks; b += kSG) {
+      const std::uint8_t* blk = wrow + b * 136;
+      const float d = load_half(blk);
+      const std::uint32_t scales_h = static_cast<std::uint32_t>(blk[2]) | (static_cast<std::uint32_t>(blk[3]) << 8);
+      const std::uint8_t* scales_l = blk + 4;
+      const std::uint8_t* qs = blk + 8;
+      const std::size_t kbase = b * 256;
+      for (int ib = 0; ib < 8; ++ib) {
+        const int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
+        const float dl = d * (ls - 32);
+        const std::uint8_t* qq = qs + ib * 16;
+        const std::size_t yb = kbase + ib * 32;
+        for (int j = 0; j < 16; ++j) {
+          acc += dl * kIQ4NL[qq[j] & 0xF] * static_cast<float>(x[yb + j]);
+          acc += dl * kIQ4NL[qq[j] >> 4] * static_cast<float>(x[yb + 16 + j]);
+        }
+      }
+    }
+    const float sum = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+    if (lane == 0) y[n] = static_cast<T>(sum);
+  });
+}
+
 template <typename T>
 sycl::event dispatch_type(sycl::queue& q, const std::uint8_t* w, const T* x, T* y,
                           std::size_t N, std::size_t K, int type) {
   if (type == 7) return gguf_iq4nl_typed<T>(q, w, x, y, N, K);
+  if (type == 8) return gguf_legacy_typed<T, 8>(q, w, x, y, N, K);
+  if (type == 9) return gguf_legacy_typed<T, 9>(q, w, x, y, N, K);
+  if (type == 10) return gguf_legacy_typed<T, 10>(q, w, x, y, N, K);
+  if (type == 11) return gguf_iq4xs_typed<T>(q, w, x, y, N, K);
   if (type == 2) return gguf_q6k_typed<T>(q, w, x, y, N, K);
   if (type == 3) return gguf_q4k_typed<T>(q, w, x, y, N, K);
   if (type == 4) return gguf_q5k_typed<T>(q, w, x, y, N, K);

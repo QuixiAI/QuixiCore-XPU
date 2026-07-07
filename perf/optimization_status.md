@@ -471,6 +471,13 @@ of the ggml reference over random-byte blocks (no shared packer): worst_excess 0
 f32+bf16. Baseline 8192x8192 bf16 = 82 GB/s weight bandwidth. Proves the k-quant
 super-block layout decodes natively on Intel.
 
+### quantization/gguf_gemv — q4_1/q5_0/q5_1 (legacy linear) + iq4_xs
+Legacy 32-elem blocks: q4_1 (20B affine d/m), q5_0 (22B, 5-bit signed -16, 5th
+bit from qh), q5_1 (24B, 5-bit affine). iq4_xs (136B super-block: 6-bit split
+scales_l/scales_h + iq4_nl codebook). All follow ggml exactly; correctness vs
+independent host replicas: worst_excess 0, f32+bf16. GGUF now 12 formats.
+Grid-based i-quants (iq2_xxs/iq2_xs/iq3_xxs/iq1_s) next.
+
 ### quantization/gguf_gemv — iq4_nl (first i-quant, codebook)
 iq4_nl = q4_0 footprint (18B: fp16 d + qs[16]) but the 4-bit index maps through
 the fixed 16-entry non-linear kvalues_iq4nl codebook (no linear scale). ggml
