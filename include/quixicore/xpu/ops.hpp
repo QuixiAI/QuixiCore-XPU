@@ -124,6 +124,22 @@ void argmax(sycl::queue& q, const void* logits, int* out, std::size_t rows,
             std::size_t vocab, DType dt, Variant variant = Variant::sycl,
             bool blocking = true);
 
+// Categorical sampling from temperature-scaled softmax(logits). `logits`
+// [rows, vocab] dt; `out` [rows] int32. `seed` drives the stateless RNG (one
+// uniform per row). temperature -> 0 reduces to argmax.
+void sample_categorical(sycl::queue& q, const void* logits, int* out,
+                        std::size_t rows, std::size_t vocab, float temperature,
+                        std::uint32_t seed, DType dt,
+                        Variant variant = Variant::sycl, bool blocking = true);
+
+// Top-k sampling: restrict to the k highest logits, softmax over them
+// (temperature), then sample. `out` [rows] int32 is always one of the row's
+// top-k tokens.
+void top_k_sample(sycl::queue& q, const void* logits, int* out, std::size_t rows,
+                  std::size_t vocab, int k, float temperature,
+                  std::uint32_t seed, DType dt, Variant variant = Variant::sycl,
+                  bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // serving (kv cache, embedding)
 // ----------------------------------------------------------------------------

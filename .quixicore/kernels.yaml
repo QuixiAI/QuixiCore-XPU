@@ -143,6 +143,22 @@ operations:
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/matmul/dense_gemm/variants/xpu_sycl}
       - {name: xpu_onednn, status: implemented, path: kernels/matmul/dense_gemm/variants/xpu_onednn}
+  sample_categorical:
+    family: sampling
+    status: implemented
+    path: kernels/sampling/sample
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/sampling/sample/variants/xpu_sycl}
+  top_k_sample:
+    family: sampling
+    status: implemented
+    path: kernels/sampling/sample
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/sampling/sample/variants/xpu_sycl}
   qgemv_int4:
     family: quantization
     status: implemented

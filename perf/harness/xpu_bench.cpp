@@ -49,6 +49,7 @@
 #include "quantization/qgemm/qgemm_kernel.hpp"
 #include "quantization/qgemv/qgemv_kernel.hpp"
 #include "sampling/argmax/argmax_kernel.hpp"
+#include "sampling/sample/sample_kernel.hpp"
 #include "linear_attention/linear_attn/linear_attn_kernel.hpp"
 #include "moe/moe_route/moe_route_kernel.hpp"
 #include "ssm/selective_scan/selective_scan_kernel.hpp"
@@ -409,6 +410,15 @@ int main(int argc, char** argv) {
               << ",\"iters\":" << iters << ",\"median_ms\":" << med << ",\"gflops\":" << gflop
               << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
     sycl::free(Q, q); sycl::free(K, q); sycl::free(V, q); sycl::free(O, q);
+    return 0;
+  }
+  if (kernel == "sample_categorical") {
+    void* lg = sycl::malloc_device(rows * dim * elem, q);
+    int* o = sycl::malloc_device<int>(rows, q);
+    q.memset(lg, 0, rows * dim * elem).wait();
+    const double med = time_median([&] { return kernels::sample_categorical_sycl(q, lg, o, rows, dim, 1.0f, 5u, dt); });
+    emit(med, static_cast<double>(rows) * dim * elem / (med * 1e-3) / 1e9);
+    sycl::free(lg, q); sycl::free(o, q);
     return 0;
   }
   if (kernel == "moe_route") {

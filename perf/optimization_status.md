@@ -460,7 +460,21 @@ Correctness: exact match (embedding gather; scatter->gather round-trip),
 f32 + bf16, 0 mismatches. Baseline: embedding bf16 8192x4096 = 258 GB/s
 (scattered table gather, below streaming roofline as expected). Native-only.
 
-## 2026-07-07: Track B depth begins — attention (flash-style SDPA)
+## 2026-07-07: Track B depth begins — attention + sampling suite
+
+### sampling — sample_categorical + top_k_sample (native)
+Reuses common/rng.hpp (stateless per-row uniform). Categorical: max/normalizer/
+inverse-CDF scan over temperature-scaled logits. top_k: k-pass argmax selection
+then softmax-sample within the top-k set. No oneDNN sampling primitive -> native.
+Correctness by tie/precision-robust invariants: top_k sample's logit >= k-th
+largest value; near-greedy (temp 1e-3) within margin of max. f32+bf16 pass.
+Completes the inference sampling path (was argmax-only). Baseline categorical
+4096x4096 = 34 GB/s / 1.96 ms. HONEST LIMIT: one-work-item-per-row with 3
+exp-heavy vocab scans is slow at real inference shapes (few rows x 128k vocab);
+the fix is work-group-per-row (parallel max/sum reductions like softmax + a
+prefix-scan for the inverse CDF), flagged for the sampling optimization pass.
+
+### attention — flash-style scaled dot-product attention (native)
 
 ### attention — flash-style scaled dot-product attention (native)
 Online-softmax attention (running max/denom/weighted-acc per query), so the

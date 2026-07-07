@@ -394,6 +394,36 @@ bool check_attention(sycl::queue& q, DType dt, std::size_t nh, std::size_t nkv,
   return ok;
 }
 
+template <typename T>
+bool check_sampling(sycl::queue& q, DType dt, std::size_t rows, std::size_t vocab, int k) {
+  T* logits = sycl::malloc_shared<T>(rows * vocab, q);
+  int* out_k = sycl::malloc_shared<int>(rows, q);
+  int* out_g = sycl::malloc_shared<int>(rows, q);
+  for (std::size_t i = 0; i < rows * vocab; ++i) logits[i] = static_cast<T>(sample(i) * 4.0f);
+
+  ops::top_k_sample(q, logits, out_k, rows, vocab, k, 1.0f, 99u, dt, Variant::sycl, true);
+  ops::sample_categorical(q, logits, out_g, rows, vocab, 1e-3f, 99u, dt, Variant::sycl, true);  // ~greedy
+
+  // Value-based, tie/precision-robust invariants: the top-k sample's logit is at
+  // least the k-th largest value; the near-greedy sample is within a small margin
+  // of the max.
+  int not_in_topk = 0, greedy_bad = 0;
+  std::vector<double> vals(vocab);
+  for (std::size_t t = 0; t < rows; ++t) {
+    for (std::size_t j = 0; j < vocab; ++j) vals[j] = (double)logits[t * vocab + j];
+    std::vector<double> s(vals);
+    std::partial_sort(s.begin(), s.begin() + k, s.end(), std::greater<double>());
+    const double kth = s[k - 1], mx = s[0];
+    if (vals[out_k[t]] < kth - 1e-3) ++not_in_topk;
+    if (vals[out_g[t]] < mx - 0.1) ++greedy_bad;   // temp 1e-3 -> within ~margin of max
+  }
+  sycl::free(logits, q); sycl::free(out_k, q); sycl::free(out_g, q);
+  const bool ok = (not_in_topk == 0) && (greedy_bad == 0);
+  std::cout << "  sampling dt=" << dtype_name(dt) << " k=" << k << " topk_viol=" << not_in_topk
+            << " greedy_bad=" << greedy_bad << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // Explicit mantissa bits per storage dtype (for the 1-ULP allowance below).
 int mantissa_bits(DType dt) {
   switch (dt) {
@@ -1133,6 +1163,10 @@ int main() {
 
   // collectives: multi-GPU sum all-reduce across the visible B60s.
   failures += check_collectives() ? 0 : 1;
+
+  // sampling: categorical + top-k (invariants: top-k membership, greedy=argmax).
+  failures += check_sampling<float>(q, DType::f32, 256, 4000, 8) ? 0 : 1;
+  failures += check_sampling<bf16_t>(q, DType::bf16, 256, 4000, 16) ? 0 : 1;
 
   // moe: top-k routing.
   failures += check_moe_route<float>(q, DType::f32, 512, 64, 2) ? 0 : 1;
