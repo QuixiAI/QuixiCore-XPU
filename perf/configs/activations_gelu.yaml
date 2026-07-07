@@ -1,0 +1,25 @@
+# Benchmark configuration for activations/gelu.
+#
+# Consumed by perf/bench_kernels.py (--phase kernels, --preset sycl), which runs
+# quixicore_xpu_bench once per entry under `runs:` and records median device
+# time (SYCL profiling events) + effective bandwidth. Parsed only when PyYAML is
+# available; otherwise the harness falls back to its built-in default matrix.
+#
+# Shapes follow perf/perf.md's memory-bound row-kernel starter set. Both shipped
+# variants (native sycl, vendor oneDNN) are benchmarked so the co-equal paths are
+# always compared on the same hardware.
+
+kernel: gelu
+family: activations
+operation: gelu
+
+runs:
+  - {kernel: gelu, variant: sycl,   dtype: f32,  n: 4194304, iters: 100, warmup: 20}
+  - {kernel: gelu, variant: vendor, dtype: f32,  n: 4194304, iters: 100, warmup: 20}
+  - {kernel: gelu, variant: sycl,   dtype: f16,  n: 4194304, iters: 100, warmup: 20}
+  - {kernel: gelu, variant: vendor, dtype: f16,  n: 4194304, iters: 100, warmup: 20}
+  - {kernel: gelu, variant: sycl,   dtype: bf16, n: 4194304, iters: 100, warmup: 20}
+  - {kernel: gelu, variant: vendor, dtype: bf16, n: 4194304, iters: 100, warmup: 20}
+  # Smaller shape to expose launch-overhead sensitivity.
+  - {kernel: gelu, variant: sycl,   dtype: f32,  n: 262144,  iters: 200, warmup: 40}
+  - {kernel: gelu, variant: vendor, dtype: f32,  n: 262144,  iters: 200, warmup: 40}

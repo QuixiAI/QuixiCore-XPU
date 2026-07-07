@@ -36,6 +36,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 RESULTS_ROOT = REPO_ROOT / "perf" / "results"
 SCHEMA_VERSION = 1
 
+# Default kernel benchmark matrix, used when a perf/configs/*.yaml is not present
+# or PyYAML is unavailable. Each entry drives one run of quixicore_xpu_bench.
+DEFAULT_KERNEL_BENCH = [
+    {"kernel": "gelu", "variant": "sycl", "dtype": "f32", "n": 4194304},
+    {"kernel": "gelu", "variant": "vendor", "dtype": "f32", "n": 4194304},
+    {"kernel": "gelu", "variant": "sycl", "dtype": "bf16", "n": 4194304},
+    {"kernel": "gelu", "variant": "sycl", "dtype": "f16", "n": 4194304},
+]
+
 
 def git_label() -> str:
     try:
@@ -148,6 +157,70 @@ def command_plan(phase: str, preset: str, include_probe: bool) -> list[tuple[str
     return commands
 
 
+def load_kernel_bench_matrix() -> list[dict]:
+    """Kernel bench configs from perf/configs/*.yaml if PyYAML is available,
+    else the built-in default matrix. Configs are optional; the default keeps
+    the harness working with no third-party dependency."""
+    configs_dir = REPO_ROOT / "perf" / "configs"
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return DEFAULT_KERNEL_BENCH
+    if not configs_dir.is_dir():
+        return DEFAULT_KERNEL_BENCH
+    matrix: list[dict] = []
+    for path in sorted(configs_dir.glob("*.yaml")):
+        try:
+            doc = yaml.safe_load(path.read_text()) or {}
+        except Exception:
+            continue
+        for run in doc.get("runs", []):
+            matrix.append(run)
+    return matrix or DEFAULT_KERNEL_BENCH
+
+
+def run_kernel_bench(preset: str, out_dir: Path, timeout: int) -> list[dict]:
+    """Run the on-device kernel benchmark for each config and collect its JSON
+    output. Only meaningful for the sycl preset (needs an Intel GPU)."""
+    bench_exe = binary_dir_for_preset(preset) / "quixicore_xpu_bench"
+    if not bench_exe.exists():
+        return [{
+            "schema_version": SCHEMA_VERSION, "phase": "kernels",
+            "status": "missing", "returncode": None, "seconds": 0.0,
+            "log": "kernels", "note": f"{bench_exe} not built",
+        }]
+
+    log_dir = out_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+    for cfg in load_kernel_bench_matrix():
+        cmd = [str(bench_exe)]
+        for key in ("kernel", "variant", "dtype", "n", "iters", "warmup"):
+            if key in cfg:
+                cmd += [f"--{key}", str(cfg[key])]
+        start = time.perf_counter()
+        try:
+            proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True,
+                                  text=True, timeout=timeout)
+            status = "ok" if proc.returncode == 0 else "error"
+            metrics = {}
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        metrics = json.loads(line)
+                    except Exception:
+                        pass
+        except subprocess.TimeoutExpired:
+            status, metrics = "timeout", {}
+        seconds = round(time.perf_counter() - start, 3)
+        row = {"schema_version": SCHEMA_VERSION, "phase": "kernels",
+               "status": status, "seconds": seconds, "config": cfg}
+        row.update({k: metrics[k] for k in metrics if k != "schema_version"})
+        rows.append(row)
+    return rows
+
+
 def write_summary(rows: list[dict], out_dir: Path, meta: dict) -> None:
     lines = [
         "# QuixiCore XPU Harness Summary",
@@ -160,9 +233,25 @@ def write_summary(rows: list[dict], out_dir: Path, meta: dict) -> None:
         "|---|---|---:|---|",
     ]
     for row in rows:
+        log = row.get("log", "")
         lines.append(
-            f"| {row['phase']} | {row['status']} | {row['seconds']:.3f} | `{row['log']}` |"
+            f"| {row['phase']} | {row['status']} | {row['seconds']:.3f} | `{log}` |"
         )
+
+    kernel_rows = [r for r in rows if r["phase"] == "kernels" and "median_ms" in r]
+    if kernel_rows:
+        lines += [
+            "",
+            "## Kernel benchmarks",
+            "",
+            "| Kernel | Variant | Dtype | n | Median ms | GB/s |",
+            "|---|---|---|---:|---:|---:|",
+        ]
+        for r in kernel_rows:
+            lines.append(
+                f"| {r.get('kernel','')} | {r.get('variant','')} | {r.get('dtype','')} "
+                f"| {r.get('n','')} | {r.get('median_ms',0):.4f} | {r.get('gbps',0):.1f} |"
+            )
     lines.append("")
     out_dir.joinpath("summary.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -171,7 +260,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--phase",
-        choices=["all", "configure", "build", "test", "info", "probe"],
+        choices=["all", "configure", "build", "test", "info", "probe", "kernels"],
         default="all",
     )
     parser.add_argument("--preset", default="dev", choices=["dev", "sycl"])
@@ -205,11 +294,20 @@ def main() -> int:
     out_dir.joinpath("run.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
     rows = []
-    for name, cmd in command_plan(args.phase, args.preset, args.include_probe):
-        row = run_command(name, cmd, out_dir, args.timeout)
-        rows.append(row)
-        if row["status"] != "ok":
-            break
+    # Standard build-health phases (skip when only the kernel bench is requested).
+    if args.phase != "kernels":
+        for name, cmd in command_plan(args.phase, args.preset, args.include_probe):
+            row = run_command(name, cmd, out_dir, args.timeout)
+            rows.append(row)
+            if row["status"] != "ok":
+                break
+
+    # On-device kernel benchmark (sycl preset only). Runs after a clean build.
+    standard_ok = all(row["status"] == "ok" for row in rows)
+    if args.preset == "sycl" and args.phase in ("all", "kernels") and (
+        args.phase == "kernels" or standard_ok
+    ):
+        rows.extend(run_kernel_bench(args.preset, out_dir, args.timeout))
 
     with out_dir.joinpath("results.jsonl").open("w", encoding="utf-8") as handle:
         for row in rows:

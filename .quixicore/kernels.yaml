@@ -1,4 +1,4 @@
-schema_version: 0.1
+schema_version: 0.2
 backend: xpu
 status_values:
   - implemented
@@ -7,14 +7,19 @@ status_values:
   - planned
   - unsupported
   - capability_gated
-layout: canonical_scaffold
+layout: canonical_variants
+# Each op ships one or more implementation variants. Native SYCL and the vendor
+# (oneDNN) path are co-equal, selectable at the ABI (quixicore::xpu::Variant),
+# analogous to the Metal backend's co-equal PyTorch and MLX bindings.
+variant_path_rule: kernels/<family>/<operation>/variants/xpu_<target>
 families:
   norms:
     status: planned
     paths: []
   activations:
-    status: planned
-    paths: []
+    status: partial
+    paths:
+      - kernels/activations
   attention:
     status: planned
     paths: []
@@ -48,4 +53,27 @@ families:
   utils:
     status: planned
     paths: []
-notes: Initial XPU scaffold. No kernel family is claimed implemented until native XPU code, correctness tests, and benchmark coverage land.
+operations:
+  gelu:
+    family: activations
+    status: implemented
+    path: kernels/activations/gelu
+    dtypes: [f32, f16, bf16]
+    tests:
+      correctness: tests/xpu_ops_smoke.cpp
+    benchmarks:
+      default: perf/configs/activations_gelu.yaml
+    variants:
+      - name: xpu_sycl
+        status: implemented
+        path: kernels/activations/gelu/variants/xpu_sycl
+      - name: xpu_onednn
+        status: implemented
+        path: kernels/activations/gelu/variants/xpu_onednn
+notes: >-
+  GELU is the reference operation and landed with both a native SYCL variant and
+  a co-equal oneDNN vendor variant, correctness-checked on Arc Pro B60 across
+  f32/f16/bf16 and benchmarked (see perf/optimization_status.md 2026-07-06). No
+  other family is claimed implemented until native XPU code, correctness tests,
+  and benchmark coverage land. GLU and GELU-backward remain planned, so the
+  activations family is `partial`.
