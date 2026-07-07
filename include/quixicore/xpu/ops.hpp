@@ -82,6 +82,17 @@ void glu(sycl::queue& q, const void* x, void* out, std::size_t rows,
          Variant variant = Variant::sycl, bool blocking = true);
 
 // ----------------------------------------------------------------------------
+// matmul
+// ----------------------------------------------------------------------------
+
+// Dense GEMM: C[M,N] = A[M,K] * B[K,N], all row-major, fp32 accumulation. `a`,
+// `b`, `c` are device pointers of dtype `dt`. The vendor variant is oneDNN
+// matmul (XMX/DPAS-backed); the native SYCL variant is an SLM-tiled baseline.
+void dense_gemm(sycl::queue& q, const void* a, const void* b, void* c,
+                std::size_t M, std::size_t N, std::size_t K, DType dt,
+                Variant variant = Variant::best, bool blocking = true);
+
+// ----------------------------------------------------------------------------
 // norms
 // ----------------------------------------------------------------------------
 

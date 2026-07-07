@@ -270,11 +270,30 @@ as a smoke/baseline, to be re-measured with distinct buffers if optimized.
 Decision: keep as the shipped native implementations; revisit perf later per the
 breadth-first directive.
 
+## 2026-07-06: matmul/dense_gemm — native SYCL tile + oneDNN (XMX), family opened
+
+Status: landed (both variants). Native SYCL is an untuned SLM-tiled baseline;
+oneDNN is the XMX/DPAS-backed fast path.
+
+Correctness: C=A*B for f32 + bf16, both variants, vs an fp64 reference (rtol
+scaled by sqrt(K) for the accumulation). All pass.
+
+Baseline (4096x4096x4096, GFLOP/s = 2*M*N*K/median):
+- native SYCL tiled: f32 1014, bf16 1115.
+- oneDNN vendor:     f32 12083 (12x), bf16 89891 (~90 TFLOP/s, 80x).
+
+Decision: `Variant::best` -> vendor for matmul (the naive tile has no matrix
+engine). This is the honest, expected gap: the native path needs XMX/DPAS
+`joint_matrix` + register blocking to compete, which is the flagged native-GEMM
+optimization (deferred under breadth-first). The ~90 TFLOP/s bf16 oneDNN number
+confirms the B60 XMX is real and is exactly why the quantization/XMX surface is
+the high-value frontier.
+
 ## First Kernel Plan
 
-Status: in progress — activations family (gelu, gelu_backward, silu, glu,
-softmax) + norms (rms_norm, layernorm) landed. Growing the feature matrix next:
-matmul (oneDNN + SYCL), then the quantization surface.
+Status: in progress — families lit up: activations (gelu, gelu_backward, silu,
+glu, softmax), norms (rms_norm, layernorm), matmul (dense_gemm). Next matrix
+growth: quantization surface (decode + qgemv/qgemm) on XMX, then attention.
 
 Priority order:
 

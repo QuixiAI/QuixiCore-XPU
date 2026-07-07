@@ -31,8 +31,9 @@ families:
     status: planned
     paths: []
   matmul:
-    status: planned
-    paths: []
+    status: partial
+    paths:
+      - kernels/matmul
   quantization:
     status: planned
     paths: []
@@ -122,6 +123,15 @@ operations:
         status: implemented
         path: kernels/norms/rms_norm/variants/xpu_sycl
       # No oneDNN RMSNorm primitive; vendor/best resolve to xpu_sycl.
+  dense_gemm:
+    family: matmul
+    status: implemented
+    path: kernels/matmul/dense_gemm
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/matmul/dense_gemm/variants/xpu_sycl}
+      - {name: xpu_onednn, status: implemented, path: kernels/matmul/dense_gemm/variants/xpu_onednn}
   layernorm:
     family: norms
     status: implemented

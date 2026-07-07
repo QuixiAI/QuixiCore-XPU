@@ -56,6 +56,8 @@ DEFAULT_KERNEL_BENCH = [
     {"kernel": "silu", "variant": "sycl", "dtype": "bf16", "n": 4194304},
     {"kernel": "glu", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 4096},
     {"kernel": "gelu_backward", "variant": "sycl", "dtype": "bf16", "n": 4194304},
+    {"kernel": "dense_gemm", "variant": "sycl", "dtype": "bf16", "M": 2048, "N": 2048, "K": 2048},
+    {"kernel": "dense_gemm", "variant": "vendor", "dtype": "bf16", "M": 2048, "N": 2048, "K": 2048},
 ]
 
 
@@ -208,7 +210,8 @@ def run_kernel_bench(preset: str, out_dir: Path, timeout: int) -> list[dict]:
     rows: list[dict] = []
     for cfg in load_kernel_bench_matrix():
         cmd = [str(bench_exe)]
-        for key in ("kernel", "variant", "dtype", "n", "iters", "warmup"):
+        for key in ("kernel", "variant", "dtype", "approx", "n", "rows", "dim",
+                    "M", "N", "K", "iters", "warmup"):
             if key in cfg:
                 cmd += [f"--{key}", str(cfg[key])]
         start = time.perf_counter()

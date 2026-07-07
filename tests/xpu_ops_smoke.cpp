@@ -233,6 +233,40 @@ bool check_softmax(sycl::queue& q, DType dt, Variant variant, std::size_t rows,
 }
 
 template <typename T>
+bool check_gemm(sycl::queue& q, DType dt, Variant variant, std::size_t M,
+                std::size_t N, std::size_t K) {
+  T* A = sycl::malloc_shared<T>(M * K, q);
+  T* B = sycl::malloc_shared<T>(K * N, q);
+  T* C = sycl::malloc_shared<T>(M * N, q);
+  for (std::size_t i = 0; i < M * K; ++i) A[i] = static_cast<T>(sample(i) * 0.3f);
+  for (std::size_t i = 0; i < K * N; ++i) B[i] = static_cast<T>(sample(i + 5) * 0.3f);
+
+  ops::dense_gemm(q, A, B, C, M, N, K, dt, variant, /*blocking=*/true);
+
+  // Tolerance grows with the K-length accumulation; scale rtol by sqrt(K).
+  const Tol base = tol_for(dt);
+  const double rtol = base.rtol * std::sqrt(static_cast<double>(K));
+  double worst = 0.0, max_abs = 0.0;
+  for (std::size_t m = 0; m < M; ++m) {
+    for (std::size_t n = 0; n < N; ++n) {
+      double acc = 0.0;
+      for (std::size_t k = 0; k < K; ++k)
+        acc += static_cast<double>(A[m * K + k]) * static_cast<double>(B[k * N + n]);
+      const double ref = static_cast<double>(static_cast<T>(acc));
+      const double err = std::abs(static_cast<double>(C[m * N + n]) - ref);
+      max_abs = std::max(max_abs, err);
+      worst = std::max(worst, err - (base.atol + rtol * std::abs(ref)));
+    }
+  }
+  sycl::free(A, q); sycl::free(B, q); sycl::free(C, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  dense_gemm dt=" << dtype_name(dt) << " variant=" << variant_name(variant)
+            << " (" << M << "x" << N << "x" << K << ") max_abs=" << max_abs
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+template <typename T>
 bool check_rms_norm(sycl::queue& q, DType dt, Variant variant, std::size_t rows,
                     std::size_t dim) {
   const std::size_t n = rows * dim;
@@ -360,6 +394,12 @@ int main() {
   failures += check_glu<float>(q, DType::f32, ops::GluMode::geglu, "glu_geglu", 64, 1024) ? 0 : 1;
   failures += check_glu<bf16_t>(q, DType::bf16, ops::GluMode::swiglu, "glu_swiglu_bf16", 64, 1024) ? 0 : 1;
   failures += check_glu<float>(q, DType::f32, ops::GluMode::reglu, "glu_reglu", 64, 1000) ? 0 : 1;  // d not mult of 4: scalar path
+
+  // Dense GEMM, both variants, f32 + bf16.
+  for (const Variant v : variants) {
+    failures += check_gemm<float>(q, DType::f32, v, 128, 96, 160) ? 0 : 1;
+    failures += check_gemm<bf16_t>(q, DType::bf16, v, 128, 96, 160) ? 0 : 1;
+  }
 
   const std::size_t rows = 64, dim = 1024;
   for (const Variant v : variants) {

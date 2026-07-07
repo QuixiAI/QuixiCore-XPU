@@ -37,6 +37,7 @@
 #include "activations/glu/glu_kernel.hpp"
 #include "activations/silu/silu_kernel.hpp"
 #include "activations/softmax/softmax_kernel.hpp"
+#include "matmul/dense_gemm/dense_gemm_kernel.hpp"
 #include "norms/norms_kernel.hpp"
 
 namespace {
@@ -78,6 +79,7 @@ int main(int argc, char** argv) {
   std::size_t n = 1u << 20;  // 1,048,576 elements (elementwise kernels)
   std::size_t rows = 4096;   // row kernels: [rows, dim]
   std::size_t dim = 4096;
+  std::size_t M = 1024, N = 1024, K = 1024;  // gemm dims
   int iters = 50;
   int warmup = 10;
   std::size_t device_index = 0;
@@ -95,6 +97,9 @@ int main(int argc, char** argv) {
     else if (a == "--n") n = std::stoull(next());
     else if (a == "--rows") rows = std::stoull(next());
     else if (a == "--dim") dim = std::stoull(next());
+    else if (a == "--M") M = std::stoull(next());
+    else if (a == "--N") N = std::stoull(next());
+    else if (a == "--K") K = std::stoull(next());
     else if (a == "--iters") iters = std::stoi(next());
     else if (a == "--warmup") warmup = std::stoi(next());
     else if (a == "--device") device_index = std::stoull(next());
@@ -114,10 +119,50 @@ int main(int argc, char** argv) {
   sycl::queue q = make_gpu_queue(device_index, /*enable_profiling=*/true);
 
   const std::size_t elem = dtype_size(dt);
+  const bool is_gemm = (kernel == "dense_gemm");
   const bool is_softmax = (kernel == "softmax");
   const bool is_norm = (kernel == "rms_norm" || kernel == "layernorm");
   const bool is_glu = (kernel == "glu");
   const bool is_row = is_norm || is_softmax;
+
+  // GEMM has its own buffer set and metric; handle it and return early.
+  if (is_gemm) {
+    void* ga = sycl::malloc_device(M * K * elem, q);
+    void* gb = sycl::malloc_device(K * N * elem, q);
+    void* gc = sycl::malloc_device(M * N * elem, q);
+    q.memset(ga, 0, M * K * elem).wait();
+    q.memset(gb, 0, K * N * elem).wait();
+
+    auto gemm_once = [&]() -> sycl::event {
+      if (variant == Variant::vendor) {
+#if defined(QUIXICORE_XPU_HAS_ONEDNN)
+        return kernels::dense_gemm_onednn(q, ga, gb, gc, M, N, K, dt);
+#endif
+      }
+      return kernels::dense_gemm_sycl(q, ga, gb, gc, M, N, K, dt);
+    };
+    for (int i = 0; i < warmup; ++i) gemm_once().wait();
+    std::vector<double> s;
+    s.reserve(iters);
+    for (int i = 0; i < iters; ++i) {
+      sycl::event ev = gemm_once();
+      ev.wait();
+      s.push_back(event_ms(ev));
+    }
+    std::sort(s.begin(), s.end());
+    const double median = s[s.size() / 2];
+    const double gflops = 2.0 * static_cast<double>(M) * static_cast<double>(N) *
+                          static_cast<double>(K) / (median * 1e-3) / 1e9;
+    sycl::free(ga, q); sycl::free(gb, q); sycl::free(gc, q);
+    std::cout << "{\"schema_version\":2,\"kernel\":\"dense_gemm\",\"variant\":\""
+              << variant_name(variant) << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"M\":" << M << ",\"N\":" << N << ",\"K\":" << K
+              << ",\"iters\":" << iters << ",\"median_ms\":" << median
+              << ",\"gflops\":" << gflops << ",\"device\":\""
+              << q.get_device().get_info<sycl::info::device::name>() << "\"}"
+              << std::endl;
+    return 0;
+  }
 
   // Input/output element counts differ for GLU (input [rows,2*dim], out [rows,dim]).
   const std::size_t in_elems = is_glu ? rows * 2 * dim : (is_row ? rows * dim : n);
