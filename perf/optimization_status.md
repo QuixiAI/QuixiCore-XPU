@@ -471,6 +471,11 @@ of the ggml reference over random-byte blocks (no shared packer): worst_excess 0
 f32+bf16. Baseline 8192x8192 bf16 = 82 GB/s weight bandwidth. Proves the k-quant
 super-block layout decodes natively on Intel.
 
+### quantization/gguf_gemv — q5_K (native k-quant decode)
+q5_K = q4_K + a 5th bit per quant from qh[32] (bit shifts by 2 per 64-block),
+176-byte super-block. ggml dequantize_row_q5_K exactly. Correctness vs independent
+host replica: worst_excess 0, f32+bf16. Baseline 8192x8192 bf16 = 81 GB/s.
+
 ### quantization/gguf_gemv — q4_K (native k-quant decode, the common one)
 q4_K (144-byte super-block: fp16 d + dmin, 12-byte packed 6-bit scales+mins,
 qs[128]; 8 sub-blocks of 32; w = d*sc*q - dmin*m). Ported ggml get_scale_min_k4
