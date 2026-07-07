@@ -264,6 +264,68 @@ sycl::event gguf_q2k_typed(sycl::queue& q, const std::uint8_t* w, const T* x,
   });
 }
 
+// GGUF q3_K: 110-byte super-block (hmask[32], qs[64], scales[12], fp16 d). 16
+// sub-blocks of 16, 3-bit quant = 2 low bits (qs) + 1 inverted high bit (hmask);
+// 6-bit scales packed via a custom kmask bit-shuffle. Follows ggml
+// dequantize_row_q3_K exactly (the fiddliest k-quant).
+template <typename T>
+sycl::event gguf_q3k_typed(sycl::queue& q, const std::uint8_t* w, const T* x,
+                           T* y, std::size_t N, std::size_t K) {
+  const std::size_t sblocks = K / 256;
+  const std::size_t row_bytes = sblocks * 110;
+  const std::size_t nwg = (N + kRowsPerWG - 1) / kRowsPerWG;
+  const sycl::nd_range<1> ndr(sycl::range<1>(nwg * kWG), sycl::range<1>(kWG));
+  return q.parallel_for(ndr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSG)]] {
+    const sycl::sub_group sg = it.get_sub_group();
+    const std::size_t n = it.get_group(0) * kRowsPerWG + sg.get_group_linear_id();
+    const int lane = static_cast<int>(sg.get_local_linear_id());
+    if (n >= N) return;
+    const std::uint8_t* wrow = w + n * row_bytes;
+    constexpr std::uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
+
+    float acc = 0.0f;
+    for (std::size_t b = lane; b < sblocks; b += kSG) {
+      const std::uint8_t* blk = wrow + b * 110;
+      const std::uint8_t* hm = blk;
+      const std::uint8_t* qs = blk + 32;
+      const std::uint8_t* sc = blk + 96;
+      const float d = load_half(blk + 108);
+      // unpack the 16 int8 scales (ggml kmask shuffle)
+      auto rd32 = [&](int o) {
+        return static_cast<std::uint32_t>(sc[o]) | (static_cast<std::uint32_t>(sc[o + 1]) << 8) |
+               (static_cast<std::uint32_t>(sc[o + 2]) << 16) | (static_cast<std::uint32_t>(sc[o + 3]) << 24);
+      };
+      const std::uint32_t a0 = rd32(0), a1 = rd32(4), tmp = rd32(8);
+      std::uint32_t aux[4];
+      aux[2] = ((a0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+      aux[3] = ((a1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+      aux[0] = (a0 & kmask2) | (((tmp >> 0) & kmask1) << 4);
+      aux[1] = (a1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+      auto scl = [&](int i) { return static_cast<int>(static_cast<std::int8_t>((aux[i >> 2] >> (8 * (i & 3))) & 0xFF)); };
+
+      const std::size_t kbase = b * 256;
+      for (int h = 0; h < 2; ++h) {
+        const std::uint8_t* qb = qs + h * 32;
+        for (int j = 0; j < 4; ++j) {
+          const int shift = 2 * j;
+          const int is = h * 8 + j * 2;
+          const std::uint8_t mbit = static_cast<std::uint8_t>(1u << (h * 4 + j));
+          const float dl1 = d * (scl(is) - 32), dl2 = d * (scl(is + 1) - 32);
+          const std::size_t yb = kbase + h * 128 + j * 32;
+          for (int l = 0; l < 16; ++l) {
+            const int v1 = static_cast<int>((qb[l] >> shift) & 3) - ((hm[l] & mbit) ? 0 : 4);
+            const int v2 = static_cast<int>((qb[l + 16] >> shift) & 3) - ((hm[l + 16] & mbit) ? 0 : 4);
+            acc += dl1 * v1 * static_cast<float>(x[yb + l]);
+            acc += dl2 * v2 * static_cast<float>(x[yb + 16 + l]);
+          }
+        }
+      }
+    }
+    const float sum = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+    if (lane == 0) y[n] = static_cast<T>(sum);
+  });
+}
+
 template <typename T>
 sycl::event dispatch_type(sycl::queue& q, const std::uint8_t* w, const T* x, T* y,
                           std::size_t N, std::size_t K, int type) {
@@ -271,6 +333,7 @@ sycl::event dispatch_type(sycl::queue& q, const std::uint8_t* w, const T* x, T* 
   if (type == 3) return gguf_q4k_typed<T>(q, w, x, y, N, K);
   if (type == 4) return gguf_q5k_typed<T>(q, w, x, y, N, K);
   if (type == 5) return gguf_q2k_typed<T>(q, w, x, y, N, K);
+  if (type == 6) return gguf_q3k_typed<T>(q, w, x, y, N, K);
   return type == 0 ? gguf_typed<T, 0>(q, w, x, y, N, K)
                    : gguf_typed<T, 1>(q, w, x, y, N, K);
 }

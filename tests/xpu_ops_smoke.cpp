@@ -639,6 +639,67 @@ bool check_qgemm_int8(sycl::queue& q, DType out_dt, Variant variant,
 }
 
 template <typename T>
+bool check_gguf_q3k(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K) {
+  const std::size_t sb = K / 256, row_bytes = sb * 110;
+  std::uint8_t* w = sycl::malloc_shared<std::uint8_t>(N * row_bytes, q);
+  T* x = sycl::malloc_shared<T>(K, q);
+  T* y = sycl::malloc_shared<T>(N, q);
+  const std::uint16_t db = sycl::bit_cast<std::uint16_t>(static_cast<half_t>(0.02f));
+  for (std::size_t n = 0; n < N; ++n)
+    for (std::size_t b = 0; b < sb; ++b) {
+      std::uint8_t* blk = w + n * row_bytes + b * 110;
+      for (int i = 0; i < 108; ++i) blk[i] = static_cast<std::uint8_t>((std::size_t)(sample((n * sb + b) * 110 + i) * 128 + 128) & 0xFF);
+      blk[108] = db & 0xFF; blk[109] = db >> 8;
+    }
+  for (std::size_t k = 0; k < K; ++k) x[k] = static_cast<T>(sample(k + 101));
+  ops::gguf_gemv(q, w, x, y, N, K, ops::GgufType::q3_K, act_dt, Variant::sycl, true);
+
+  auto lh = [](const std::uint8_t* p) { std::uint16_t b = p[0] | (p[1] << 8); return (double)sycl::bit_cast<half_t>(b); };
+  const std::uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
+  const Tol tol = tol_for(act_dt);
+  const double rtol = tol.rtol * std::sqrt((double)K) + 3e-3;
+  double worst = 0.0;
+  for (std::size_t n = 0; n < N; ++n) {
+    double acc = 0.0;
+    const std::uint8_t* wrow = w + n * row_bytes;
+    for (std::size_t b = 0; b < sb; ++b) {
+      const std::uint8_t* blk = wrow + b * 110;
+      const std::uint8_t* hm = blk; const std::uint8_t* qs = blk + 32; const std::uint8_t* sc = blk + 96;
+      const double d = lh(blk + 108);
+      auto rd32 = [&](int o){ return (std::uint32_t)sc[o] | ((std::uint32_t)sc[o+1]<<8) | ((std::uint32_t)sc[o+2]<<16) | ((std::uint32_t)sc[o+3]<<24); };
+      const std::uint32_t a0 = rd32(0), a1 = rd32(4), tmp = rd32(8);
+      std::uint32_t aux[4];
+      aux[2] = ((a0>>4)&kmask2) | (((tmp>>4)&kmask1)<<4);
+      aux[3] = ((a1>>4)&kmask2) | (((tmp>>6)&kmask1)<<4);
+      aux[0] = (a0&kmask2) | (((tmp>>0)&kmask1)<<4);
+      aux[1] = (a1&kmask2) | (((tmp>>2)&kmask1)<<4);
+      auto scl = [&](int i){ return (int)(std::int8_t)((aux[i>>2] >> (8*(i&3))) & 0xFF); };
+      for (int h = 0; h < 2; ++h) {
+        const std::uint8_t* qb = qs + h * 32;
+        for (int j = 0; j < 4; ++j) {
+          const int shift = 2 * j, is = h * 8 + j * 2; const std::uint8_t mbit = (std::uint8_t)(1u << (h*4+j));
+          const double dl1 = d * (scl(is) - 32), dl2 = d * (scl(is + 1) - 32);
+          const std::size_t yb = b * 256 + h * 128 + j * 32;
+          for (int l = 0; l < 16; ++l) {
+            const int v1 = (int)((qb[l]>>shift)&3) - ((hm[l] & mbit) ? 0 : 4);
+            const int v2 = (int)((qb[l+16]>>shift)&3) - ((hm[l+16] & mbit) ? 0 : 4);
+            acc += dl1 * v1 * (double)x[yb + l];
+            acc += dl2 * v2 * (double)x[yb + 16 + l];
+          }
+        }
+      }
+    }
+    const double ref = (double)static_cast<T>(acc);
+    worst = std::max(worst, std::abs((double)y[n] - ref) - (tol.atol + rtol * std::abs(ref)));
+  }
+  sycl::free(w, q); sycl::free(x, q); sycl::free(y, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  gguf_gemv q3_K act=" << dtype_name(act_dt) << " (N=" << N << " K=" << K
+            << ") worst_excess=" << worst << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+template <typename T>
 bool check_gguf_q2k(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K) {
   const std::size_t sb = K / 256, row_bytes = sb * 84;
   std::uint8_t* w = sycl::malloc_shared<std::uint8_t>(N * row_bytes, q);
@@ -1353,6 +1414,8 @@ int main() {
   failures += check_gguf_q5k<bf16_t>(q, DType::bf16, 128, 4096) ? 0 : 1;
   failures += check_gguf_q2k<float>(q, DType::f32, 128, 4096) ? 0 : 1;
   failures += check_gguf_q2k<bf16_t>(q, DType::bf16, 128, 4096) ? 0 : 1;
+  failures += check_gguf_q3k<float>(q, DType::f32, 128, 4096) ? 0 : 1;
+  failures += check_gguf_q3k<bf16_t>(q, DType::bf16, 128, 4096) ? 0 : 1;
 
   // int8 w8a8 GEMM, both variants.
   for (const Variant v : variants) {
