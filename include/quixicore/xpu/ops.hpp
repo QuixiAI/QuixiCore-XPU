@@ -183,6 +183,21 @@ void linear_attn(sycl::queue& q, const void* Q, const void* K, const void* V,
                  DType dt, Variant variant = Variant::sycl, bool blocking = true);
 
 // ----------------------------------------------------------------------------
+// ssm (state-space / Mamba)
+// ----------------------------------------------------------------------------
+
+// Mamba selective scan (S6), forward. Per channel c and state s the recurrence
+// is h_s = exp(delta*A[c,s]) * h_s + delta*B[t,s]*u[c,t]; y[c,t] = sum_s C[t,s]*h_s
+// + D[c]*u[c,t]. Shapes: u,delta [n_chan, seq]; A [n_chan, state]; B,C [seq,
+// state] (shared across channels); D [n_chan]; y [n_chan, seq]. All dtype dt
+// except the recurrence runs in fp32. `state` <= 16. Native-only (sequential).
+void selective_scan(sycl::queue& q, const void* u, const void* delta,
+                    const void* A, const void* B, const void* C, const void* D,
+                    void* y, std::size_t n_chan, std::size_t seq,
+                    std::size_t state, DType dt, Variant variant = Variant::sycl,
+                    bool blocking = true);
+
+// ----------------------------------------------------------------------------
 // matmul
 // ----------------------------------------------------------------------------
 

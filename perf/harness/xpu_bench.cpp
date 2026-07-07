@@ -50,6 +50,7 @@
 #include "sampling/argmax/argmax_kernel.hpp"
 #include "linear_attention/linear_attn/linear_attn_kernel.hpp"
 #include "moe/moe_route/moe_route_kernel.hpp"
+#include "ssm/selective_scan/selective_scan_kernel.hpp"
 #include "serving/serving_kernel.hpp"
 #include "utils/utils_kernel.hpp"
 
@@ -357,6 +358,27 @@ int main(int argc, char** argv) {
               << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>()
               << "\"}" << std::endl;
   };
+  if (kernel == "selective_scan") {
+    const std::size_t nc = rows, seq = dim, st = 16;
+    void* u = sycl::malloc_device(nc * seq * elem, q);
+    void* dl = sycl::malloc_device(nc * seq * elem, q);
+    void* A = sycl::malloc_device(nc * st * elem, q);
+    void* B = sycl::malloc_device(seq * st * elem, q);
+    void* C = sycl::malloc_device(seq * st * elem, q);
+    void* D = sycl::malloc_device(nc * elem, q);
+    void* y = sycl::malloc_device(nc * seq * elem, q);
+    q.memset(u, 0, nc * seq * elem).wait(); q.memset(dl, 0, nc * seq * elem).wait();
+    q.memset(A, 0, nc * st * elem).wait(); q.memset(B, 0, seq * st * elem).wait();
+    q.memset(C, 0, seq * st * elem).wait(); q.memset(D, 0, nc * elem).wait();
+    const double med = time_median([&] { return kernels::selective_scan_sycl(q, u, dl, A, B, C, D, y, nc, seq, st, dt); });
+    const double gtok = static_cast<double>(nc) * seq / (med * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"selective_scan\",\"variant\":\"sycl\",\"dtype\":\""
+              << dtype_name(dt) << "\",\"chan\":" << nc << ",\"seq\":" << seq << ",\"state\":" << st
+              << ",\"iters\":" << iters << ",\"median_ms\":" << med << ",\"Gelem_s\":" << gtok
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(u, q); sycl::free(dl, q); sycl::free(A, q); sycl::free(B, q); sycl::free(C, q); sycl::free(D, q); sycl::free(y, q);
+    return 0;
+  }
   if (kernel == "linear_attn") {
     const std::size_t nh = rows, seq = dim, d = 64;
     const std::size_t sz = nh * seq * d * elem;

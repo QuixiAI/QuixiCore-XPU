@@ -295,6 +295,48 @@ bool check_linear_attn(sycl::queue& q, DType dt, std::size_t nh, std::size_t seq
   return ok;
 }
 
+template <typename T>
+bool check_selective_scan(sycl::queue& q, DType dt, std::size_t nc, std::size_t seq, std::size_t st) {
+  T* u = sycl::malloc_shared<T>(nc * seq, q);
+  T* delta = sycl::malloc_shared<T>(nc * seq, q);
+  T* A = sycl::malloc_shared<T>(nc * st, q);
+  T* B = sycl::malloc_shared<T>(seq * st, q);
+  T* C = sycl::malloc_shared<T>(seq * st, q);
+  T* D = sycl::malloc_shared<T>(nc, q);
+  T* y = sycl::malloc_shared<T>(nc * seq, q);
+  for (std::size_t i = 0; i < nc * seq; ++i) { u[i] = static_cast<T>(sample(i)); delta[i] = static_cast<T>(0.05f + 0.05f * std::abs(sample(i + 3))); }
+  for (std::size_t i = 0; i < nc * st; ++i) A[i] = static_cast<T>(-0.5f - 0.5f * std::abs(sample(i + 5)));  // negative (stable)
+  for (std::size_t i = 0; i < seq * st; ++i) { B[i] = static_cast<T>(sample(i + 7)); C[i] = static_cast<T>(sample(i + 11)); }
+  for (std::size_t i = 0; i < nc; ++i) D[i] = static_cast<T>(sample(i + 13));
+
+  ops::selective_scan(q, u, delta, A, B, C, D, y, nc, seq, st, dt, Variant::sycl, true);
+
+  const Tol tol = tol_for(dt);
+  const double rtol = tol.rtol * std::sqrt(static_cast<double>(seq)) + 5e-3;
+  double worst = 0.0;
+  std::vector<double> h(st);
+  for (std::size_t c = 0; c < nc; ++c) {
+    std::fill(h.begin(), h.end(), 0.0);
+    for (std::size_t t = 0; t < seq; ++t) {
+      const double dt_ = (double)delta[c * seq + t], ut = (double)u[c * seq + t];
+      double yt = 0;
+      for (std::size_t s = 0; s < st; ++s) {
+        const double dA = std::exp(dt_ * (double)A[c * st + s]);
+        h[s] = dA * h[s] + dt_ * (double)B[t * st + s] * ut;
+        yt += (double)C[t * st + s] * h[s];
+      }
+      const double ref = (double)static_cast<T>(yt + (double)D[c] * ut);
+      worst = std::max(worst, std::abs((double)y[c * seq + t] - ref) - (tol.atol + rtol * std::abs(ref)));
+    }
+  }
+  sycl::free(u, q); sycl::free(delta, q); sycl::free(A, q); sycl::free(B, q);
+  sycl::free(C, q); sycl::free(D, q); sycl::free(y, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  selective_scan dt=" << dtype_name(dt) << " (c=" << nc << " s=" << seq
+            << " N=" << st << ") worst_excess=" << worst << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // Explicit mantissa bits per storage dtype (for the 1-ULP allowance below).
 int mantissa_bits(DType dt) {
   switch (dt) {
@@ -1022,6 +1064,10 @@ int main() {
   // linear_attention: non-causal linear attention.
   failures += check_linear_attn<float>(q, DType::f32, 8, 256, 64) ? 0 : 1;
   failures += check_linear_attn<bf16_t>(q, DType::bf16, 8, 128, 64) ? 0 : 1;
+
+  // ssm: Mamba selective scan.
+  failures += check_selective_scan<float>(q, DType::f32, 1024, 512, 16) ? 0 : 1;
+  failures += check_selective_scan<bf16_t>(q, DType::bf16, 1024, 256, 16) ? 0 : 1;
 
   // moe: top-k routing.
   failures += check_moe_route<float>(q, DType::f32, 512, 64, 2) ? 0 : 1;

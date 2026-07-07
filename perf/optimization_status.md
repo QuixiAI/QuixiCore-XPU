@@ -460,6 +460,14 @@ Correctness: exact match (embedding gather; scatter->gather round-trip),
 f32 + bf16, 0 mismatches. Baseline: embedding bf16 8192x4096 = 258 GB/s
 (scattered table gather, below streaming roofline as expected). Native-only.
 
+### ssm — selective_scan (Mamba S6 forward, native)
+One work-item per channel; state vector h[state] in registers; the scan runs
+sequentially over seq (inherently serial recurrence), parallelism from the many
+independent channels. fp32 recurrence. Correctness vs fp64 (worst_excess 0,
+sqrt(seq) tol), f32+bf16. Baseline 4096 chan x 2048 x 16 state = 1.5 Gelem/s
+(sequential-bound). Native-only; the chunked parallel scan (ssd_chunk_*) is the
+optimization, deferred to the ssm depth wave.
+
 ### linear_attention — linear_attn (non-causal, native)
 Exploits linear-attention associativity O = Q(K^T V): one work-group per head
 builds the (dim x dim) KV state + (dim) normalizer z in SLM (O(seq*dim^2)), then
