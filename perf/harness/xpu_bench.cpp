@@ -42,6 +42,7 @@
 #include "matmul/dense_gemm/dense_gemm_kernel.hpp"
 #include "norms/norms_kernel.hpp"
 #include "optimizers/adamw/adamw_kernel.hpp"
+#include "quantization/act_quant/act_quant_kernel.hpp"
 #include "quantization/fp8_gemm/fp8_kernel.hpp"
 #include "quantization/gguf_gemv/gguf_kernel.hpp"
 #include "quantization/mxfp4_gemv/mxfp4_kernel.hpp"
@@ -424,6 +425,16 @@ int main(int argc, char** argv) {
     const double med = time_median([&] { return kernels::sample_categorical_sycl(q, lg, o, rows, dim, 1.0f, 5u, dt); });
     emit(med, static_cast<double>(rows) * dim * elem / (med * 1e-3) / 1e9);
     sycl::free(lg, q); sycl::free(o, q);
+    return 0;
+  }
+  if (kernel == "act_quant") {
+    void* xx = sycl::malloc_device(rows * dim * elem, q);
+    signed char* qo = sycl::malloc_device<signed char>(rows * dim, q);
+    float* sc = sycl::malloc_device<float>(rows, q);
+    q.memset(xx, 0, rows * dim * elem).wait();
+    const double med = time_median([&] { return kernels::act_quant_int8_sycl(q, xx, qo, sc, rows, dim, dt); });
+    emit(med, (static_cast<double>(rows) * dim * elem + static_cast<double>(rows) * dim) / (med * 1e-3) / 1e9);
+    sycl::free(xx, q); sycl::free(qo, q); sycl::free(sc, q);
     return 0;
   }
   if (kernel == "moe_route") {

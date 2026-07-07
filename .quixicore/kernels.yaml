@@ -159,6 +159,14 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/sampling/sample/variants/xpu_sycl}
+  act_quant_int8:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/act_quant
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/quantization/act_quant/variants/xpu_sycl}
   qgemv_int4:
     family: quantization
     status: implemented

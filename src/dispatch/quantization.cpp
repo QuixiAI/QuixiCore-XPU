@@ -4,6 +4,7 @@
 
 #include "quixicore/xpu/ops.hpp"
 
+#include "quantization/act_quant/act_quant_kernel.hpp"
 #include "quantization/fp8_gemm/fp8_kernel.hpp"
 #include "quantization/gguf_gemv/gguf_kernel.hpp"
 #include "quantization/mxfp4_gemv/mxfp4_kernel.hpp"
@@ -37,6 +38,14 @@ void nvfp4_gemv(sycl::queue& q, const void* w_packed, const void* block_scales,
   (void)variant;  // native only
   sycl::event ev = kernels::nvfp4_gemv_sycl(q, w_packed, block_scales,
                                             global_scale, x, y, N, K, act_dt);
+  if (blocking) ev.wait();
+}
+
+void act_quant_int8(sycl::queue& q, const void* x, signed char* q_out,
+                    float* scale, std::size_t rows, std::size_t dim, DType dt,
+                    Variant variant, bool blocking) {
+  (void)variant;
+  sycl::event ev = kernels::act_quant_int8_sycl(q, x, q_out, scale, rows, dim, dt);
   if (blocking) ev.wait();
 }
 

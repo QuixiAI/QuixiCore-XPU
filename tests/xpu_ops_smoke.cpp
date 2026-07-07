@@ -794,6 +794,32 @@ bool check_gguf_iq1s(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K)
 }
 
 template <typename T>
+bool check_act_quant(sycl::queue& q, DType dt, std::size_t rows, std::size_t dim) {
+  T* x = sycl::malloc_shared<T>(rows * dim, q);
+  signed char* qo = sycl::malloc_shared<signed char>(rows * dim, q);
+  float* scale = sycl::malloc_shared<float>(rows, q);
+  for (std::size_t i = 0; i < rows * dim; ++i) x[i] = static_cast<T>(sample(i) * 6.0f);
+  ops::act_quant_int8(q, x, qo, scale, rows, dim, dt, Variant::sycl, true);
+
+  int bad_scale = 0; double worst_recon = 0.0;
+  for (std::size_t r = 0; r < rows; ++r) {
+    double amax = 0;
+    for (std::size_t j = 0; j < dim; ++j) amax = std::max(amax, std::abs((double)x[r * dim + j]));
+    const double ref_s = amax / 127.0;
+    if (std::abs((double)scale[r] - ref_s) > 1e-4 * std::max(1.0, ref_s)) ++bad_scale;
+    for (std::size_t j = 0; j < dim; ++j) {
+      const double recon = (double)qo[r * dim + j] * (double)scale[r];
+      worst_recon = std::max(worst_recon, std::abs(recon - (double)x[r * dim + j]) - (double)scale[r] * 0.51);
+    }
+  }
+  sycl::free(x, q); sycl::free(qo, q); sycl::free(scale, q);
+  const bool ok = (bad_scale == 0) && (worst_recon <= 0.0);
+  std::cout << "  act_quant_int8 dt=" << dtype_name(dt) << " bad_scale=" << bad_scale
+            << " recon_excess=" << worst_recon << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+template <typename T>
 bool check_gguf_iquant(sycl::queue& q, DType act_dt, ops::GgufType gt, const char* name,
                        std::size_t N, std::size_t K) {
   const int BB = (gt == ops::GgufType::iq2_xxs) ? 66 : (gt == ops::GgufType::iq2_xs) ? 74 : 98;
@@ -1699,6 +1725,10 @@ int main() {
   failures += check_gguf_iquant<float>(q, DType::f32, ops::GgufType::iq3_xxs, "iq3_xxs", 128, 4096) ? 0 : 1;
   failures += check_gguf_iq1s<float>(q, DType::f32, 128, 4096) ? 0 : 1;
   failures += check_gguf_iq1s<bf16_t>(q, DType::bf16, 128, 4096) ? 0 : 1;
+
+  // act_quant: per-token int8 activation quantization (feeds w8a8).
+  failures += check_act_quant<float>(q, DType::f32, 128, 4096) ? 0 : 1;
+  failures += check_act_quant<bf16_t>(q, DType::bf16, 128, 4096) ? 0 : 1;
 
   // int8 w8a8 GEMM, both variants.
   for (const Variant v : variants) {

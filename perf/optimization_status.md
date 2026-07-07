@@ -460,6 +460,15 @@ Correctness: exact match (embedding gather; scatter->gather round-trip),
 f32 + bf16, 0 mismatches. Baseline: embedding bf16 8192x4096 = 258 GB/s
 (scattered table gather, below streaming roofline as expected). Native-only.
 
+## 2026-07-07: quantization — act_quant (w8a8 activation quant) + all formats done
+
+### quantization/act_quant — per-token int8 activation quantization
+Work-group per row: reduce |max|, scale = |max|/127, round each element to int8.
+Produces the int8 activations + per-row scales consumed by qgemm_int8 -> the w8a8
+pipeline is now end-to-end (quantize acts -> XMX int8 GEMM at 182 TOPS ->
+dequant). Correctness: exact per-row scale + reconstruction within half a quant
+step, f32+bf16.
+
 ## 2026-07-07: Track B quant depth — GGUF q6_K k-quant
 
 ### quantization/gguf_gemv — q6_K (native k-quant decode)

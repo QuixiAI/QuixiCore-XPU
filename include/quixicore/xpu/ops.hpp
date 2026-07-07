@@ -336,6 +336,13 @@ void gguf_gemv(sycl::queue& q, const void* w_blocks, const void* x, void* y,
                std::size_t N, std::size_t K, GgufType type, DType act_dt,
                Variant variant = Variant::sycl, bool blocking = true);
 
+// Per-token symmetric int8 activation quantization. `x` [rows, dim] dtype dt ->
+// `q` [rows, dim] int8 + `scale` [rows] fp32, where scale = rowmax(|x|)/127 and
+// q = round(x/scale). Feeds qgemm_int8 (the w8a8 path). Native.
+void act_quant_int8(sycl::queue& q, const void* x, signed char* q_out,
+                    float* scale, std::size_t rows, std::size_t dim, DType dt,
+                    Variant variant = Variant::sycl, bool blocking = true);
+
 // int8 w8a8 GEMM: C[M,N] = (A_int8[M,K] @ B_int8[K,N]) * a_scale[M] * b_scale[N].
 // A, B are int8 device pointers; a_scale (per-row/token) and b_scale (per-col/
 // channel) are fp32 [M] and [N]; C is `out_dt` (f32/f16/bf16). Accumulates int32.
