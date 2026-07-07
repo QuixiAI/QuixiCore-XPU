@@ -319,6 +319,55 @@ bool check_qgemm_int8(sycl::queue& q, DType out_dt, Variant variant,
 }
 
 template <typename T>
+bool check_mxfp4_gemv(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K) {
+  const float e2m1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+  const std::size_t bpr = K / 2, blkpr = K / 32;
+  std::uint8_t* w = sycl::malloc_shared<std::uint8_t>(N * bpr, q);
+  std::uint8_t* bs = sycl::malloc_shared<std::uint8_t>(N * blkpr, q);
+  T* x = sycl::malloc_shared<T>(K, q);
+  T* y = sycl::malloc_shared<T>(N, q);
+
+  auto nib = [&](std::size_t i) {  // random e2m1 nibble
+    int mag = static_cast<int>(std::floor((sample(i) * 0.5f + 0.5f) * 8.0f)) & 7;
+    int sign = (sample(i + 1) < 0.0f) ? 8 : 0;
+    return static_cast<std::uint8_t>(sign | mag);
+  };
+  for (std::size_t n = 0; n < N; ++n) {
+    for (std::size_t b = 0; b < bpr; ++b)
+      w[n * bpr + b] = static_cast<std::uint8_t>(nib(n * K + 2 * b) | (nib(n * K + 2 * b + 1) << 4));
+    for (std::size_t g = 0; g < blkpr; ++g)
+      bs[n * blkpr + g] = static_cast<std::uint8_t>(124 + (static_cast<int>((g + n) % 5)));  // ~2^-3..2^1
+  }
+  for (std::size_t k = 0; k < K; ++k) x[k] = static_cast<T>(sample(k + 21));
+
+  ops::mxfp4_gemv(q, w, bs, x, y, N, K, act_dt, Variant::sycl, true);
+
+  const Tol base = tol_for(act_dt);
+  const double rtol = base.rtol * std::sqrt(static_cast<double>(K)) + 3e-3;
+  double worst = 0.0, max_abs = 0.0;
+  for (std::size_t n = 0; n < N; ++n) {
+    double acc = 0.0;
+    for (std::size_t k = 0; k < K; ++k) {
+      const std::uint8_t byte = w[n * bpr + k / 2];
+      const int n4 = (k & 1) ? (byte >> 4) : (byte & 0xF);
+      double val = e2m1[n4 & 7];
+      if (n4 & 8) val = -val;
+      const double scale = std::ldexp(1.0, static_cast<int>(bs[n * blkpr + k / 32]) - 127);
+      acc += val * scale * static_cast<double>(x[k]);
+    }
+    const double ref = static_cast<double>(static_cast<T>(acc));
+    const double err = std::abs(static_cast<double>(y[n]) - ref);
+    max_abs = std::max(max_abs, err);
+    worst = std::max(worst, err - (base.atol + rtol * std::abs(ref)));
+  }
+  sycl::free(w, q); sycl::free(bs, q); sycl::free(x, q); sycl::free(y, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  mxfp4_gemv act=" << dtype_name(act_dt) << " (N=" << N << " K=" << K
+            << ") max_abs=" << max_abs << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+template <typename T>
 bool check_qgemv_int4(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K,
                       std::size_t group) {
   const std::size_t bpr = K / 2;         // bytes per row
@@ -619,6 +668,10 @@ int main() {
   // int4 quantized GEMV (native).
   failures += check_qgemv_int4<float>(q, DType::f32, 128, 4096, 128) ? 0 : 1;
   failures += check_qgemv_int4<bf16_t>(q, DType::bf16, 128, 4096, 128) ? 0 : 1;
+
+  // mxfp4 GEMV (native e2m1 + e8m0 block-scale decode).
+  failures += check_mxfp4_gemv<float>(q, DType::f32, 128, 4096) ? 0 : 1;
+  failures += check_mxfp4_gemv<bf16_t>(q, DType::bf16, 128, 4096) ? 0 : 1;
 
   // int8 w8a8 GEMM, both variants.
   for (const Variant v : variants) {

@@ -42,6 +42,7 @@
 #include "norms/norms_kernel.hpp"
 #include "optimizers/adamw/adamw_kernel.hpp"
 #include "quantization/fp8_gemm/fp8_kernel.hpp"
+#include "quantization/mxfp4_gemv/mxfp4_kernel.hpp"
 #include "quantization/qgemm/qgemm_kernel.hpp"
 #include "quantization/qgemv/qgemv_kernel.hpp"
 #include "sampling/argmax/argmax_kernel.hpp"
@@ -229,6 +230,32 @@ int main(int argc, char** argv) {
               << ",\"gops\":" << gops << ",\"device\":\""
               << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
     sycl::free(A, q); sycl::free(B, q); sycl::free(as, q); sycl::free(bs, q); sycl::free(C, q);
+    return 0;
+  }
+
+  if (kernel == "mxfp4_gemv") {
+    const std::size_t Nn = rows, Kk = dim;
+    void* w = sycl::malloc_device(Nn * (Kk / 2), q);       // fp4 packed
+    void* bs = sycl::malloc_device(Nn * (Kk / 32), q);     // e8m0 block scales
+    void* xx = sycl::malloc_device(Kk * elem, q);
+    void* yy = sycl::malloc_device(Nn * elem, q);
+    q.memset(w, 0, Nn * (Kk / 2)).wait();
+    q.memset(bs, 127, Nn * (Kk / 32)).wait();
+    q.memset(xx, 0, Kk * elem).wait();
+    auto once = [&] { return kernels::mxfp4_gemv_sycl(q, w, bs, xx, yy, Nn, Kk, dt); };
+    for (int i = 0; i < warmup; ++i) once().wait();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) { sycl::event e = once(); e.wait(); s.push_back(event_ms(e)); }
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    const double wbytes = static_cast<double>(Nn) * static_cast<double>(Kk) / 2.0;  // fp4 = 0.5 byte
+    std::cout << "{\"schema_version\":2,\"kernel\":\"mxfp4_gemv\",\"variant\":\"sycl\",\"dtype\":\""
+              << dtype_name(dt) << "\",\"N\":" << Nn << ",\"K\":" << Kk
+              << ",\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"weight_gbps\":" << (wbytes / (med * 1e-3) / 1e9)
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>()
+              << "\"}" << std::endl;
+    sycl::free(w, q); sycl::free(bs, q); sycl::free(xx, q); sycl::free(yy, q);
     return 0;
   }
 

@@ -163,6 +163,18 @@ void fp8_encode(sycl::queue& q, const float* in, void* out_fp8, std::size_t n,
 void fp8_decode(sycl::queue& q, const void* in_fp8, float* out, std::size_t n,
                 Fp8Kind kind, bool blocking = true);
 
+// mxfp4 GEMV (OCP microscaling FP4), native decode. Weight W is [N, K] of e2m1
+// (fp4) elements packed 2/byte along K, with one e8m0 (power-of-two) block scale
+// per 32 elements: `block_scales` is [N, K/32] uint8. Activation `x` is [K] and
+// output `y` is [N], dtype `act_dt`. Dequant in fp32:
+//   w = e2m1(nibble) * 2^(e8m0 - 127);  y[n] = sum_k w * x[k]
+// K must be a multiple of 32. Proves mxfp4 (not a hardware feature) runs
+// natively on Intel via a hand-written decoder.
+void mxfp4_gemv(sycl::queue& q, const void* w_packed, const void* block_scales,
+                const void* x, void* y, std::size_t N, std::size_t K,
+                DType act_dt, Variant variant = Variant::sycl,
+                bool blocking = true);
+
 // int8 w8a8 GEMM: C[M,N] = (A_int8[M,K] @ B_int8[K,N]) * a_scale[M] * b_scale[N].
 // A, B are int8 device pointers; a_scale (per-row/token) and b_scale (per-col/
 // channel) are fp32 [M] and [N]; C is `out_dt` (f32/f16/bf16). Accumulates int32.

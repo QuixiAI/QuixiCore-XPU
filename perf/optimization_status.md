@@ -384,6 +384,27 @@ claim; do ship fp8 correctness/portability.
 Decision: keep fp8_gemm (vendor) + codecs for correctness/portability; flag "not
 accelerated on B60" in metadata. Revisit on a future Intel GPU with native fp8.
 
+## 2026-07-07: quantization/mxfp4_gemv — OCP microscaling FP4 decodes natively on Intel
+
+Status: landed (native SYCL, hand-written decoder — no vendor path).
+
+Format: OCP mxfp4 — e2m1 (fp4) elements packed 2/byte, e8m0 (power-of-two) block
+scale per 32 elements. Decoder: 8-entry e2m1 magnitude LUT {0,.5,1,1.5,2,3,4,6}
++ sign bit, block scale = 2^(e8m0 - 127). Reuses the tuned qgemv structure (one
+32-wide subgroup per row, 16-byte wide loads); a 16-byte chunk is exactly one
+32-element mx block, so one scale per chunk.
+
+Correctness (act f32 + bf16, N=128 K=4096) vs an fp64 decode reference: pass
+(f32 max_abs 1e-3, bf16 0). The point: mxfp4 is a data encoding (fixed LUT +
+power-of-two scale), NOT Blackwell silicon — it decodes natively on the B60 via
+a hand-written kernel.
+
+Baseline (8192x8192, bf16): 0.386 ms, 87 GB/s weight bandwidth. About on par
+with the fp16 GEMV (0.303 ms) and a bit behind the int4 qgemv (0.257 ms) -- the
+extra e2m1 LUT + per-block exp2 decode ALU is the difference. Correct and
+functional; optimization (hoist the block scale to a float pre-pass, cut decode
+ALU) deferred. mxfp4 -> experimental in quant-formats.yaml.
+
 ## First Kernel Plan
 
 Status: in progress — 7 families now have implementations: activations (gelu,

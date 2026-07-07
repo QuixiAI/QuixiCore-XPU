@@ -5,10 +5,20 @@
 #include "quixicore/xpu/ops.hpp"
 
 #include "quantization/fp8_gemm/fp8_kernel.hpp"
+#include "quantization/mxfp4_gemv/mxfp4_kernel.hpp"
 #include "quantization/qgemm/qgemm_kernel.hpp"
 #include "quantization/qgemv/qgemv_kernel.hpp"
 
 namespace quixicore::xpu::ops {
+
+void mxfp4_gemv(sycl::queue& q, const void* w_packed, const void* block_scales,
+                const void* x, void* y, std::size_t N, std::size_t K,
+                DType act_dt, Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev =
+      kernels::mxfp4_gemv_sycl(q, w_packed, block_scales, x, y, N, K, act_dt);
+  if (blocking) ev.wait();
+}
 
 void fp8_gemm(sycl::queue& q, const void* a_fp8, const void* b_fp8, void* c,
               std::size_t M, std::size_t N, std::size_t K, Fp8Kind kind,
