@@ -1,0 +1,26 @@
+#pragma once
+
+#include <cstddef>
+
+#include <sycl/sycl.hpp>
+
+#include "quixicore/xpu/runtime.hpp"
+
+namespace quixicore::xpu::kernels {
+
+// kind: 0 = e4m3, 1 = e5m2.
+#if defined(QUIXICORE_XPU_HAS_ONEDNN)
+// fp8 GEMM via oneDNN. Returns false (and leaves an unspecified event) if the
+// device/library cannot build an fp8 matmul primitive; the caller reports it.
+bool fp8_gemm_onednn(sycl::queue& q, const void* a, const void* b, void* c,
+                     std::size_t M, std::size_t N, std::size_t K, int kind,
+                     float scale, DType out_dt);
+
+// Codec helpers (oneDNN reorder) so tests need no hand-written fp8 encoder:
+// f32 -> fp8 (out is 1 byte/elem) and fp8 -> f32.
+void fp8_from_f32(sycl::queue& q, const float* in, void* out_fp8, std::size_t n, int kind);
+void fp8_to_f32(sycl::queue& q, const void* in_fp8, float* out, std::size_t n, int kind);
+bool fp8_supported();
+#endif
+
+}  // namespace quixicore::xpu::kernels

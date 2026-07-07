@@ -41,6 +41,7 @@
 #include "matmul/dense_gemm/dense_gemm_kernel.hpp"
 #include "norms/norms_kernel.hpp"
 #include "optimizers/adamw/adamw_kernel.hpp"
+#include "quantization/fp8_gemm/fp8_kernel.hpp"
 #include "quantization/qgemm/qgemm_kernel.hpp"
 #include "quantization/qgemv/qgemv_kernel.hpp"
 #include "sampling/argmax/argmax_kernel.hpp"
@@ -169,6 +170,36 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+#if defined(QUIXICORE_XPU_HAS_ONEDNN)
+  if (kernel == "fp8_gemm") {
+    void* A = sycl::malloc_device(M * K, q);   // 1 byte/elem
+    void* B = sycl::malloc_device(K * N, q);
+    void* C = sycl::malloc_device(M * N * elem, q);
+    q.memset(A, 0, M * K).wait(); q.memset(B, 0, K * N).wait();
+    const int fk = (approx_s == "e5m2") ? 1 : 0;  // reuse --approx to pick fp8 kind
+    for (int i = 0; i < warmup; ++i) kernels::fp8_gemm_onednn(q, A, B, C, M, N, K, fk, 1.0f, dt);
+    // fp8_gemm_onednn is synchronous (waits internally), so time a batch between
+    // two profiling markers and divide -> ms/call.
+    const int batch = iters;
+    sycl::event a = q.single_task([] {});
+    a.wait();
+    const auto b0 = a.get_profiling_info<sycl::info::event_profiling::command_end>();
+    for (int i = 0; i < batch; ++i) kernels::fp8_gemm_onednn(q, A, B, C, M, N, K, fk, 1.0f, dt);
+    sycl::event z = q.single_task([] {});
+    z.wait();
+    const auto b1 = z.get_profiling_info<sycl::info::event_profiling::command_start>();
+    const double median = (static_cast<double>(b1 - b0) * 1e-6) / batch;  // ms/call
+    const double gflops = 2.0 * (double)M * (double)N * (double)K / (median * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"fp8_gemm\",\"variant\":\"vendor\",\"fp8\":\""
+              << (fk ? "e5m2" : "e4m3") << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"M\":" << M << ",\"N\":" << N << ",\"K\":" << K
+              << ",\"iters\":" << batch << ",\"median_ms\":" << median
+              << ",\"gflops\":" << gflops << ",\"device\":\""
+              << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(A, q); sycl::free(B, q); sycl::free(C, q);
+    return 0;
+  }
+#endif
   if (kernel == "qgemm_int8") {
     std::int8_t* A = sycl::malloc_device<std::int8_t>(M * K, q);
     std::int8_t* B = sycl::malloc_device<std::int8_t>(K * N, q);

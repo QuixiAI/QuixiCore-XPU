@@ -140,6 +140,29 @@ void qgemv_int4(sycl::queue& q, const void* w_packed, const void* scales,
                 std::size_t group, DType act_dt, Variant variant = Variant::sycl,
                 bool blocking = true);
 
+// fp8 format selector (OCP / NVIDIA fp8).
+enum class Fp8Kind {
+  e4m3,
+  e5m2,
+};
+
+// fp8 GEMM: C[M,N] = A_fp8[M,K] @ B_fp8[K,N], scaled by a single global `scale`.
+// A, B are opaque fp8 bytes (1 byte/elem) of kind `kind`; C is `out_dt`
+// (f32/f16/bf16). Vendor-only (oneDNN XMX fp8); if fp8 matmul is unsupported on
+// the device the call reports it via the runtime (no silent wrong result).
+void fp8_gemm(sycl::queue& q, const void* a_fp8, const void* b_fp8, void* c,
+              std::size_t M, std::size_t N, std::size_t K, Fp8Kind kind,
+              float scale, DType out_dt, Variant variant = Variant::vendor,
+              bool blocking = true);
+
+// fp8 codecs: f32 -> fp8 (out is 1 byte/elem) and fp8 -> f32, both over `n`
+// contiguous elements. Vendor-backed (oneDNN reorder). Useful for quantizing
+// activations/weights and for exact round-trip references.
+void fp8_encode(sycl::queue& q, const float* in, void* out_fp8, std::size_t n,
+                Fp8Kind kind, bool blocking = true);
+void fp8_decode(sycl::queue& q, const void* in_fp8, float* out, std::size_t n,
+                Fp8Kind kind, bool blocking = true);
+
 // int8 w8a8 GEMM: C[M,N] = (A_int8[M,K] @ B_int8[K,N]) * a_scale[M] * b_scale[N].
 // A, B are int8 device pointers; a_scale (per-row/token) and b_scale (per-col/
 // channel) are fp32 [M] and [N]; C is `out_dt` (f32/f16/bf16). Accumulates int32.

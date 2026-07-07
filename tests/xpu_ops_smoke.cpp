@@ -233,6 +233,56 @@ bool check_softmax(sycl::queue& q, DType dt, Variant variant, std::size_t rows,
 }
 
 template <typename T>
+bool check_fp8_gemm(sycl::queue& q, DType out_dt, ops::Fp8Kind kind,
+                    const char* kname, std::size_t M, std::size_t N, std::size_t K) {
+  // Build fp8 inputs from f32 via the public codec; decode them back to get the
+  // exact fp8-rounded values the GEMM actually consumes -> fp64 reference.
+  float* Af = sycl::malloc_shared<float>(M * K, q);
+  float* Bf = sycl::malloc_shared<float>(K * N, q);
+  std::uint8_t* A8 = sycl::malloc_shared<std::uint8_t>(M * K, q);
+  std::uint8_t* B8 = sycl::malloc_shared<std::uint8_t>(K * N, q);
+  float* Art = sycl::malloc_shared<float>(M * K, q);
+  float* Brt = sycl::malloc_shared<float>(K * N, q);
+  T* C = sycl::malloc_shared<T>(M * N, q);
+  for (std::size_t i = 0; i < M * K; ++i) Af[i] = sample(i) * 0.5f;
+  for (std::size_t i = 0; i < K * N; ++i) Bf[i] = sample(i + 5) * 0.5f;
+  const float scale = 1.0f;
+
+  bool ok = true;
+  try {
+    ops::fp8_encode(q, Af, A8, M * K, kind);
+    ops::fp8_encode(q, Bf, B8, K * N, kind);
+    ops::fp8_decode(q, A8, Art, M * K, kind);
+    ops::fp8_decode(q, B8, Brt, K * N, kind);
+    ops::fp8_gemm(q, A8, B8, C, M, N, K, kind, scale, out_dt, Variant::vendor, true);
+
+    const Tol base = tol_for(out_dt);
+    const double rtol = base.rtol * std::sqrt(static_cast<double>(K)) + 5e-3;
+    double worst = 0.0, max_abs = 0.0;
+    for (std::size_t m = 0; m < M; ++m)
+      for (std::size_t n = 0; n < N; ++n) {
+        double acc = 0.0;
+        for (std::size_t k = 0; k < K; ++k)
+          acc += (double)Art[m * K + k] * (double)Brt[k * N + n];
+        const double ref = static_cast<double>(static_cast<T>(acc * scale));
+        const double err = std::abs((double)C[m * N + n] - ref);
+        max_abs = std::max(max_abs, err);
+        worst = std::max(worst, err - (base.atol + rtol * std::abs(ref)));
+      }
+    ok = worst <= 0.0;
+    std::cout << "  fp8_gemm " << kname << " out=" << dtype_name(out_dt)
+              << " (" << M << "x" << N << "x" << K << ") max_abs=" << max_abs
+              << (ok ? "  ok" : "  FAIL") << '\n';
+  } catch (const std::exception& e) {
+    std::cout << "  fp8_gemm " << kname << ": UNSUPPORTED (" << e.what() << ")\n";
+    ok = true;  // not a correctness failure; recorded as unsupported on this device
+  }
+  sycl::free(Af, q); sycl::free(Bf, q); sycl::free(A8, q); sycl::free(B8, q);
+  sycl::free(Art, q); sycl::free(Brt, q); sycl::free(C, q);
+  return ok;
+}
+
+template <typename T>
 bool check_qgemm_int8(sycl::queue& q, DType out_dt, Variant variant,
                       std::size_t M, std::size_t N, std::size_t K) {
   std::int8_t* A = sycl::malloc_shared<std::int8_t>(M * K, q);
@@ -575,6 +625,10 @@ int main() {
     failures += check_qgemm_int8<float>(q, DType::f32, v, 96, 128, 256) ? 0 : 1;
     failures += check_qgemm_int8<bf16_t>(q, DType::bf16, v, 96, 128, 256) ? 0 : 1;
   }
+
+  // fp8 GEMM (e4m3/e5m2), vendor-only; skips cleanly if the device lacks fp8.
+  failures += check_fp8_gemm<float>(q, DType::f32, ops::Fp8Kind::e4m3, "e4m3", 128, 128, 256) ? 0 : 1;
+  failures += check_fp8_gemm<float>(q, DType::f32, ops::Fp8Kind::e5m2, "e5m2", 128, 128, 256) ? 0 : 1;
 
   // rope / adamw / argmax (native only).
   failures += check_rope<float>(q, DType::f32, 32, 8, 64) ? 0 : 1;

@@ -362,6 +362,28 @@ is the flagged follow-up. Another proof for "quant works natively on XPU":
 w8a8 int8 GEMM runs at full XMX throughput, no NVIDIA hardware. int8 format ->
 experimental in quant-formats.yaml.
 
+## 2026-07-06: quantization/fp8_gemm (e4m3, e5m2) — works natively, not yet fast on B60
+
+Status: landed (oneDNN vendor-only). Also exposes fp8_encode/fp8_decode codecs
+(oneDNN reorder) as public quant utilities.
+
+The truism: "fp8 is a Hopper/Blackwell (NVIDIA) thing." FALSE for correctness —
+both e4m3 and e5m2 matmul run natively on the B60 via oneDNN and are numerically
+correct (max_abs 0 / 4.8e-7 vs an fp8-round-tripped fp64 reference; fp8 inputs
+built with the oneDNN reorder codec so the reference sees exactly the values the
+GEMM consumes). But ALSO measure the performance, don't assume it:
+
+Baseline (4096^3, GFLOP/s): e4m3 15556, e5m2 18912 -- i.e. ~16-19 TFLOP/s.
+That is FAR below this backend's int8 (182 TOPS) and even bf16 (90 TFLOP/s) GEMM.
+Conclusion: Battlemage/Xe2 supports fp8 functionally but has no fast native fp8
+XMX/DPAS path this generation, so oneDNN takes a slow/emulated route. So the
+honest, nuanced claim is: fp8 WORKS on Intel (portable, correct — no NVIDIA
+hardware needed), but is NOT accelerated on B60 today. Don't ship an fp8-fast
+claim; do ship fp8 correctness/portability.
+
+Decision: keep fp8_gemm (vendor) + codecs for correctness/portability; flag "not
+accelerated on B60" in metadata. Revisit on a future Intel GPU with native fp8.
+
 ## First Kernel Plan
 
 Status: in progress — 7 families now have implementations: activations (gelu,

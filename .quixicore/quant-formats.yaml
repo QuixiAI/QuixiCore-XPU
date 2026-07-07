@@ -25,8 +25,13 @@ formats:
     status: planned
     note: FP4 e2m1 with an fp8 (e4m3) block scale. Portable; decode + DPAS/XMX.
   fp8:
-    status: planned
-    note: e4m3 / e5m2, per-tensor / per-token / per-block scales.
+    status: experimental
+    note: >-
+      e4m3 + e5m2 GEMM landed (quantization/fp8_gemm) via oneDNN, with
+      fp8_encode/fp8_decode codecs. Numerically correct on B60 (fp8 is NOT
+      NVIDIA-exclusive), but NOT accelerated there: ~16-19 TFLOP/s vs int8 182
+      TOPS / bf16 90 TFLOP/s -- Xe2 has no fast native fp8 XMX this generation.
+      Portability yes; performance pending future Intel GPU.
   fp4:
     status: planned
     note: generic fp4_e2m1 packing.
