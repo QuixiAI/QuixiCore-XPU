@@ -429,6 +429,25 @@ Both "FP4 is Blackwell-only" (mxfp4 = OCP, nvfp4 = NVIDIA) claims are now
 empirically false on Intel: both decode natively via hand-written kernels, no
 special silicon.
 
+## 2026-07-07: quantization/gguf_gemv — llama.cpp q8_0/q4_0 decode natively on Intel
+
+Status: landed (native SYCL, hand-written decoder from the on-disk block layout).
+
+Format: authentic GGUF blocks laid consecutively per row — q8_0 = {fp16 d; 32
+int8} (34 B), q4_0 = {fp16 d; 16 packed bytes} (18 B), q4_0 dequant (nibble-8)*d
+with low nibbles = elems 0..15, high = 16..31. One subgroup per row; each lane
+decodes whole blocks; unaligned fp16 scale read via a 2-byte bit_cast.
+
+Correctness (q8_0 + q4_0, act f32 + bf16) vs an fp64 reference using the exact
+fp16-rounded scales and int quants: pass (bf16 max_abs 0).
+
+Baseline (8192x8192, bf16, weight bytes incl. scales): q8_0 0.86 ms / 83 GB/s,
+q4_0 0.61 ms / 62 GB/s. Slower than the packed formats (int4 130 GB/s) because
+the interleaved 34/18-byte block layout is not GPU-coalescing-friendly (odd
+strides, unaligned scale reads, scalar per-element decode). Correctness-first;
+the optimization is a one-time repack from GGUF layout to a GPU-friendly
+scale-planar + aligned-quant layout. GGUF k-quants decode natively on Intel.
+
 ## First Kernel Plan
 
 Status: in progress — 7 families now have implementations: activations (gelu,

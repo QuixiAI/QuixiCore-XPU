@@ -319,6 +319,72 @@ bool check_qgemm_int8(sycl::queue& q, DType out_dt, Variant variant,
 }
 
 template <typename T>
+bool check_gguf_gemv(sycl::queue& q, DType act_dt, ops::GgufType type,
+                     const char* tname, std::size_t N, std::size_t K) {
+  const int block_bytes = (type == ops::GgufType::q8_0) ? 34 : 18;
+  const std::size_t bpr = K / 32;              // blocks per row
+  const std::size_t row_bytes = bpr * block_bytes;
+  std::uint8_t* w = sycl::malloc_shared<std::uint8_t>(N * row_bytes, q);
+  T* x = sycl::malloc_shared<T>(K, q);
+  T* y = sycl::malloc_shared<T>(N, q);
+  for (std::size_t k = 0; k < K; ++k) x[k] = static_cast<T>(sample(k + 51));
+
+  // Pack blocks; keep the fp16-rounded scale and int quants for the reference.
+  std::vector<double> dref(N * bpr);
+  std::vector<int> qref(N * K);
+  for (std::size_t n = 0; n < N; ++n)
+    for (std::size_t b = 0; b < bpr; ++b) {
+      std::uint8_t* blk = w + n * row_bytes + b * block_bytes;
+      const half_t hd = static_cast<half_t>(0.01f + 0.02f * std::abs(sample((n * bpr + b) * 7)));
+      const std::uint16_t db = sycl::bit_cast<std::uint16_t>(hd);
+      blk[0] = db & 0xFF; blk[1] = static_cast<std::uint8_t>(db >> 8);
+      dref[n * bpr + b] = static_cast<double>(hd);
+      std::uint8_t* qs = blk + 2;
+      if (type == ops::GgufType::q8_0) {
+        for (int i = 0; i < 32; ++i) {
+          const int v = static_cast<int>(std::floor(sample(n * K + b * 32 + i) * 60.0f));
+          const int cv = std::max(-127, std::min(127, v));
+          qs[i] = static_cast<std::uint8_t>(static_cast<std::int8_t>(cv));
+          qref[n * K + b * 32 + i] = cv;
+        }
+      } else {  // q4_0: low nibble -> elem i, high nibble -> elem i+16, val=(nib-8)
+        for (int i = 0; i < 16; ++i) {
+          auto q4 = [&](std::size_t idx) {
+            int v = static_cast<int>(std::floor((sample(idx) * 0.5f + 0.5f) * 16.0f));
+            return std::max(0, std::min(15, v));
+          };
+          const int lo = q4(n * K + b * 32 + i);
+          const int hi = q4(n * K + b * 32 + 16 + i);
+          qs[i] = static_cast<std::uint8_t>(lo | (hi << 4));
+          qref[n * K + b * 32 + i] = lo - 8;
+          qref[n * K + b * 32 + 16 + i] = hi - 8;
+        }
+      }
+    }
+
+  ops::gguf_gemv(q, w, x, y, N, K, type, act_dt, Variant::sycl, true);
+
+  const Tol base = tol_for(act_dt);
+  const double rtol = base.rtol * std::sqrt(static_cast<double>(K)) + 3e-3;
+  double worst = 0.0, max_abs = 0.0;
+  for (std::size_t n = 0; n < N; ++n) {
+    double acc = 0.0;
+    for (std::size_t k = 0; k < K; ++k)
+      acc += static_cast<double>(qref[n * K + k]) * dref[n * bpr + k / 32] * static_cast<double>(x[k]);
+    const double ref = static_cast<double>(static_cast<T>(acc));
+    const double err = std::abs(static_cast<double>(y[n]) - ref);
+    max_abs = std::max(max_abs, err);
+    worst = std::max(worst, err - (base.atol + rtol * std::abs(ref)));
+  }
+  sycl::free(w, q); sycl::free(x, q); sycl::free(y, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  gguf_gemv " << tname << " act=" << dtype_name(act_dt)
+            << " (N=" << N << " K=" << K << ") max_abs=" << max_abs
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+template <typename T>
 bool check_mxfp4_gemv(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K) {
   const float e2m1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
   const std::size_t bpr = K / 2, blkpr = K / 32;
@@ -735,6 +801,12 @@ int main() {
   // nvfp4 GEMV (native e2m1 + e4m3 block scale + per-tensor scale).
   failures += check_nvfp4_gemv<float>(q, DType::f32, 128, 4096) ? 0 : 1;
   failures += check_nvfp4_gemv<bf16_t>(q, DType::bf16, 128, 4096) ? 0 : 1;
+
+  // GGUF q8_0 / q4_0 GEMV (native block-layout decode).
+  failures += check_gguf_gemv<float>(q, DType::f32, ops::GgufType::q8_0, "q8_0", 128, 4096) ? 0 : 1;
+  failures += check_gguf_gemv<bf16_t>(q, DType::bf16, ops::GgufType::q8_0, "q8_0", 128, 4096) ? 0 : 1;
+  failures += check_gguf_gemv<float>(q, DType::f32, ops::GgufType::q4_0, "q4_0", 128, 4096) ? 0 : 1;
+  failures += check_gguf_gemv<bf16_t>(q, DType::bf16, ops::GgufType::q4_0, "q4_0", 128, 4096) ? 0 : 1;
 
   // int8 w8a8 GEMM, both variants.
   for (const Variant v : variants) {

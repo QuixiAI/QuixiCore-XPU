@@ -66,6 +66,7 @@ DEFAULT_KERNEL_BENCH = [
     {"kernel": "fp8_gemm", "variant": "vendor", "dtype": "bf16", "approx": "e4m3", "M": 2048, "N": 2048, "K": 2048},
     {"kernel": "mxfp4_gemv", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 8192},
     {"kernel": "nvfp4_gemv", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 8192},
+    {"kernel": "gguf_gemv", "variant": "sycl", "dtype": "bf16", "approx": "q4_0", "rows": 8192, "dim": 8192},
 ]
 
 

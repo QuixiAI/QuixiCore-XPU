@@ -186,6 +186,20 @@ void nvfp4_gemv(sycl::queue& q, const void* w_packed, const void* block_scales,
                 std::size_t K, DType act_dt, Variant variant = Variant::sycl,
                 bool blocking = true);
 
+// GGUF (llama.cpp) block-quant GEMV, native decode from the authentic on-disk
+// block layout. `w_blocks` is row-major [N rows], each row = K/32 blocks laid
+// consecutively; a block is { fp16 scale d; quants } — q8_0: 34 bytes (32 int8),
+// q4_0: 18 bytes (32 int4 packed, dequant (nibble-8)*d). Activation `x` is [K],
+// output `y` is [N], dtype `act_dt`. K must be a multiple of 32.
+enum class GgufType {
+  q8_0,
+  q4_0,
+};
+
+void gguf_gemv(sycl::queue& q, const void* w_blocks, const void* x, void* y,
+               std::size_t N, std::size_t K, GgufType type, DType act_dt,
+               Variant variant = Variant::sycl, bool blocking = true);
+
 // int8 w8a8 GEMM: C[M,N] = (A_int8[M,K] @ B_int8[K,N]) * a_scale[M] * b_scale[N].
 // A, B are int8 device pointers; a_scale (per-row/token) and b_scale (per-col/
 // channel) are fp32 [M] and [N]; C is `out_dt` (f32/f16/bf16). Accumulates int32.

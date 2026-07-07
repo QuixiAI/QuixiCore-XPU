@@ -164,6 +164,16 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/quantization/mxfp4_gemv/variants/xpu_sycl}
+  gguf_gemv:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/gguf_gemv
+    dtypes: [f32, f16, bf16]
+    quant_format: gguf
+    gguf_types: [q8_0, q4_0]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/quantization/gguf_gemv/variants/xpu_sycl}
   nvfp4_gemv:
     family: quantization
     status: implemented

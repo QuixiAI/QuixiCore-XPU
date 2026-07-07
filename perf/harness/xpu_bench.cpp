@@ -42,6 +42,7 @@
 #include "norms/norms_kernel.hpp"
 #include "optimizers/adamw/adamw_kernel.hpp"
 #include "quantization/fp8_gemm/fp8_kernel.hpp"
+#include "quantization/gguf_gemv/gguf_kernel.hpp"
 #include "quantization/mxfp4_gemv/mxfp4_kernel.hpp"
 #include "quantization/nvfp4_gemv/nvfp4_kernel.hpp"
 #include "quantization/qgemm/qgemm_kernel.hpp"
@@ -260,6 +261,32 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  if (kernel == "gguf_gemv") {
+    const std::size_t Nn = rows, Kk = dim;
+    const int gt = (approx_s == "q4_0") ? 1 : 0;  // reuse --approx to pick type
+    const int bb = gt == 0 ? 34 : 18;
+    const std::size_t row_bytes = (Kk / 32) * bb;
+    void* w = sycl::malloc_device(Nn * row_bytes, q);
+    void* xx = sycl::malloc_device(Kk * elem, q);
+    void* yy = sycl::malloc_device(Nn * elem, q);
+    q.memset(w, 0, Nn * row_bytes).wait();
+    q.memset(xx, 0, Kk * elem).wait();
+    auto once = [&] { return kernels::gguf_gemv_sycl(q, w, xx, yy, Nn, Kk, gt, dt); };
+    for (int i = 0; i < warmup; ++i) once().wait();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) { sycl::event e = once(); e.wait(); s.push_back(event_ms(e)); }
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    const double wbytes = static_cast<double>(Nn) * static_cast<double>(row_bytes);
+    std::cout << "{\"schema_version\":2,\"kernel\":\"gguf_gemv\",\"variant\":\"sycl\",\"gguf\":\""
+              << (gt ? "q4_0" : "q8_0") << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"N\":" << Nn << ",\"K\":" << Kk << ",\"iters\":" << iters
+              << ",\"median_ms\":" << med << ",\"weight_gbps\":" << (wbytes / (med * 1e-3) / 1e9)
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>()
+              << "\"}" << std::endl;
+    sycl::free(w, q); sycl::free(xx, q); sycl::free(yy, q);
+    return 0;
+  }
   if (kernel == "nvfp4_gemv") {
     const std::size_t Nn = rows, Kk = dim;
     void* w = sycl::malloc_device(Nn * (Kk / 2), q);

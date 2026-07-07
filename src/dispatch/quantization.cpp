@@ -5,12 +5,22 @@
 #include "quixicore/xpu/ops.hpp"
 
 #include "quantization/fp8_gemm/fp8_kernel.hpp"
+#include "quantization/gguf_gemv/gguf_kernel.hpp"
 #include "quantization/mxfp4_gemv/mxfp4_kernel.hpp"
 #include "quantization/nvfp4_gemv/nvfp4_kernel.hpp"
 #include "quantization/qgemm/qgemm_kernel.hpp"
 #include "quantization/qgemv/qgemv_kernel.hpp"
 
 namespace quixicore::xpu::ops {
+
+void gguf_gemv(sycl::queue& q, const void* w_blocks, const void* x, void* y,
+               std::size_t N, std::size_t K, GgufType type, DType act_dt,
+               Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::gguf_gemv_sycl(q, w_blocks, x, y, N, K,
+                                           static_cast<int>(type), act_dt);
+  if (blocking) ev.wait();
+}
 
 void mxfp4_gemv(sycl::queue& q, const void* w_packed, const void* block_scales,
                 const void* x, void* y, std::size_t N, std::size_t K,
