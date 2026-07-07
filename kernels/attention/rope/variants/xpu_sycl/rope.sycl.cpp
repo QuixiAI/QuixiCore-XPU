@@ -3,6 +3,8 @@
 
 #include "attention/rope/rope_kernel.hpp"
 
+#include <cmath>
+
 namespace quixicore::xpu::kernels {
 namespace {
 
@@ -12,19 +14,24 @@ sycl::event rope_typed(sycl::queue& q, const T* x, T* out, std::size_t tokens,
                        std::size_t pos0) {
   const std::size_t half = head_dim / 2;
   const std::size_t total = tokens * n_heads * half;
-  const float inv_hd = 1.0f / static_cast<float>(head_dim);
-  return q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> idx) {
-    const std::size_t id = idx[0];
-    const std::size_t i = id % half;
-    const std::size_t hh = (id / half) % n_heads;
-    const std::size_t t = id / (half * n_heads);
+  // freq = base^(-2i/hd) = exp2(i * kc); one (often native) exp2 replaces pow's
+  // exp+log pair. kc folds the log2(base) host-side. sincos yields cos+sin in
+  // one call. rope was transcendental-bound (151 GB/s, ~3x off roofline).
+  const float kc = -2.0f * std::log2(base) / static_cast<float>(head_dim);
+  (void)total;
+  // 3D range (t, head, i) removes the per-item integer div/mod that decomposed a
+  // flat id; last dim (i) is fastest-varying so adjacent items stay coalesced.
+  return q.parallel_for(sycl::range<3>(tokens, n_heads, half), [=](sycl::id<3> idx) {
+    const std::size_t t = idx[0];
+    const std::size_t hh = idx[1];
+    const std::size_t i = idx[2];
     const std::size_t bufi = (t * n_heads + hh) * head_dim;
 
     const float pos = static_cast<float>(pos0 + t);
-    const float freq = sycl::pow(base, -2.0f * static_cast<float>(i) * inv_hd);
+    const float freq = sycl::exp2(static_cast<float>(i) * kc);
     const float angle = pos * freq;
-    const float c = sycl::cos(angle);
-    const float s = sycl::sin(angle);
+    float c;
+    const float s = sycl::sincos(angle, sycl::private_ptr<float>(&c));
 
     const float x1 = static_cast<float>(x[bufi + i]);
     const float x2 = static_cast<float>(x[bufi + i + half]);

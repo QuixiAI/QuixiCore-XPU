@@ -657,3 +657,33 @@ Open questions:
   Python extension be introduced before the first kernels?
 - Which framework baseline should be primary for XPU comparisons: oneDNN,
   PyTorch XPU, IPEX, Triton XPU, or a mix?
+
+## 2026-07-07: Optimization pass — profiled all kernels, fixed the biggest gaps
+
+Ran a full bench sweep vs the ~456 GB/s B60 roofline. Most elementwise/row
+kernels were already 82-87% (silu/glu/rms_norm/layernorm/gelu, vectorized); the
+GEMM vendor path is at 90 TFLOP/s. Attacked the kernels far below roofline that
+had known fixes. All correctness gates still green; every number is a measured
+median (50 iters, 15 warmup) on Arc Pro B60.
+
+| kernel | before | after | speedup | fix |
+|---|---|---|---|---|
+| sample_categorical | 45.6 ms | 0.87 ms | **52x** | one-item-per-row -> work-group-per-row; parallel max/Z reductions; exclusive_scan_over_group for the inverse-CDF selection over contiguous chunks |
+| argmax | 80 GB/s | 395/447 GB/s (bf16/f32) | **4.9x** | serial 256-iter final reduction -> SLM tree reduction; 16-byte vectorized scan |
+| dropout | 144 GB/s | 400 GB/s | **2.8x** | scalar per-element -> 16-byte vectorized load/store (RNG index preserved, mask bit-identical) |
+| quantize_int4 | 43 GB/s | 121 GB/s | **2.8x** | scalar group scan -> 16-byte vectorized double read pass |
+| rope | 151 GB/s | 284/400 GB/s (bf16/f32) | **1.9x** | flat-id div/mod -> 3D range; pow(exp+log) -> exp2; cos+sin -> sincos |
+
+Truisms confirmed/smashed: (1) argmax "reduction-bound" was really "serial-tail
+bound" — the parallel scan was fine, one thread's 256-iter final loop dominated.
+(2) rope "transcendental-bound" was PARTLY integer-div/mod-bound (flat-id
+decomposition); the 3D range gave more than exp2/sincos did. (3) cross_entropy
+reads the row twice so its "34% roofline" is a bench single-pass undercount (~300
+GB/s effective) — left as-is.
+
+Left as-is (already near roofline or inherently sequential): silu/glu/rms_norm/
+layernorm/gelu/gelu_backward (82-87%), adamw (74%), dense_gemm vendor (90
+TFLOP/s), softmax (69%). Deferred as bigger projects: native dense_gemm XMX
+joint_matrix (1.1 vs 90 TFLOP/s vendor, task #9); quant-GEMV decode coalescing
+(qgemv_int4/gguf/mxfp4/nvfp4 at 13-25% weight-bw); selective_scan/linear_attn
+(sequential recurrence).
