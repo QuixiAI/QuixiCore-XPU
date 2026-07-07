@@ -49,26 +49,32 @@ sycl::event nvfp4_typed(sycl::queue& q, const std::uint8_t* w,
     const WVec* wvrow = reinterpret_cast<const WVec*>(w + n * bytes_per_row);
     const std::uint8_t* srow = bscale + n * blocks_per_row;
 
+    // Decode is ALU/latency-bound (was 17% of BW roofline). Hoist the two block
+    // scales out of the nibble loop (one mul per 16-elem block, not per nibble);
+    // vectorize the activation read; accumulate each word independently for ILP.
     float acc = 0.0f;
     for (std::size_t c = lane; c < nchunks; c += kSG) {
       const WVec chunk = wvrow[c];
       // Two 16-element blocks in this chunk -> two e4m3 scales.
       const float s0 = e4m3_to_float(srow[2 * c]) * gscale;
       const float s1 = e4m3_to_float(srow[2 * c + 1]) * gscale;
-      const std::size_t kbase = c * 32;
+      const T* xc = x + c * 32;
+      float aw[4];
 #pragma unroll
       for (int wi = 0; wi < 4; ++wi) {
         const std::uint32_t word = chunk[wi];
-        const float s = (wi < 2) ? s0 : s1;  // wi 0,1 -> block0; 2,3 -> block1
-        const std::size_t kb = kbase + wi * 8;
+        const sycl::vec<T, 8> xv = *reinterpret_cast<const sycl::vec<T, 8>*>(xc + wi * 8);
+        float a = 0.0f;
 #pragma unroll
         for (int nib = 0; nib < 8; ++nib) {
           const int n4 = (word >> (nib * 4)) & 0xF;
           float val = kE2M1[n4 & 7];
           if (n4 & 8) val = -val;
-          acc += val * s * static_cast<float>(x[kb + nib]);
+          a += val * static_cast<float>(xv[nib]);
         }
+        aw[wi] = a;
       }
+      acc += (aw[0] + aw[1]) * s0 + (aw[2] + aw[3]) * s1;
     }
     const float sum = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
     if (lane == 0) y[n] = static_cast<T>(sum);

@@ -38,23 +38,30 @@ sycl::event mxfp4_typed(sycl::queue& q, const std::uint8_t* w,
     const WVec* wvrow = reinterpret_cast<const WVec*>(w + n * bytes_per_row);
     const std::uint8_t* srow = bscale + n * blocks_per_row;
 
+    // Decode is ALU/latency-bound (was 18% of BW roofline). One e8m0 scale per
+    // block (= per chunk), so hoist it to a single mul per chunk; vectorize the
+    // activation read (sycl::vec<T,8>); accumulate each word independently for ILP.
     float acc = 0.0f;
     for (std::size_t c = lane; c < blocks_per_row; c += kSG) {
       const WVec chunk = wvrow[c];
       const float scale = sycl::exp2(static_cast<float>(srow[c]) - 127.0f);
-      const std::size_t kbase = c * 32;
+      const T* xc = x + c * 32;
+      float aw[4];
 #pragma unroll
       for (int wi = 0; wi < 4; ++wi) {
         const std::uint32_t word = chunk[wi];
-        const std::size_t kb = kbase + wi * 8;
+        const sycl::vec<T, 8> xv = *reinterpret_cast<const sycl::vec<T, 8>*>(xc + wi * 8);
+        float a = 0.0f;
 #pragma unroll
         for (int nib = 0; nib < 8; ++nib) {
           const int n4 = (word >> (nib * 4)) & 0xF;
           float val = kE2M1[n4 & 7];
           if (n4 & 8) val = -val;
-          acc += val * scale * static_cast<float>(x[kb + nib]);
+          a += val * static_cast<float>(xv[nib]);
         }
+        aw[wi] = a;
       }
+      acc += ((aw[0] + aw[1]) + (aw[2] + aw[3])) * scale;
     }
     const float sum = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
     if (lane == 0) y[n] = static_cast<T>(sum);

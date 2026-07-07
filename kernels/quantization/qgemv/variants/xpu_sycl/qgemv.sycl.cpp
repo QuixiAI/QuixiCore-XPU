@@ -52,22 +52,31 @@ sycl::event qgemv_typed(sycl::queue& q, const std::uint8_t* w, const half_t* sca
     const half_t* srow = scales + n * groups_per_row;
     const WVec* wvrow = reinterpret_cast<const WVec*>(wrow);
 
+    // Decode is ALU/latency-bound, not weight-memory-bound (measured: was 25%
+    // of BW roofline). Two fixes: (1) hoist the per-group scale OUT of the nibble
+    // loop -- one mul per 8-nibble word instead of two muls per nibble; (2)
+    // vectorize the activation read (one sycl::vec<T,8> vs 8 scalar loads), and
+    // accumulate each word into its own register so the 4 words are independent
+    // (breaks the serial acc dependency chain -> more ILP).
     float acc = 0.0f;
     for (std::size_t c = lane; c < nchunks; c += kSG) {
       const WVec chunk = wvrow[c];
       const std::size_t kbase = c * 32;
+      const T* xc = x + kbase;
       const float sc = fast_scale ? static_cast<float>(srow[kbase / group]) : 0.0f;
+      float aw[4];
 #pragma unroll
       for (int wi = 0; wi < 4; ++wi) {
         const std::uint32_t word = chunk[wi];
-        const std::size_t kb = kbase + wi * 8;
-        const float s = fast_scale ? sc : static_cast<float>(srow[kb / group]);
+        const float s = fast_scale ? sc : static_cast<float>(srow[(kbase + wi * 8) / group]);
+        const sycl::vec<T, 8> xv = *reinterpret_cast<const sycl::vec<T, 8>*>(xc + wi * 8);
+        float a = 0.0f;
 #pragma unroll
-        for (int nib = 0; nib < 8; ++nib) {
-          const int val = s4((word >> (nib * 4)) & 0xF);
-          acc += static_cast<float>(val) * s * static_cast<float>(x[kb + nib]);
-        }
+        for (int nib = 0; nib < 8; ++nib)
+          a += static_cast<float>(s4((word >> (nib * 4)) & 0xF)) * static_cast<float>(xv[nib]);
+        aw[wi] = a * s;
       }
+      acc += (aw[0] + aw[1]) + (aw[2] + aw[3]);
     }
     // scalar tail (remaining bytes past the last full 16-byte chunk)
     for (std::size_t b = tail_b0 + lane; b < bytes_per_row; b += kSG) {

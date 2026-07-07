@@ -687,3 +687,26 @@ TFLOP/s), softmax (69%). Deferred as bigger projects: native dense_gemm XMX
 joint_matrix (1.1 vs 90 TFLOP/s vendor, task #9); quant-GEMV decode coalescing
 (qgemv_int4/gguf/mxfp4/nvfp4 at 13-25% weight-bw); selective_scan/linear_attn
 (sequential recurrence).
+
+## 2026-07-07: Optimization pass #2 — 4-bit quant-GEMV decode (truism busted)
+
+The quant-GEMVs sat at 13-25% of the 456 GB/s roofline and their comments *claimed*
+"weight-memory-bound". Measured: they are **decode-ALU/latency-bound**. Three
+fixes, applied uniformly (correctness exact, bf16 max_abs=0 vs host replica):
+(1) hoist the per-block/per-group scale OUT of the nibble loop — one mul per
+8-nibble word or per block instead of two muls per nibble; (2) vectorize the
+activation read — one `sycl::vec<T,8>` per word vs 8 scalar loads; (3) accumulate
+each of the 4 words into its own register so they're independent (breaks the
+serial `acc` dependency chain -> ILP).
+
+| kernel (8192x8192 bf16) | before | after | speedup |
+|---|---|---|---|
+| qgemv_int4 | 116 GB/s (0.288 ms) | 167 GB/s (0.201 ms) | **1.44x** |
+| mxfp4_gemv | 80.7 GB/s (0.416 ms) | 119 GB/s (0.282 ms) | **1.48x** |
+| nvfp4_gemv | 78.5 GB/s (0.427 ms) | 114 GB/s (0.294 ms) | **1.45x** |
+
+Truism busted: "int4/fp4 GEMV is weight-memory-bound" — false on B60 at this
+decode cost. Still ~37% of roofline, so decode ALU (nibble unpack + sign +
+fp-convert) remains the ceiling; further wins would need SIMD unpack or a LUT, or
+a repack to a coalescing-friendly layout. GGUF GEMVs (18-byte block stride fights
+16-byte coalescing) are the remaining decode target.
