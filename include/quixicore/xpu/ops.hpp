@@ -56,6 +56,31 @@ void softmax(sycl::queue& q, const void* x, void* out, std::size_t rows,
              std::size_t dim, DType dt, Variant variant = Variant::sycl,
              bool blocking = true);
 
+// SiLU / swish: out[i] = x[i] * sigmoid(x[i]). Elementwise over `n`.
+void silu(sycl::queue& q, const void* in, void* out, std::size_t n, DType dt,
+          Variant variant = Variant::sycl, bool blocking = true);
+
+// GELU backward: grad_in[i] = grad_out[i] * gelu'(x[i]). `approx` selects the
+// erf or tanh derivative to match the forward. Elementwise over `n`.
+void gelu_backward(sycl::queue& q, const void* grad_out, const void* x,
+                   void* grad_in, std::size_t n, DType dt,
+                   GeluApprox approx = GeluApprox::erf,
+                   Variant variant = Variant::sycl, bool blocking = true);
+
+// Gated linear unit variants. Input `x` is [rows, 2*d] row-major (gate half then
+// value half); output is [rows, d]: out[r,i] = act(x[r,i]) * x[r,d+i], where act
+// is silu (swiglu), gelu (geglu), relu (reglu), or sigmoid (glu).
+enum class GluMode {
+  swiglu,
+  geglu,
+  reglu,
+  glu,
+};
+
+void glu(sycl::queue& q, const void* x, void* out, std::size_t rows,
+         std::size_t d, DType dt, GluMode mode = GluMode::swiglu,
+         Variant variant = Variant::sycl, bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // norms
 // ----------------------------------------------------------------------------

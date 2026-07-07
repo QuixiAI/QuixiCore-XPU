@@ -5,6 +5,9 @@
 #include "quixicore/xpu/ops.hpp"
 
 #include "activations/gelu/gelu_kernel.hpp"
+#include "activations/gelu_backward/gelu_backward_kernel.hpp"
+#include "activations/glu/glu_kernel.hpp"
+#include "activations/silu/silu_kernel.hpp"
 #include "activations/softmax/softmax_kernel.hpp"
 
 namespace quixicore::xpu::ops {
@@ -58,6 +61,29 @@ void softmax(sycl::queue& q, const void* x, void* out, std::size_t rows,
       ev = kernels::softmax_sycl(q, x, out, rows, dim, dt);
       break;
   }
+  if (blocking) ev.wait();
+}
+
+void silu(sycl::queue& q, const void* in, void* out, std::size_t n, DType dt,
+          Variant variant, bool blocking) {
+  (void)variant;  // native only for now
+  sycl::event ev = kernels::silu_sycl(q, in, out, n, dt);
+  if (blocking) ev.wait();
+}
+
+void gelu_backward(sycl::queue& q, const void* grad_out, const void* x,
+                   void* grad_in, std::size_t n, DType dt, GeluApprox approx,
+                   Variant variant, bool blocking) {
+  (void)variant;
+  sycl::event ev = kernels::gelu_backward_sycl(q, grad_out, x, grad_in, n, dt,
+                                               approx == GeluApprox::tanh);
+  if (blocking) ev.wait();
+}
+
+void glu(sycl::queue& q, const void* x, void* out, std::size_t rows,
+         std::size_t d, DType dt, GluMode mode, Variant variant, bool blocking) {
+  (void)variant;
+  sycl::event ev = kernels::glu_sycl(q, x, out, rows, d, dt, static_cast<int>(mode));
   if (blocking) ev.wait();
 }
 

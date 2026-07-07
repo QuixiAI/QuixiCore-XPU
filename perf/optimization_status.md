@@ -244,11 +244,37 @@ read); a `dim`/occupancy sweep (multiple rows per work-group for small `dim`).
 
 Raw results: `perf/results/<date>/<run-id>/`.
 
+## 2026-07-06: activations breadth — silu, gelu_backward, glu (feature-matrix pass)
+
+Status: landed (native SYCL, vectorized-by-default). Optimization intentionally
+deferred (breadth pass); baselines recorded to satisfy the perf gate.
+
+Implementation: silu and gelu_backward via the shared `kernels/common/vec_map.hpp`
+(vec_unary / vec_binary) so they get the 16-byte vector-load treatment for free;
+glu is a custom row kernel (gate/value halves) vectorized when d % V == 0. Modes:
+swiglu/geglu/reglu/glu.
+
+Correctness: silu, gelu_backward x {f32,f16,bf16} and glu {swiglu,geglu,reglu} x
+{f32,bf16}, incl. a d=1000 (non-multiple-of-V) scalar-path case, vs fp64
+references rounded to storage dtype. All pass. The test tolerance now adds one
+storage ULP on top of the contract rtol: the kernel computes in fp32 and the
+oracle in fp64, and a single bf16 ULP (~0.4%) exceeds the 2e-3 bf16 rtol, so
+transcendental bf16 ops would otherwise fail by construction (silu bf16 hit
+exactly 1 ULP = 0.03125 at silu(~6)).
+
+Baselines (B60, GB/s): silu f32 408 / bf16 485; glu f32 392 / bf16 394.
+Caveat: gelu_backward's bench aliases one buffer for both inputs, so its reported
+~565/414 GB/s is cache-inflated and NOT a real bandwidth figure — recorded only
+as a smoke/baseline, to be re-measured with distinct buffers if optimized.
+
+Decision: keep as the shipped native implementations; revisit perf later per the
+breadth-first directive.
+
 ## First Kernel Plan
 
-Status: in progress — GELU + RMSNorm + LayerNorm + Softmax landed, both variants,
-all dtypes vectorized (~90% of roofline). Next: GLU modes + GELU backward, then
-Phase 2 quantization surface (qgemv/qgemm on XMX/DPAS int8).
+Status: in progress — activations family (gelu, gelu_backward, silu, glu,
+softmax) + norms (rms_norm, layernorm) landed. Growing the feature matrix next:
+matmul (oneDNN + SYCL), then the quantization surface.
 
 Priority order:
 

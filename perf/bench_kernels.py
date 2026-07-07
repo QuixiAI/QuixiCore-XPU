@@ -53,6 +53,9 @@ DEFAULT_KERNEL_BENCH = [
     {"kernel": "softmax", "variant": "vendor", "dtype": "f32", "rows": 8192, "dim": 4096},
     {"kernel": "softmax", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 4096},
     {"kernel": "softmax", "variant": "vendor", "dtype": "bf16", "rows": 8192, "dim": 4096},
+    {"kernel": "silu", "variant": "sycl", "dtype": "bf16", "n": 4194304},
+    {"kernel": "glu", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 4096},
+    {"kernel": "gelu_backward", "variant": "sycl", "dtype": "bf16", "n": 4194304},
 ]
 
 

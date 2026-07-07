@@ -33,6 +33,9 @@
 #include "quixicore/xpu/variants.hpp"
 
 #include "activations/gelu/gelu_kernel.hpp"
+#include "activations/gelu_backward/gelu_backward_kernel.hpp"
+#include "activations/glu/glu_kernel.hpp"
+#include "activations/silu/silu_kernel.hpp"
 #include "activations/softmax/softmax_kernel.hpp"
 #include "norms/norms_kernel.hpp"
 
@@ -113,14 +116,19 @@ int main(int argc, char** argv) {
   const std::size_t elem = dtype_size(dt);
   const bool is_softmax = (kernel == "softmax");
   const bool is_norm = (kernel == "rms_norm" || kernel == "layernorm");
+  const bool is_glu = (kernel == "glu");
   const bool is_row = is_norm || is_softmax;
-  const std::size_t n_elems = is_row ? rows * dim : n;
 
-  void* d_in = sycl::malloc_device(n_elems * elem, q);
-  void* d_out = sycl::malloc_device(n_elems * elem, q);
+  // Input/output element counts differ for GLU (input [rows,2*dim], out [rows,dim]).
+  const std::size_t in_elems = is_glu ? rows * 2 * dim : (is_row ? rows * dim : n);
+  const std::size_t out_elems = is_glu ? rows * dim : (is_row ? rows * dim : n);
+  const std::size_t n_elems = out_elems;
+
+  void* d_in = sycl::malloc_device(in_elems * elem, q);
+  void* d_out = sycl::malloc_device(out_elems * elem, q);
   void* d_w = is_norm ? sycl::malloc_device(dim * elem, q) : nullptr;
   void* d_b = is_norm ? sycl::malloc_device(dim * elem, q) : nullptr;
-  q.memset(d_in, 0, n_elems * elem).wait();
+  q.memset(d_in, 0, in_elems * elem).wait();
   if (is_norm) {
     q.memset(d_w, 0, dim * elem).wait();
     q.memset(d_b, 0, dim * elem).wait();
@@ -136,6 +144,15 @@ int main(int argc, char** argv) {
 #endif
       }
       return kernels::gelu_sycl(q, d_in, d_out, n, dt, tanh_approx);
+    }
+    if (kernel == "silu") {
+      return kernels::silu_sycl(q, d_in, d_out, n, dt);
+    }
+    if (kernel == "gelu_backward") {
+      return kernels::gelu_backward_sycl(q, d_in, d_in, d_out, n, dt, tanh_approx);
+    }
+    if (kernel == "glu") {
+      return kernels::glu_sycl(q, d_in, d_out, rows, dim, dt, /*mode=*/0);
     }
     if (kernel == "rms_norm") {
       return kernels::rms_norm_sycl(q, d_in, d_w, d_out, rows, dim, eps, dt);
@@ -182,6 +199,10 @@ int main(int argc, char** argv) {
             static_cast<double>(elem);
   } else if (is_softmax) {
     bytes = 2.0 * static_cast<double>(rows * dim) * static_cast<double>(elem);
+  } else if (is_glu) {
+    bytes = 3.0 * static_cast<double>(rows * dim) * static_cast<double>(elem);
+  } else if (kernel == "gelu_backward") {
+    bytes = 3.0 * static_cast<double>(n) * static_cast<double>(elem);
   } else {
     bytes = static_cast<double>(n) * static_cast<double>(elem) * 2.0;
   }

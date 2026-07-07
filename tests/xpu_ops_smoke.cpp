@@ -93,6 +93,109 @@ float sample(std::size_t i) {
   return static_cast<float>(-2.0 + 4.0 * t);
 }
 
+double sigmoid_ref(double x) { return 1.0 / (1.0 + std::exp(-x)); }
+double silu_ref(double x) { return x * sigmoid_ref(x); }
+double gelu_ref(double x) { return 0.5 * x * (1.0 + std::erf(x * 0.7071067811865476)); }
+double relu_ref(double x) { return x > 0.0 ? x : 0.0; }
+
+double gelu_grad_ref(double x) {
+  const double cdf = 0.5 * (1.0 + std::erf(x * 0.7071067811865476));
+  const double pdf = 0.3989422804014327 * std::exp(-0.5 * x * x);
+  return cdf + x * pdf;
+}
+
+// Explicit mantissa bits per storage dtype (for the 1-ULP allowance below).
+int mantissa_bits(DType dt) {
+  switch (dt) {
+    case DType::f32: return 23;
+    case DType::f16: return 10;
+    case DType::bf16: return 7;
+  }
+  return 23;
+}
+
+// Generic pass/fail against a per-element reference rounded to storage dtype.
+// The kernel computes in fp32 and the oracle in fp64, so around a rounding
+// boundary they can land on adjacent storage values: allow one storage ULP on
+// top of the contract tolerance (a single bf16 ULP is ~0.4% > the 2e-3 rtol, so
+// transcendental bf16 ops would otherwise fail by construction).
+template <typename T>
+bool report(const char* name, DType dt, const std::vector<float>& out,
+            const std::vector<double>& ref_hi) {
+  const Tol tol = tol_for(dt);
+  const double ulp_rel = std::ldexp(1.0, -mantissa_bits(dt));  // 2^-mant
+  double max_abs = 0.0, worst = 0.0;
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    const double ref = static_cast<double>(static_cast<T>(ref_hi[i]));
+    const double err = std::abs(static_cast<double>(out[i]) - ref);
+    const double allow = tol.atol + tol.rtol * std::abs(ref) + ulp_rel * std::abs(ref);
+    max_abs = std::max(max_abs, err);
+    worst = std::max(worst, err - allow);
+  }
+  const bool ok = worst <= 0.0;
+  std::cout << "  " << name << " dt=" << dtype_name(dt) << " max_abs=" << max_abs
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+template <typename T>
+bool check_silu(sycl::queue& q, DType dt, std::size_t n) {
+  T* in = sycl::malloc_shared<T>(n, q);
+  T* out = sycl::malloc_shared<T>(n, q);
+  for (std::size_t i = 0; i < n; ++i) in[i] = static_cast<T>(sample(i) * 3.0f);
+  ops::silu(q, in, out, n, dt, Variant::sycl, true);
+  std::vector<float> o(n);
+  std::vector<double> r(n);
+  for (std::size_t i = 0; i < n; ++i) { o[i] = static_cast<float>(out[i]); r[i] = silu_ref(static_cast<double>(in[i])); }
+  const bool ok = report<T>("silu", dt, o, r);
+  sycl::free(in, q); sycl::free(out, q);
+  return ok;
+}
+
+template <typename T>
+bool check_gelu_bwd(sycl::queue& q, DType dt, std::size_t n) {
+  T* g = sycl::malloc_shared<T>(n, q);
+  T* x = sycl::malloc_shared<T>(n, q);
+  T* out = sycl::malloc_shared<T>(n, q);
+  for (std::size_t i = 0; i < n; ++i) { g[i] = static_cast<T>(sample(i + 1)); x[i] = static_cast<T>(sample(i) * 3.0f); }
+  ops::gelu_backward(q, g, x, out, n, dt, ops::GeluApprox::erf, Variant::sycl, true);
+  std::vector<float> o(n);
+  std::vector<double> r(n);
+  for (std::size_t i = 0; i < n; ++i) { o[i] = static_cast<float>(out[i]); r[i] = static_cast<double>(g[i]) * gelu_grad_ref(static_cast<double>(x[i])); }
+  const bool ok = report<T>("gelu_bwd", dt, o, r);
+  sycl::free(g, q); sycl::free(x, q); sycl::free(out, q);
+  return ok;
+}
+
+template <typename T>
+bool check_glu(sycl::queue& q, DType dt, ops::GluMode mode, const char* mname,
+               std::size_t rows, std::size_t d) {
+  T* x = sycl::malloc_shared<T>(rows * 2 * d, q);
+  T* out = sycl::malloc_shared<T>(rows * d, q);
+  for (std::size_t i = 0; i < rows * 2 * d; ++i) x[i] = static_cast<T>(sample(i) * 2.0f);
+  ops::glu(q, x, out, rows, d, dt, mode, Variant::sycl, true);
+  std::vector<float> o(rows * d);
+  std::vector<double> r(rows * d);
+  for (std::size_t rr = 0; rr < rows; ++rr) {
+    for (std::size_t i = 0; i < d; ++i) {
+      const double gate = static_cast<double>(x[rr * 2 * d + i]);
+      const double val = static_cast<double>(x[rr * 2 * d + d + i]);
+      double a;
+      switch (mode) {
+        case ops::GluMode::swiglu: a = silu_ref(gate); break;
+        case ops::GluMode::geglu:  a = gelu_ref(gate); break;
+        case ops::GluMode::reglu:  a = relu_ref(gate); break;
+        default:                   a = sigmoid_ref(gate); break;
+      }
+      o[rr * d + i] = static_cast<float>(out[rr * d + i]);
+      r[rr * d + i] = a * val;
+    }
+  }
+  const bool ok = report<T>(mname, dt, o, r);
+  sycl::free(x, q); sycl::free(out, q);
+  return ok;
+}
+
 template <typename T>
 bool check_softmax(sycl::queue& q, DType dt, Variant variant, std::size_t rows,
                    std::size_t dim) {
@@ -239,6 +342,24 @@ int main() {
     failures += check_gelu<half_t>(q, DType::f16, v, host_in) ? 0 : 1;
     failures += check_gelu<bf16_t>(q, DType::bf16, v, host_in) ? 0 : 1;
   }
+
+  // Elementwise activations (native only): silu, gelu backward, glu modes.
+  for (const DType dt : {DType::f32, DType::f16, DType::bf16}) {
+    if (dt == DType::f32) {
+      failures += check_silu<float>(q, dt, 4096) ? 0 : 1;
+      failures += check_gelu_bwd<float>(q, dt, 4096) ? 0 : 1;
+    } else if (dt == DType::f16) {
+      failures += check_silu<half_t>(q, dt, 4096) ? 0 : 1;
+      failures += check_gelu_bwd<half_t>(q, dt, 4096) ? 0 : 1;
+    } else {
+      failures += check_silu<bf16_t>(q, dt, 4096) ? 0 : 1;
+      failures += check_gelu_bwd<bf16_t>(q, dt, 4096) ? 0 : 1;
+    }
+  }
+  failures += check_glu<float>(q, DType::f32, ops::GluMode::swiglu, "glu_swiglu", 64, 1024) ? 0 : 1;
+  failures += check_glu<float>(q, DType::f32, ops::GluMode::geglu, "glu_geglu", 64, 1024) ? 0 : 1;
+  failures += check_glu<bf16_t>(q, DType::bf16, ops::GluMode::swiglu, "glu_swiglu_bf16", 64, 1024) ? 0 : 1;
+  failures += check_glu<float>(q, DType::f32, ops::GluMode::reglu, "glu_reglu", 64, 1000) ? 0 : 1;  // d not mult of 4: scalar path
 
   const std::size_t rows = 64, dim = 1024;
   for (const Variant v : variants) {

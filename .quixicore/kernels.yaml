@@ -85,6 +85,31 @@ operations:
       - name: xpu_onednn
         status: implemented
         path: kernels/activations/softmax/variants/xpu_onednn
+  silu:
+    family: activations
+    status: implemented
+    path: kernels/activations/silu
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/activations/silu/variants/xpu_sycl}
+  gelu_backward:
+    family: activations
+    status: implemented
+    path: kernels/activations/gelu_backward
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/activations/gelu_backward/variants/xpu_sycl}
+  glu:
+    family: activations
+    status: implemented
+    path: kernels/activations/glu
+    dtypes: [f32, f16, bf16]
+    modes: [swiglu, geglu, reglu, glu]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/activations/glu/variants/xpu_sycl}
   rms_norm:
     family: norms
     status: implemented
