@@ -469,7 +469,15 @@ recentred -32; per-16 sub-block int8 scales). Follows ggml dequantize_row_q6_K
 exactly, one 32-wide subgroup per row. Correctness vs an INDEPENDENT host replica
 of the ggml reference over random-byte blocks (no shared packer): worst_excess 0,
 f32+bf16. Baseline 8192x8192 bf16 = 82 GB/s weight bandwidth. Proves the k-quant
-super-block layout decodes natively on Intel. q4_K/q5_K/q2_K/q3_K + i-quants next.
+super-block layout decodes natively on Intel.
+
+### quantization/gguf_gemv — q4_K (native k-quant decode, the common one)
+q4_K (144-byte super-block: fp16 d + dmin, 12-byte packed 6-bit scales+mins,
+qs[128]; 8 sub-blocks of 32; w = d*sc*q - dmin*m). Ported ggml get_scale_min_k4
+sub-scale unpacker + dequantize_row_q4_K. Correctness vs an independent host ggml
+replica over random bytes: worst_excess 0, f32+bf16. Baseline 8192x8192 bf16 =
+88 GB/s. q4_K is the format most real quantized LLMs ship in — now native on B60.
+q5_K/q2_K/q3_K + i-quants next.
 
 ## 2026-07-07: Track B depth begins — attention + sampling suite
 

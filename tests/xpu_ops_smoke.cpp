@@ -639,6 +639,59 @@ bool check_qgemm_int8(sycl::queue& q, DType out_dt, Variant variant,
 }
 
 template <typename T>
+bool check_gguf_q4k(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K) {
+  auto smk4 = [](int j, const std::uint8_t* s, int& sc, int& m) {
+    if (j < 4) { sc = s[j] & 63; m = s[j + 4] & 63; }
+    else { sc = (s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4); m = (s[j + 4] >> 4) | ((s[j] >> 6) << 4); }
+  };
+  const std::size_t sb = K / 256, row_bytes = sb * 144;
+  std::uint8_t* w = sycl::malloc_shared<std::uint8_t>(N * row_bytes, q);
+  T* x = sycl::malloc_shared<T>(K, q);
+  T* y = sycl::malloc_shared<T>(N, q);
+  const std::uint16_t db = sycl::bit_cast<std::uint16_t>(static_cast<half_t>(0.02f));
+  const std::uint16_t mb = sycl::bit_cast<std::uint16_t>(static_cast<half_t>(0.01f));
+  for (std::size_t n = 0; n < N; ++n)
+    for (std::size_t b = 0; b < sb; ++b) {
+      std::uint8_t* blk = w + n * row_bytes + b * 144;
+      blk[0] = db & 0xFF; blk[1] = db >> 8; blk[2] = mb & 0xFF; blk[3] = mb >> 8;
+      for (int i = 4; i < 144; ++i) blk[i] = static_cast<std::uint8_t>((std::size_t)(sample((n * sb + b) * 144 + i) * 128 + 128) & 0xFF);
+    }
+  for (std::size_t k = 0; k < K; ++k) x[k] = static_cast<T>(sample(k + 71));
+
+  ops::gguf_gemv(q, w, x, y, N, K, ops::GgufType::q4_K, act_dt, Variant::sycl, true);
+
+  auto lh = [](const std::uint8_t* p) { std::uint16_t b = p[0] | (p[1] << 8); return (double)sycl::bit_cast<half_t>(b); };
+  const Tol tol = tol_for(act_dt);
+  const double rtol = tol.rtol * std::sqrt((double)K) + 3e-3;
+  double worst = 0.0;
+  for (std::size_t n = 0; n < N; ++n) {
+    double acc = 0.0;
+    const std::uint8_t* wrow = w + n * row_bytes;
+    for (std::size_t b = 0; b < sb; ++b) {
+      const std::uint8_t* blk = wrow + b * 144;
+      const double d = lh(blk), dmin = lh(blk + 2);
+      const std::uint8_t* sc = blk + 4; const std::uint8_t* qs = blk + 16;
+      for (int iter = 0; iter < 4; ++iter) {
+        int s1, m1, s2, m2; smk4(iter * 2, sc, s1, m1); smk4(iter * 2 + 1, sc, s2, m2);
+        const double d1 = d * s1, mm1 = dmin * m1, d2 = d * s2, mm2 = dmin * m2;
+        const std::uint8_t* qq = qs + iter * 32; const std::size_t yb = b * 256 + iter * 64;
+        for (int l = 0; l < 32; ++l) {
+          acc += (d1 * (qq[l] & 0xF) - mm1) * (double)x[yb + l];
+          acc += (d2 * (qq[l] >> 4) - mm2) * (double)x[yb + 32 + l];
+        }
+      }
+    }
+    const double ref = (double)static_cast<T>(acc);
+    worst = std::max(worst, std::abs((double)y[n] - ref) - (tol.atol + rtol * std::abs(ref)));
+  }
+  sycl::free(w, q); sycl::free(x, q); sycl::free(y, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  gguf_gemv q4_K act=" << dtype_name(act_dt) << " (N=" << N << " K=" << K
+            << ") worst_excess=" << worst << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+template <typename T>
 bool check_gguf_q6k(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K) {
   const std::size_t sb = K / 256, row_bytes = sb * 210;
   std::uint8_t* w = sycl::malloc_shared<std::uint8_t>(N * row_bytes, q);
@@ -1187,6 +1240,8 @@ int main() {
   failures += check_gguf_gemv<bf16_t>(q, DType::bf16, ops::GgufType::q4_0, "q4_0", 128, 4096) ? 0 : 1;
   failures += check_gguf_q6k<float>(q, DType::f32, 128, 4096) ? 0 : 1;
   failures += check_gguf_q6k<bf16_t>(q, DType::bf16, 128, 4096) ? 0 : 1;
+  failures += check_gguf_q4k<float>(q, DType::f32, 128, 4096) ? 0 : 1;
+  failures += check_gguf_q4k<bf16_t>(q, DType::bf16, 128, 4096) ? 0 : 1;
 
   // int8 w8a8 GEMM, both variants.
   for (const Variant v : variants) {

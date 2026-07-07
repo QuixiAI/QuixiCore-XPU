@@ -115,10 +115,66 @@ sycl::event gguf_q6k_typed(sycl::queue& q, const std::uint8_t* w, const T* x,
   });
 }
 
+// ggml get_scale_min_k4: unpack the j-th 6-bit sub-scale (sc) and sub-min (m)
+// from the 12-byte packed scales array of q4_K/q5_K.
+inline void scale_min_k4(int j, const std::uint8_t* s, int& sc, int& m) {
+  if (j < 4) { sc = s[j] & 63; m = s[j + 4] & 63; }
+  else {
+    sc = (s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4);
+    m = (s[j + 4] >> 4) | ((s[j] >> 6) << 4);
+  }
+}
+
+// GGUF q4_K: 256-element super-block (144 bytes): fp16 d, fp16 dmin,
+// scales[12] (8 packed 6-bit scale+min pairs), qs[128]. 8 sub-blocks of 32,
+// w = d*sc*(q&0xF or q>>4) - dmin*m. Follows ggml dequantize_row_q4_K.
+template <typename T>
+sycl::event gguf_q4k_typed(sycl::queue& q, const std::uint8_t* w, const T* x,
+                           T* y, std::size_t N, std::size_t K) {
+  const std::size_t sblocks = K / 256;
+  const std::size_t row_bytes = sblocks * 144;
+  const std::size_t nwg = (N + kRowsPerWG - 1) / kRowsPerWG;
+  const sycl::nd_range<1> ndr(sycl::range<1>(nwg * kWG), sycl::range<1>(kWG));
+  return q.parallel_for(ndr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSG)]] {
+    const sycl::sub_group sg = it.get_sub_group();
+    const int sgid = static_cast<int>(sg.get_group_linear_id());
+    const int lane = static_cast<int>(sg.get_local_linear_id());
+    const std::size_t n = it.get_group(0) * kRowsPerWG + sgid;
+    if (n >= N) return;
+    const std::uint8_t* wrow = w + n * row_bytes;
+
+    float acc = 0.0f;
+    for (std::size_t b = lane; b < sblocks; b += kSG) {
+      const std::uint8_t* blk = wrow + b * 144;
+      const float d = load_half(blk);
+      const float dmin = load_half(blk + 2);
+      const std::uint8_t* sc = blk + 4;
+      const std::uint8_t* qs = blk + 16;
+      const std::size_t kbase = b * 256;
+      for (int iter = 0; iter < 4; ++iter) {
+        int s1, m1i, s2, m2i;
+        scale_min_k4(iter * 2 + 0, sc, s1, m1i);
+        scale_min_k4(iter * 2 + 1, sc, s2, m2i);
+        const float d1 = d * s1, mm1 = dmin * m1i;
+        const float d2 = d * s2, mm2 = dmin * m2i;
+        const std::uint8_t* qq = qs + iter * 32;
+        const std::size_t yb = kbase + iter * 64;
+        for (int l = 0; l < 32; ++l) {
+          acc += (d1 * (qq[l] & 0xF) - mm1) * static_cast<float>(x[yb + l]);
+          acc += (d2 * (qq[l] >> 4) - mm2) * static_cast<float>(x[yb + 32 + l]);
+        }
+      }
+    }
+    const float sum = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+    if (lane == 0) y[n] = static_cast<T>(sum);
+  });
+}
+
 template <typename T>
 sycl::event dispatch_type(sycl::queue& q, const std::uint8_t* w, const T* x, T* y,
                           std::size_t N, std::size_t K, int type) {
   if (type == 2) return gguf_q6k_typed<T>(q, w, x, y, N, K);
+  if (type == 3) return gguf_q4k_typed<T>(q, w, x, y, N, K);
   return type == 0 ? gguf_typed<T, 0>(q, w, x, y, N, K)
                    : gguf_typed<T, 1>(q, w, x, y, N, K);
 }
