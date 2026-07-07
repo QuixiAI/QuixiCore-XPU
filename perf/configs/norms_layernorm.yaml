@@ -1,0 +1,19 @@
+# Benchmark configuration for norms/layernorm.
+#
+# Consumed by perf/bench_kernels.py (--phase kernels, --preset sycl). Both shipped
+# variants are benchmarked because neither wins universally on B60: native SYCL
+# leads f32, oneDNN leads the 16-bit dtypes (perf/optimization_status.md
+# 2026-07-06). Parsed only when PyYAML is available; otherwise the harness falls
+# back to its built-in default matrix.
+
+kernel: layernorm
+family: norms
+operation: layernorm
+
+runs:
+  - {kernel: layernorm, variant: sycl,   dtype: f32,  rows: 8192, dim: 4096, iters: 60, warmup: 15}
+  - {kernel: layernorm, variant: vendor, dtype: f32,  rows: 8192, dim: 4096, iters: 60, warmup: 15}
+  - {kernel: layernorm, variant: sycl,   dtype: bf16, rows: 8192, dim: 4096, iters: 60, warmup: 15}
+  - {kernel: layernorm, variant: vendor, dtype: bf16, rows: 8192, dim: 4096, iters: 60, warmup: 15}
+  - {kernel: layernorm, variant: sycl,   dtype: f16,  rows: 8192, dim: 4096, iters: 60, warmup: 15}
+  - {kernel: layernorm, variant: vendor, dtype: f16,  rows: 8192, dim: 4096, iters: 60, warmup: 15}

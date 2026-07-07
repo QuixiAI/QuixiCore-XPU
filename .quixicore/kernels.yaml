@@ -14,8 +14,9 @@ layout: canonical_variants
 variant_path_rule: kernels/<family>/<operation>/variants/xpu_<target>
 families:
   norms:
-    status: planned
-    paths: []
+    status: partial
+    paths:
+      - kernels/norms
   activations:
     status: partial
     paths:
@@ -70,6 +71,32 @@ operations:
       - name: xpu_onednn
         status: implemented
         path: kernels/activations/gelu/variants/xpu_onednn
+  rms_norm:
+    family: norms
+    status: implemented
+    path: kernels/norms/rms_norm
+    dtypes: [f32, f16, bf16]
+    tests:
+      correctness: tests/xpu_ops_smoke.cpp
+    variants:
+      - name: xpu_sycl
+        status: implemented
+        path: kernels/norms/rms_norm/variants/xpu_sycl
+      # No oneDNN RMSNorm primitive; vendor/best resolve to xpu_sycl.
+  layernorm:
+    family: norms
+    status: implemented
+    path: kernels/norms/layernorm
+    dtypes: [f32, f16, bf16]
+    tests:
+      correctness: tests/xpu_ops_smoke.cpp
+    variants:
+      - name: xpu_sycl
+        status: implemented
+        path: kernels/norms/layernorm/variants/xpu_sycl
+      - name: xpu_onednn
+        status: implemented
+        path: kernels/norms/layernorm/variants/xpu_onednn
 notes: >-
   GELU is the reference operation and landed with both a native SYCL variant and
   a co-equal oneDNN vendor variant, correctness-checked on Arc Pro B60 across

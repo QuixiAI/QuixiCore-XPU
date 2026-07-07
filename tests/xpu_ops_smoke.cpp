@@ -86,6 +86,96 @@ bool check_gelu(sycl::queue& q, DType dt, Variant variant,
   return ok;
 }
 
+// Deterministic pseudo-random fill in a modest range, reproducible without any
+// RNG dependency.
+float sample(std::size_t i) {
+  const double t = static_cast<double>((i * 2654435761u) % 10007) / 10007.0;
+  return static_cast<float>(-2.0 + 4.0 * t);
+}
+
+template <typename T>
+bool check_rms_norm(sycl::queue& q, DType dt, Variant variant, std::size_t rows,
+                    std::size_t dim) {
+  const std::size_t n = rows * dim;
+  T* x = sycl::malloc_shared<T>(n, q);
+  T* w = sycl::malloc_shared<T>(dim, q);
+  T* out = sycl::malloc_shared<T>(n, q);
+  for (std::size_t i = 0; i < n; ++i) x[i] = static_cast<T>(sample(i));
+  for (std::size_t i = 0; i < dim; ++i) w[i] = static_cast<T>(0.5f + sample(i + 7) * 0.1f);
+  const float eps = 1e-6f;
+
+  ops::rms_norm(q, x, w, out, rows, dim, eps, dt, variant, /*blocking=*/true);
+
+  const Tol tol = tol_for(dt);
+  double worst_excess = 0.0, max_abs = 0.0;
+  for (std::size_t r = 0; r < rows; ++r) {
+    double ss = 0.0;
+    for (std::size_t i = 0; i < dim; ++i) {
+      const double v = static_cast<double>(x[r * dim + i]);
+      ss += v * v;
+    }
+    const double inv = 1.0 / std::sqrt(ss / static_cast<double>(dim) + eps);
+    for (std::size_t i = 0; i < dim; ++i) {
+      const double ref_hi = static_cast<double>(x[r * dim + i]) * inv *
+                            static_cast<double>(w[i]);
+      const double ref = static_cast<double>(static_cast<T>(ref_hi));
+      const double err = std::abs(static_cast<double>(out[r * dim + i]) - ref);
+      max_abs = std::max(max_abs, err);
+      worst_excess = std::max(worst_excess, err - (tol.atol + tol.rtol * std::abs(ref)));
+    }
+  }
+  sycl::free(x, q); sycl::free(w, q); sycl::free(out, q);
+  const bool ok = worst_excess <= 0.0;
+  std::cout << "  rms_norm dt=" << dtype_name(dt) << " variant=" << variant_name(variant)
+            << " max_abs=" << max_abs << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+template <typename T>
+bool check_layernorm(sycl::queue& q, DType dt, Variant variant, std::size_t rows,
+                     std::size_t dim) {
+  const std::size_t n = rows * dim;
+  T* x = sycl::malloc_shared<T>(n, q);
+  T* w = sycl::malloc_shared<T>(dim, q);
+  T* b = sycl::malloc_shared<T>(dim, q);
+  T* out = sycl::malloc_shared<T>(n, q);
+  for (std::size_t i = 0; i < n; ++i) x[i] = static_cast<T>(sample(i));
+  for (std::size_t i = 0; i < dim; ++i) {
+    w[i] = static_cast<T>(0.8f + sample(i + 3) * 0.1f);
+    b[i] = static_cast<T>(sample(i + 11) * 0.1f);
+  }
+  const float eps = 1e-5f;
+
+  ops::layernorm(q, x, w, b, out, rows, dim, eps, dt, variant, /*blocking=*/true);
+
+  const Tol tol = tol_for(dt);
+  double worst_excess = 0.0, max_abs = 0.0;
+  for (std::size_t r = 0; r < rows; ++r) {
+    double sum = 0.0, ss = 0.0;
+    for (std::size_t i = 0; i < dim; ++i) {
+      const double v = static_cast<double>(x[r * dim + i]);
+      sum += v; ss += v * v;
+    }
+    const double mean = sum / static_cast<double>(dim);
+    const double var = ss / static_cast<double>(dim) - mean * mean;
+    const double inv = 1.0 / std::sqrt(var + eps);
+    for (std::size_t i = 0; i < dim; ++i) {
+      const double ref_hi = (static_cast<double>(x[r * dim + i]) - mean) * inv *
+                                static_cast<double>(w[i]) +
+                            static_cast<double>(b[i]);
+      const double ref = static_cast<double>(static_cast<T>(ref_hi));
+      const double err = std::abs(static_cast<double>(out[r * dim + i]) - ref);
+      max_abs = std::max(max_abs, err);
+      worst_excess = std::max(worst_excess, err - (tol.atol + tol.rtol * std::abs(ref)));
+    }
+  }
+  sycl::free(x, q); sycl::free(w, q); sycl::free(b, q); sycl::free(out, q);
+  const bool ok = worst_excess <= 0.0;
+  std::cout << "  layernorm dt=" << dtype_name(dt) << " variant=" << variant_name(variant)
+            << " max_abs=" << max_abs << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -112,6 +202,16 @@ int main() {
     failures += check_gelu<float>(q, DType::f32, v, host_in) ? 0 : 1;
     failures += check_gelu<half_t>(q, DType::f16, v, host_in) ? 0 : 1;
     failures += check_gelu<bf16_t>(q, DType::bf16, v, host_in) ? 0 : 1;
+  }
+
+  const std::size_t rows = 64, dim = 1024;
+  for (const Variant v : variants) {
+    failures += check_rms_norm<float>(q, DType::f32, v, rows, dim) ? 0 : 1;
+    failures += check_rms_norm<half_t>(q, DType::f16, v, rows, dim) ? 0 : 1;
+    failures += check_rms_norm<bf16_t>(q, DType::bf16, v, rows, dim) ? 0 : 1;
+    failures += check_layernorm<float>(q, DType::f32, v, rows, dim) ? 0 : 1;
+    failures += check_layernorm<half_t>(q, DType::f16, v, rows, dim) ? 0 : 1;
+    failures += check_layernorm<bf16_t>(q, DType::bf16, v, rows, dim) ? 0 : 1;
   }
 
   if (failures) {

@@ -43,6 +43,12 @@ DEFAULT_KERNEL_BENCH = [
     {"kernel": "gelu", "variant": "vendor", "dtype": "f32", "n": 4194304},
     {"kernel": "gelu", "variant": "sycl", "dtype": "bf16", "n": 4194304},
     {"kernel": "gelu", "variant": "sycl", "dtype": "f16", "n": 4194304},
+    {"kernel": "rms_norm", "variant": "sycl", "dtype": "f32", "rows": 8192, "dim": 4096},
+    {"kernel": "rms_norm", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 4096},
+    {"kernel": "layernorm", "variant": "sycl", "dtype": "f32", "rows": 8192, "dim": 4096},
+    {"kernel": "layernorm", "variant": "vendor", "dtype": "f32", "rows": 8192, "dim": 4096},
+    {"kernel": "layernorm", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 4096},
+    {"kernel": "layernorm", "variant": "vendor", "dtype": "bf16", "rows": 8192, "dim": 4096},
 ]
 
 

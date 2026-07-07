@@ -48,4 +48,25 @@ void gelu(sycl::queue& q, const void* in, void* out, std::size_t n, DType dt,
           GeluApprox approx = GeluApprox::erf, Variant variant = Variant::sycl,
           bool blocking = true);
 
+// ----------------------------------------------------------------------------
+// norms
+// ----------------------------------------------------------------------------
+
+// RMSNorm over the last axis of a [rows, dim] row-major tensor:
+//   out[r, i] = x[r, i] * rsqrt(mean_i(x[r, :]^2) + eps) * weight[i]
+// `x`, `out` are device pointers of dtype `dt` ([rows*dim]); `weight` is [dim]
+// of dtype `dt`. Reduction accumulates in fp32. Deterministic family.
+void rms_norm(sycl::queue& q, const void* x, const void* weight, void* out,
+              std::size_t rows, std::size_t dim, float eps, DType dt,
+              Variant variant = Variant::sycl, bool blocking = true);
+
+// LayerNorm over the last axis of a [rows, dim] row-major tensor:
+//   out[r, i] = (x[r, i] - mean) * rsqrt(var + eps) * weight[i] + bias[i]
+// with mean/var over x[r, :]. `bias` may be null to skip the shift. `weight`,
+// `bias` are [dim] of dtype `dt`. Reduction accumulates in fp32.
+void layernorm(sycl::queue& q, const void* x, const void* weight,
+               const void* bias, void* out, std::size_t rows, std::size_t dim,
+               float eps, DType dt, Variant variant = Variant::sycl,
+               bool blocking = true);
+
 }  // namespace quixicore::xpu::ops

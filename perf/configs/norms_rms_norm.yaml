@@ -1,0 +1,17 @@
+# Benchmark configuration for norms/rms_norm.
+#
+# Consumed by perf/bench_kernels.py (--phase kernels, --preset sycl). rms_norm is
+# SYCL-only (no oneDNN RMSNorm primitive), so vendor/best resolve to the native
+# variant. Parsed only when PyYAML is available; otherwise the harness falls back
+# to its built-in default matrix.
+
+kernel: rms_norm
+family: norms
+operation: rms_norm
+
+runs:
+  - {kernel: rms_norm, variant: sycl, dtype: f32,  rows: 8192, dim: 1024, iters: 60, warmup: 15}
+  - {kernel: rms_norm, variant: sycl, dtype: f32,  rows: 8192, dim: 4096, iters: 60, warmup: 15}
+  - {kernel: rms_norm, variant: sycl, dtype: f32,  rows: 8192, dim: 8192, iters: 60, warmup: 15}
+  - {kernel: rms_norm, variant: sycl, dtype: bf16, rows: 8192, dim: 4096, iters: 60, warmup: 15}
+  - {kernel: rms_norm, variant: sycl, dtype: f16,  rows: 8192, dim: 4096, iters: 60, warmup: 15}

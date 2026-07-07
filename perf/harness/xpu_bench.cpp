@@ -33,6 +33,7 @@
 #include "quixicore/xpu/variants.hpp"
 
 #include "activations/gelu/gelu_kernel.hpp"
+#include "norms/norms_kernel.hpp"
 
 namespace {
 
@@ -70,7 +71,9 @@ int main(int argc, char** argv) {
   std::string dtype_s = "f32";
   std::string variant_s = "sycl";
   std::string approx_s = "erf";
-  std::size_t n = 1u << 20;  // 1,048,576 elements
+  std::size_t n = 1u << 20;  // 1,048,576 elements (elementwise kernels)
+  std::size_t rows = 4096;   // row kernels: [rows, dim]
+  std::size_t dim = 4096;
   int iters = 50;
   int warmup = 10;
   std::size_t device_index = 0;
@@ -86,6 +89,8 @@ int main(int argc, char** argv) {
     else if (a == "--variant") variant_s = next();
     else if (a == "--approx") approx_s = next();
     else if (a == "--n") n = std::stoull(next());
+    else if (a == "--rows") rows = std::stoull(next());
+    else if (a == "--dim") dim = std::stoull(next());
     else if (a == "--iters") iters = std::stoi(next());
     else if (a == "--warmup") warmup = std::stoi(next());
     else if (a == "--device") device_index = std::stoull(next());
@@ -105,9 +110,19 @@ int main(int argc, char** argv) {
   sycl::queue q = make_gpu_queue(device_index, /*enable_profiling=*/true);
 
   const std::size_t elem = dtype_size(dt);
-  void* d_in = sycl::malloc_device(n * elem, q);
-  void* d_out = sycl::malloc_device(n * elem, q);
-  q.memset(d_in, 0, n * elem).wait();
+  const bool is_norm = (kernel == "rms_norm" || kernel == "layernorm");
+  const std::size_t n_elems = is_norm ? rows * dim : n;
+
+  void* d_in = sycl::malloc_device(n_elems * elem, q);
+  void* d_out = sycl::malloc_device(n_elems * elem, q);
+  void* d_w = is_norm ? sycl::malloc_device(dim * elem, q) : nullptr;
+  void* d_b = is_norm ? sycl::malloc_device(dim * elem, q) : nullptr;
+  q.memset(d_in, 0, n_elems * elem).wait();
+  if (is_norm) {
+    q.memset(d_w, 0, dim * elem).wait();
+    q.memset(d_b, 0, dim * elem).wait();
+  }
+  const float eps = 1e-6f;
 
   // Event-returning submit of the selected op + variant.
   auto run_once = [&]() -> sycl::event {
@@ -118,6 +133,17 @@ int main(int argc, char** argv) {
 #endif
       }
       return kernels::gelu_sycl(q, d_in, d_out, n, dt, tanh_approx);
+    }
+    if (kernel == "rms_norm") {
+      return kernels::rms_norm_sycl(q, d_in, d_w, d_out, rows, dim, eps, dt);
+    }
+    if (kernel == "layernorm") {
+      if (variant == Variant::vendor) {
+#if defined(QUIXICORE_XPU_HAS_ONEDNN)
+        return kernels::layernorm_onednn(q, d_in, d_w, d_b, d_out, rows, dim, eps, dt);
+#endif
+      }
+      return kernels::layernorm_sycl(q, d_in, d_w, d_b, d_out, rows, dim, eps, dt);
     }
     throw std::invalid_argument("unknown kernel: " + kernel);
   };
@@ -136,12 +162,22 @@ int main(int argc, char** argv) {
   const double min_ms = samples.front();
   const double max_ms = samples.back();
 
-  // Effective bandwidth: read + write of n elements.
-  const double bytes = static_cast<double>(n) * static_cast<double>(elem) * 2.0;
+  // Effective bandwidth. Elementwise: read + write of n. Norms: read x + write
+  // out (2*rows*dim) plus the small weight/bias reads (dim, or 2*dim w/ bias).
+  double bytes;
+  if (is_norm) {
+    const double affine = (kernel == "layernorm") ? 2.0 : 1.0;
+    bytes = (2.0 * static_cast<double>(rows * dim) + affine * static_cast<double>(dim)) *
+            static_cast<double>(elem);
+  } else {
+    bytes = static_cast<double>(n) * static_cast<double>(elem) * 2.0;
+  }
   const double gbps = bytes / (median * 1e-3) / 1e9;
 
   sycl::free(d_in, q);
   sycl::free(d_out, q);
+  if (d_w) sycl::free(d_w, q);
+  if (d_b) sycl::free(d_b, q);
 
   std::cout << "{\"schema_version\":2"
             << ",\"kernel\":\"" << kernel << "\""
@@ -149,7 +185,9 @@ int main(int argc, char** argv) {
             << ",\"requested_variant\":\"" << variant_name(requested) << "\""
             << ",\"approx\":\"" << (tanh_approx ? "tanh" : "erf") << "\""
             << ",\"dtype\":\"" << dtype_name(dt) << "\""
-            << ",\"n\":" << n
+            << ",\"n\":" << n_elems
+            << ",\"rows\":" << rows
+            << ",\"dim\":" << dim
             << ",\"iters\":" << iters
             << ",\"warmup\":" << warmup
             << ",\"median_ms\":" << median
