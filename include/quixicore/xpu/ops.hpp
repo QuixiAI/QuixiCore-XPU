@@ -198,6 +198,19 @@ void selective_scan(sycl::queue& q, const void* u, const void* delta,
                     bool blocking = true);
 
 // ----------------------------------------------------------------------------
+// collectives (multi-GPU)
+// ----------------------------------------------------------------------------
+
+// Sum all-reduce across ALL visible Intel GPUs (the 4x B60). `in_per_gpu` is a
+// host buffer [n_gpus * count] where GPU g's contribution is at offset g*count;
+// `out` is host [count] = the elementwise sum across GPUs. Internally scatters
+// to each GPU (shared SYCL context), reduces via cross-device USM copies, and
+// broadcasts. Returns the number of GPUs used (capability-gated: 0 if none).
+// Native path; a oneCCL vendor variant is the production route (deferred).
+std::size_t all_reduce_sum(const float* in_per_gpu, float* out,
+                           std::size_t count);
+
+// ----------------------------------------------------------------------------
 // matmul
 // ----------------------------------------------------------------------------
 

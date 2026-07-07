@@ -58,8 +58,10 @@ families:
     paths:
       - kernels/optimizers
   collectives:
-    status: planned
-    paths: []
+    status: capability_gated
+    paths:
+      - src/dispatch/collectives.cpp
+    note: Native multi-GPU sum all-reduce across the 4x B60 (verified); requires >1 GPU. oneCCL vendor variant deferred.
   utils:
     status: partial
     paths:

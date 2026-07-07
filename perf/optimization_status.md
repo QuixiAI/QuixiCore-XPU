@@ -460,6 +460,19 @@ Correctness: exact match (embedding gather; scatter->gather round-trip),
 f32 + bf16, 0 mismatches. Baseline: embedding bf16 8192x4096 = 258 GB/s
 (scattered table gather, below streaming roofline as expected). Native-only.
 
+### collectives — all_reduce_sum (native multi-GPU) — BREADTH PASS COMPLETE
+Real sum all-reduce across all 4 Arc Pro B60s. The B60s appear on 2 backends
+(Level Zero + OpenCL), so a single context can't span platforms — select the
+single platform exposing the most GPUs (L0, 4 devices), one queue per device,
+shared context, reduce onto GPU0 via cross-device USM copies, broadcast.
+Correctness: ng=4, sum(1..4)=10, 0 mismatches — verified on the real 4-GPU box.
+Native; oneCCL ring/tree all-reduce is the vendor variant (deferred).
+
+With this, EVERY kernel family has at least one implemented op (breadth-first
+Track A done): activations, norms, matmul, attention, optimizers, sampling,
+quantization, serving, utils, moe, linear_attention, ssm, collectives. Next:
+Track B depth waves to full Metal parity + Track C PyTorch-XPU binding.
+
 ### ssm — selective_scan (Mamba S6 forward, native)
 One work-item per channel; state vector h[state] in registers; the scan runs
 sequentially over seq (inherently serial recurrence), parallelism from the many

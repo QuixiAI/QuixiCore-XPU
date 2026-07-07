@@ -337,6 +337,22 @@ bool check_selective_scan(sycl::queue& q, DType dt, std::size_t nc, std::size_t 
   return ok;
 }
 
+bool check_collectives() {
+  const std::size_t count = 4096;
+  std::vector<float> in(8 * count), out(count, 0.0f);
+  for (std::size_t g = 0; g < 8; ++g)
+    for (std::size_t i = 0; i < count; ++i) in[g * count + i] = static_cast<float>(g + 1);
+  const std::size_t ng = ops::all_reduce_sum(in.data(), out.data(), count);
+  if (ng == 0) { std::cout << "  all_reduce_sum: no GPU (skip)\n"; return true; }
+  const float expected = static_cast<float>(ng * (ng + 1) / 2);
+  int bad = 0;
+  for (std::size_t i = 0; i < count; ++i) if (std::abs(out[i] - expected) > 1e-3f) ++bad;
+  const bool ok = (bad == 0);
+  std::cout << "  all_reduce_sum ng=" << ng << " expected=" << expected << " bad=" << bad
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // Explicit mantissa bits per storage dtype (for the 1-ULP allowance below).
 int mantissa_bits(DType dt) {
   switch (dt) {
@@ -1068,6 +1084,9 @@ int main() {
   // ssm: Mamba selective scan.
   failures += check_selective_scan<float>(q, DType::f32, 1024, 512, 16) ? 0 : 1;
   failures += check_selective_scan<bf16_t>(q, DType::bf16, 1024, 256, 16) ? 0 : 1;
+
+  // collectives: multi-GPU sum all-reduce across the visible B60s.
+  failures += check_collectives() ? 0 : 1;
 
   // moe: top-k routing.
   failures += check_moe_route<float>(q, DType::f32, 512, 64, 2) ? 0 : 1;
