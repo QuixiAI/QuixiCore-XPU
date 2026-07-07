@@ -10,6 +10,10 @@ include(CMakePackageConfigHelpers)
 include(CTest)
 include(GNUInstallDirs)
 
+# Build position-independent so the static libs can be linked into the PyTorch
+# extension shared object (bindings/pytorch).
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 option(QUIXICORE_XPU_BUILD_TESTS "Build QuixiCore XPU tests" ON)
 option(QUIXICORE_XPU_BUILD_EXAMPLES "Build QuixiCore XPU examples" ON)
 option(QUIXICORE_XPU_ENABLE_SYCL "Build SYCL/oneAPI device-probe targets" OFF)

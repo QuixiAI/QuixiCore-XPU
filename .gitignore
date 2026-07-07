@@ -49,3 +49,6 @@ perf/results/*
 .DS_Store
 .env
 .env.*
+build-sycl-shared/
+bindings/pytorch/build/
+bindings/pytorch/*.so

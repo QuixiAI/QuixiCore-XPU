@@ -358,3 +358,12 @@ notes: >-
   other family is claimed implemented until native XPU code, correctness tests,
   and benchmark coverage land. GLU and GELU-backward remain planned, so the
   activations family is `partial`.
+
+bindings:
+  pytorch:
+    status: implemented
+    path: bindings/pytorch
+    note: >-
+      torch.xpu zero-copy binding (tk_xpu); queue off the tensor XPU stream ->
+      ops ABI on data_ptr. Validated vs torch.xpu eager kernels (f32/bf16/f16).
+      Requires a shared ops lib (icpx -fsycl) + a .sycl binding source.

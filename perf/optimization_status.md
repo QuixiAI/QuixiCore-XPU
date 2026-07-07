@@ -460,6 +460,23 @@ Correctness: exact match (embedding gather; scatter->gather round-trip),
 f32 + bf16, 0 mismatches. Baseline: embedding bf16 8192x4096 = 258 GB/s
 (scattered table gather, below streaming roofline as expected). Native-only.
 
+## 2026-07-07: Track C — PyTorch-XPU binding works end-to-end (validated vs torch.xpu)
+
+`bindings/pytorch/tk_xpu`: torch.xpu tensors -> SYCL queue off the tensor's XPU
+stream -> our ops ABI on the USM data_ptr, zero-copy. Parity harness
+(test_parity.py) checks tk_xpu.<op> vs PyTorch's own XPU kernels across
+f32/bf16/f16: gelu/silu/softmax/rms_norm/layernorm/attention/argmax/dense_gemm
+ALL PASS (max abs err at storage-dtype epsilon).
+
+Non-obvious blocker solved (looked like a SYCL version skew; was not — torch's
+libsycl and system icpx are the identical 20260331 build). Two real causes:
+(1) the ops must be a SHARED lib built with `icpx -fsycl` so device images
+self-register — a static .a linked via plain c++ never registers -> submit
+segfaults in ProgramManager::getDeviceKernelInfo; (2) the binding source must end
+in `.sycl` so SyclExtension applies -fsycl + does the device link. Proven by a
+minimal named-kernel .sycl running correctly on a torch.xpu tensor. Build via
+bindings/pytorch/build.sh (BUILD_SHARED_LIBS=ON + .sycl source).
+
 ## 2026-07-07: quantization — act_quant (w8a8 activation quant) + all formats done
 
 ### quantization/quantize_int4_group — weight quantization (round-trips qgemv)
