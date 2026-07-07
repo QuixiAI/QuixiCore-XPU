@@ -333,6 +333,35 @@ fp16; we are at 1.18x). Flagged as the next qgemv optimization. This is also the
 first proof point for the "all quant formats work on XPU" thesis: int4 group
 decode runs natively and competitively, no NVIDIA hardware required.
 
+## 2026-07-06: quantization/qgemm int8 w8a8 — oneDNN XMX hits 182 TOPS
+
+Status: landed (native int8 tile + oneDNN vendor). Prefill counterpart to qgemv.
+
+Format: A int8 [M,K] with per-row (per-token) fp32 scale; B int8 [K,N] with
+per-col (per-channel) fp32 scale; C = (A@B) * a_scale[m] * b_scale[n], int32
+accum, out f32/f16/bf16. Correctness (out f32+bf16, both variants) vs an fp64
+reference: pass.
+
+Obstacle smashed: oneDNN GPU int8 matmul rejects a per-M (per-token) SRC scale
+attribute ("unsupported scales configuration", matmul.cpp:130) — it only takes
+per-tensor src / per-channel weights scales. Rather than drop to per-tensor
+activation scaling (wrong for dynamic per-token quant), the per-row scale is
+applied as a binary-mul POST-OP with an [M,1] tensor that broadcasts over N;
+the per-col weight scale stays a scale attribute. A try/catch falls back to the
+native tile if a config is still unsupported. This is the honest way around a
+vendor constraint — work with the API's real capabilities, verified on device.
+
+Baseline (4096x4096x4096, GOPS = 2*M*N*K/median):
+- native SYCL int8 tile: 826 GOPS (untuned, no DPAS joint_matrix).
+- oneDNN vendor (XMX int8 DPAS): 182189 GOPS = ~182 TOPS (0.75 ms) — 2x the bf16
+  dense GEMM (90 TFLOP/s) and 220x the naive tile.
+
+Decision: best -> vendor for qgemm. The ~182 TOPS int8 confirms B60's DPAS int8
+peak and is the real payoff of the quant surface. Native DPAS joint_matrix int8
+is the flagged follow-up. Another proof for "quant works natively on XPU":
+w8a8 int8 GEMM runs at full XMX throughput, no NVIDIA hardware. int8 format ->
+experimental in quant-formats.yaml.
+
 ## First Kernel Plan
 
 Status: in progress — 7 families now have implementations: activations (gelu,

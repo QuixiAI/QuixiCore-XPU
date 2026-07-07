@@ -40,8 +40,11 @@ formats:
       groupwise). First decode landed as quantization/qgemv (int4 GEMV that beats
       fp16 GEMV on B60). Proof that groupwise int4 runs natively on Intel GPU.
   int8:
-    status: planned
-    note: w8a8 / azp zero-point; native Intel XMX/DPAS int8.
+    status: experimental
+    note: >-
+      w8a8, per-token (row) activation + per-channel (col) weight scales. Landed
+      as quantization/qgemm; oneDNN XMX/DPAS int8 path measured ~182 TOPS on B60
+      (2x the bf16 GEMM). Native DPAS joint_matrix path is a follow-up.
   bitnet:
     status: planned
 status_values:

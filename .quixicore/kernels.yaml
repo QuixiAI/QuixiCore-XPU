@@ -145,6 +145,16 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/quantization/qgemv/variants/xpu_sycl}
+  qgemm_int8:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/qgemm
+    dtypes: [f32, f16, bf16]
+    quant_format: int8_w8a8
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/quantization/qgemm/variants/xpu_sycl}
+      - {name: xpu_onednn, status: implemented, path: kernels/quantization/qgemm/variants/xpu_onednn}
   rope:
     family: attention
     status: implemented

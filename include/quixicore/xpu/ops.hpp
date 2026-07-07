@@ -140,6 +140,16 @@ void qgemv_int4(sycl::queue& q, const void* w_packed, const void* scales,
                 std::size_t group, DType act_dt, Variant variant = Variant::sycl,
                 bool blocking = true);
 
+// int8 w8a8 GEMM: C[M,N] = (A_int8[M,K] @ B_int8[K,N]) * a_scale[M] * b_scale[N].
+// A, B are int8 device pointers; a_scale (per-row/token) and b_scale (per-col/
+// channel) are fp32 [M] and [N]; C is `out_dt` (f32/f16/bf16). Accumulates int32.
+// The vendor variant is oneDNN int8 matmul (XMX/DPAS); the native variant is an
+// SLM-tiled int8 baseline.
+void qgemm_int8(sycl::queue& q, const void* a_int8, const void* b_int8,
+                const void* a_scale, const void* b_scale, void* c, std::size_t M,
+                std::size_t N, std::size_t K, DType out_dt,
+                Variant variant = Variant::best, bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // norms
 // ----------------------------------------------------------------------------

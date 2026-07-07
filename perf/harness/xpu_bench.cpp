@@ -41,6 +41,7 @@
 #include "matmul/dense_gemm/dense_gemm_kernel.hpp"
 #include "norms/norms_kernel.hpp"
 #include "optimizers/adamw/adamw_kernel.hpp"
+#include "quantization/qgemm/qgemm_kernel.hpp"
 #include "quantization/qgemv/qgemv_kernel.hpp"
 #include "sampling/argmax/argmax_kernel.hpp"
 
@@ -165,6 +166,38 @@ int main(int argc, char** argv) {
               << ",\"gflops\":" << gflops << ",\"device\":\""
               << q.get_device().get_info<sycl::info::device::name>() << "\"}"
               << std::endl;
+    return 0;
+  }
+
+  if (kernel == "qgemm_int8") {
+    std::int8_t* A = sycl::malloc_device<std::int8_t>(M * K, q);
+    std::int8_t* B = sycl::malloc_device<std::int8_t>(K * N, q);
+    float* as = sycl::malloc_device<float>(M, q);
+    float* bs = sycl::malloc_device<float>(N, q);
+    void* C = sycl::malloc_device(M * N * elem, q);
+    q.memset(A, 0, M * K).wait(); q.memset(B, 0, K * N).wait();
+    q.memset(as, 0, M * 4).wait(); q.memset(bs, 0, N * 4).wait();
+    auto once = [&]() -> sycl::event {
+      if (variant == Variant::vendor) {
+#if defined(QUIXICORE_XPU_HAS_ONEDNN)
+        return kernels::qgemm_int8_onednn(q, A, B, as, bs, C, M, N, K, dt);
+#endif
+      }
+      return kernels::qgemm_int8_sycl(q, A, B, as, bs, C, M, N, K, dt);
+    };
+    for (int i = 0; i < warmup; ++i) once().wait();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) { sycl::event e = once(); e.wait(); s.push_back(event_ms(e)); }
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    const double gops = 2.0 * (double)M * (double)N * (double)K / (med * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"qgemm_int8\",\"variant\":\""
+              << variant_name(variant) << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"M\":" << M << ",\"N\":" << N << ",\"K\":" << K
+              << ",\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"gops\":" << gops << ",\"device\":\""
+              << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(A, q); sycl::free(B, q); sycl::free(as, q); sycl::free(bs, q); sycl::free(C, q);
     return 0;
   }
 

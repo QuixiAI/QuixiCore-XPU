@@ -233,6 +233,42 @@ bool check_softmax(sycl::queue& q, DType dt, Variant variant, std::size_t rows,
 }
 
 template <typename T>
+bool check_qgemm_int8(sycl::queue& q, DType out_dt, Variant variant,
+                      std::size_t M, std::size_t N, std::size_t K) {
+  std::int8_t* A = sycl::malloc_shared<std::int8_t>(M * K, q);
+  std::int8_t* B = sycl::malloc_shared<std::int8_t>(K * N, q);
+  float* as = sycl::malloc_shared<float>(M, q);
+  float* bs = sycl::malloc_shared<float>(N, q);
+  T* C = sycl::malloc_shared<T>(M * N, q);
+  for (std::size_t i = 0; i < M * K; ++i) A[i] = static_cast<std::int8_t>(std::floor(sample(i) * 30.0f));
+  for (std::size_t i = 0; i < K * N; ++i) B[i] = static_cast<std::int8_t>(std::floor(sample(i + 5) * 30.0f));
+  for (std::size_t i = 0; i < M; ++i) as[i] = 0.01f + 0.005f * std::abs(sample(i + 1));
+  for (std::size_t i = 0; i < N; ++i) bs[i] = 0.01f + 0.005f * std::abs(sample(i + 2));
+
+  ops::qgemm_int8(q, A, B, as, bs, C, M, N, K, out_dt, variant, /*blocking=*/true);
+
+  const Tol base = tol_for(out_dt);
+  const double rtol = base.rtol * std::sqrt(static_cast<double>(K)) + 1e-3;
+  double worst = 0.0, max_abs = 0.0;
+  for (std::size_t m = 0; m < M; ++m)
+    for (std::size_t n = 0; n < N; ++n) {
+      long acc = 0;
+      for (std::size_t k = 0; k < K; ++k) acc += (int)A[m * K + k] * (int)B[k * N + n];
+      const double ref_hi = (double)acc * (double)as[m] * (double)bs[n];
+      const double ref = static_cast<double>(static_cast<T>(ref_hi));
+      const double err = std::abs((double)C[m * N + n] - ref);
+      max_abs = std::max(max_abs, err);
+      worst = std::max(worst, err - (base.atol + rtol * std::abs(ref)));
+    }
+  sycl::free(A, q); sycl::free(B, q); sycl::free(as, q); sycl::free(bs, q); sycl::free(C, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  qgemm_int8 out=" << dtype_name(out_dt) << " variant=" << variant_name(variant)
+            << " (" << M << "x" << N << "x" << K << ") max_abs=" << max_abs
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+template <typename T>
 bool check_qgemv_int4(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K,
                       std::size_t group) {
   const std::size_t bpr = K / 2;         // bytes per row
@@ -533,6 +569,12 @@ int main() {
   // int4 quantized GEMV (native).
   failures += check_qgemv_int4<float>(q, DType::f32, 128, 4096, 128) ? 0 : 1;
   failures += check_qgemv_int4<bf16_t>(q, DType::bf16, 128, 4096, 128) ? 0 : 1;
+
+  // int8 w8a8 GEMM, both variants.
+  for (const Variant v : variants) {
+    failures += check_qgemm_int8<float>(q, DType::f32, v, 96, 128, 256) ? 0 : 1;
+    failures += check_qgemm_int8<bf16_t>(q, DType::bf16, v, 96, 128, 256) ? 0 : 1;
+  }
 
   // rope / adamw / argmax (native only).
   failures += check_rope<float>(q, DType::f32, 32, 8, 64) ? 0 : 1;
