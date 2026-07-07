@@ -171,6 +171,18 @@ void moe_route_topk(sycl::queue& q, const void* router_logits, int* expert_ids,
                     Variant variant = Variant::sycl, bool blocking = true);
 
 // ----------------------------------------------------------------------------
+// linear_attention
+// ----------------------------------------------------------------------------
+
+// Non-causal linear attention. Q, K, V are [n_heads, seq, dim] dtype dt; O is
+// [n_heads, seq, dim]. Per head: KV = sum_t K[t]^T V[t] (dim x dim), z = sum_t
+// K[t] (dim), O[t] = (Q[t] @ KV) / (Q[t] . z + eps). fp32 accumulation. dim must
+// be <= 64 for the SLM path. Native-only.
+void linear_attn(sycl::queue& q, const void* Q, const void* K, const void* V,
+                 void* O, std::size_t n_heads, std::size_t seq, std::size_t dim,
+                 DType dt, Variant variant = Variant::sycl, bool blocking = true);
+
+// ----------------------------------------------------------------------------
 // matmul
 // ----------------------------------------------------------------------------
 

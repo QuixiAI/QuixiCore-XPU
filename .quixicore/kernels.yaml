@@ -26,8 +26,9 @@ families:
     paths:
       - kernels/attention
   linear_attention:
-    status: planned
-    paths: []
+    status: partial
+    paths:
+      - kernels/linear_attention
   ssm:
     status: planned
     paths: []
@@ -196,6 +197,14 @@ operations:
     note: Correct on B60 (e4m3/e5m2) but not hardware-accelerated this generation.
     variants:
       - {name: xpu_onednn, status: experimental, path: kernels/quantization/fp8_gemm/variants/xpu_onednn}
+  linear_attn:
+    family: linear_attention
+    status: implemented
+    path: kernels/linear_attention/linear_attn
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/linear_attention/linear_attn/variants/xpu_sycl}
   moe_route_topk:
     family: moe
     status: implemented

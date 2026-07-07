@@ -460,6 +460,14 @@ Correctness: exact match (embedding gather; scatter->gather round-trip),
 f32 + bf16, 0 mismatches. Baseline: embedding bf16 8192x4096 = 258 GB/s
 (scattered table gather, below streaming roofline as expected). Native-only.
 
+### linear_attention — linear_attn (non-causal, native)
+Exploits linear-attention associativity O = Q(K^T V): one work-group per head
+builds the (dim x dim) KV state + (dim) normalizer z in SLM (O(seq*dim^2)), then
+applies O[t] = (Q[t] @ KV)/(Q[t].z). dim<=64 SLM path. Correctness vs fp64
+(worst_excess 0, sqrt(seq)-scaled tol), f32+bf16. Baseline 32h x 2048 x 64 =
+136 GFLOP/s (naive triple loops; register-tiling deferred). Native-only.
+Causal/decay/chunked + gdn/based/hedgehog land in the depth wave.
+
 ### moe — moe_route_topk (native)
 Top-k expert routing: one work-item per token, iterative argmax selection over
 expert logits + softmax over the k selected. Correctness vs fp64 (exact top-k

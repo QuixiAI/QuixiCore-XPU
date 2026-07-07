@@ -48,6 +48,7 @@
 #include "quantization/qgemm/qgemm_kernel.hpp"
 #include "quantization/qgemv/qgemv_kernel.hpp"
 #include "sampling/argmax/argmax_kernel.hpp"
+#include "linear_attention/linear_attn/linear_attn_kernel.hpp"
 #include "moe/moe_route/moe_route_kernel.hpp"
 #include "serving/serving_kernel.hpp"
 #include "utils/utils_kernel.hpp"
@@ -356,6 +357,21 @@ int main(int argc, char** argv) {
               << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>()
               << "\"}" << std::endl;
   };
+  if (kernel == "linear_attn") {
+    const std::size_t nh = rows, seq = dim, d = 64;
+    const std::size_t sz = nh * seq * d * elem;
+    void* Q = sycl::malloc_device(sz, q); void* K = sycl::malloc_device(sz, q);
+    void* V = sycl::malloc_device(sz, q); void* O = sycl::malloc_device(sz, q);
+    q.memset(Q, 0, sz).wait(); q.memset(K, 0, sz).wait(); q.memset(V, 0, sz).wait();
+    const double med = time_median([&] { return kernels::linear_attn_sycl(q, Q, K, V, O, nh, seq, d, dt); });
+    const double gflop = 2.0 * nh * (seq * d * d + seq * d * d) / (med * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"linear_attn\",\"variant\":\"sycl\",\"dtype\":\""
+              << dtype_name(dt) << "\",\"heads\":" << nh << ",\"seq\":" << seq << ",\"dim\":" << d
+              << ",\"iters\":" << iters << ",\"median_ms\":" << med << ",\"gflops\":" << gflop
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(Q, q); sycl::free(K, q); sycl::free(V, q); sycl::free(O, q);
+    return 0;
+  }
   if (kernel == "moe_route") {
     const std::size_t nt = rows, ne = dim; const int kk = 4;
     void* lg = sycl::malloc_device(nt * ne * elem, q);

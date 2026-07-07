@@ -252,6 +252,49 @@ bool check_moe_route(sycl::queue& q, DType dt, std::size_t nt, std::size_t ne, i
   return ok;
 }
 
+template <typename T>
+bool check_linear_attn(sycl::queue& q, DType dt, std::size_t nh, std::size_t seq, std::size_t dim) {
+  T* Q = sycl::malloc_shared<T>(nh * seq * dim, q);
+  T* K = sycl::malloc_shared<T>(nh * seq * dim, q);
+  T* V = sycl::malloc_shared<T>(nh * seq * dim, q);
+  T* O = sycl::malloc_shared<T>(nh * seq * dim, q);
+  for (std::size_t i = 0; i < nh * seq * dim; ++i) {
+    Q[i] = static_cast<T>(0.5f + 0.5f * std::abs(sample(i)));       // positive (feature map)
+    K[i] = static_cast<T>(0.5f + 0.5f * std::abs(sample(i + 7)));
+    V[i] = static_cast<T>(sample(i + 13));
+  }
+  ops::linear_attn(q, Q, K, V, O, nh, seq, dim, dt, Variant::sycl, true);
+
+  const Tol tol = tol_for(dt);
+  const double rtol = tol.rtol * std::sqrt(static_cast<double>(seq)) + 5e-3;
+  double worst = 0.0;
+  std::vector<double> KV(dim * dim), z(dim);
+  for (std::size_t h = 0; h < nh; ++h) {
+    const std::size_t base = h * seq * dim;
+    for (std::size_t i = 0; i < dim; ++i) {
+      z[i] = 0;
+      for (std::size_t t = 0; t < seq; ++t) z[i] += (double)K[base + t * dim + i];
+      for (std::size_t j = 0; j < dim; ++j) {
+        double a = 0;
+        for (std::size_t t = 0; t < seq; ++t) a += (double)K[base + t * dim + i] * (double)V[base + t * dim + j];
+        KV[i * dim + j] = a;
+      }
+    }
+    for (std::size_t t = 0; t < seq; ++t)
+      for (std::size_t j = 0; j < dim; ++j) {
+        double num = 0, den = 0;
+        for (std::size_t i = 0; i < dim; ++i) { const double qi = (double)Q[base + t * dim + i]; num += qi * KV[i * dim + j]; den += qi * z[i]; }
+        const double ref = (double)static_cast<T>(num / (den + 1e-6));
+        worst = std::max(worst, std::abs((double)O[base + t * dim + j] - ref) - (tol.atol + rtol * std::abs(ref)));
+      }
+  }
+  sycl::free(Q, q); sycl::free(K, q); sycl::free(V, q); sycl::free(O, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  linear_attn dt=" << dtype_name(dt) << " (h=" << nh << " s=" << seq
+            << " d=" << dim << ") worst_excess=" << worst << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // Explicit mantissa bits per storage dtype (for the 1-ULP allowance below).
 int mantissa_bits(DType dt) {
   switch (dt) {
@@ -975,6 +1018,10 @@ int main() {
   // serving: embedding + kv-cache scatter/gather (exact copy).
   failures += check_serving<float>(q, DType::f32) ? 0 : 1;
   failures += check_serving<bf16_t>(q, DType::bf16) ? 0 : 1;
+
+  // linear_attention: non-causal linear attention.
+  failures += check_linear_attn<float>(q, DType::f32, 8, 256, 64) ? 0 : 1;
+  failures += check_linear_attn<bf16_t>(q, DType::bf16, 8, 128, 64) ? 0 : 1;
 
   // moe: top-k routing.
   failures += check_moe_route<float>(q, DType::f32, 512, 64, 2) ? 0 : 1;
