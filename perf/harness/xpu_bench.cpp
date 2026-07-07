@@ -49,6 +49,7 @@
 #include "quantization/qgemv/qgemv_kernel.hpp"
 #include "sampling/argmax/argmax_kernel.hpp"
 #include "serving/serving_kernel.hpp"
+#include "utils/utils_kernel.hpp"
 
 namespace {
 
@@ -354,6 +355,35 @@ int main(int argc, char** argv) {
               << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>()
               << "\"}" << std::endl;
   };
+  if (kernel == "dropout") {
+    const std::size_t ne = rows * dim;
+    void* in = sycl::malloc_device(ne * elem, q);
+    void* o = sycl::malloc_device(ne * elem, q);
+    q.memset(in, 0, ne * elem).wait();
+    const double med = time_median([&] { return kernels::dropout_sycl(q, in, o, ne, 0.1f, 7u, dt); });
+    emit(med, 2.0 * ne * elem / (med * 1e-3) / 1e9);
+    sycl::free(in, q); sycl::free(o, q);
+    return 0;
+  }
+  if (kernel == "cross_entropy") {
+    void* lg = sycl::malloc_device(rows * dim * elem, q);
+    int* tg = sycl::malloc_device<int>(rows, q);
+    float* ls = sycl::malloc_device<float>(rows, q);
+    q.memset(lg, 0, rows * dim * elem).wait(); q.memset(tg, 0, rows * sizeof(int)).wait();
+    const double med = time_median([&] { return kernels::cross_entropy_sycl(q, lg, tg, ls, rows, dim, dt); });
+    emit(med, static_cast<double>(rows) * dim * elem / (med * 1e-3) / 1e9);
+    sycl::free(lg, q); sycl::free(tg, q); sycl::free(ls, q);
+    return 0;
+  }
+  if (kernel == "hadamard") {
+    void* in = sycl::malloc_device(rows * dim * elem, q);
+    void* o = sycl::malloc_device(rows * dim * elem, q);
+    q.memset(in, 0, rows * dim * elem).wait();
+    const double med = time_median([&] { return kernels::hadamard_sycl(q, in, o, rows, dim, dt); });
+    emit(med, 2.0 * static_cast<double>(rows) * dim * elem / (med * 1e-3) / 1e9);
+    sycl::free(in, q); sycl::free(o, q);
+    return 0;
+  }
   if (kernel == "rope") {
     const std::size_t ne = rows * dim;  // tokens=rows, heads=1, head_dim=dim
     void* x = sycl::malloc_device(ne * elem, q);

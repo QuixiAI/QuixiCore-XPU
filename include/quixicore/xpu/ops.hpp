@@ -137,6 +137,28 @@ void kv_cache_gather(sycl::queue& q, const void* cache, const int* idx,
                      Variant variant = Variant::sycl, bool blocking = true);
 
 // ----------------------------------------------------------------------------
+// utils
+// ----------------------------------------------------------------------------
+
+// Inverted dropout: out[i] = uniform(seed,i) < p ? 0 : in[i]/(1-p), over `n`.
+void dropout(sycl::queue& q, const void* in, void* out, std::size_t n, float p,
+             std::uint32_t seed, DType dt, Variant variant = Variant::sycl,
+             bool blocking = true);
+
+// Per-row cross-entropy loss from logits: loss[r] = logsumexp(logits[r,:]) -
+// logits[r, target[r]]. `logits` [rows, vocab] dt, `target` [rows] int32,
+// `loss` [rows] fp32. fp32 accumulation.
+void cross_entropy(sycl::queue& q, const void* logits, const int* target,
+                   float* loss, std::size_t rows, std::size_t vocab, DType dt,
+                   Variant variant = Variant::sycl, bool blocking = true);
+
+// Fast Walsh-Hadamard transform (unnormalized) over each row: out[r,:] =
+// H_n * in[r,:]. `in`/`out` [rows, n] dt, n a power of two (<= 2048).
+void hadamard(sycl::queue& q, const void* in, void* out, std::size_t rows,
+              std::size_t n, DType dt, Variant variant = Variant::sycl,
+              bool blocking = true);
+
+// ----------------------------------------------------------------------------
 // matmul
 // ----------------------------------------------------------------------------
 

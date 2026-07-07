@@ -140,6 +140,85 @@ bool check_serving(sycl::queue& q, DType dt) {
   return ok;
 }
 
+bool check_dropout(sycl::queue& q, DType dt) {
+  const std::size_t n = 1u << 16;
+  const float p = 0.3f;
+  float* in = sycl::malloc_shared<float>(n, q);
+  float* out = sycl::malloc_shared<float>(n, q);
+  float* out2 = sycl::malloc_shared<float>(n, q);
+  for (std::size_t i = 0; i < n; ++i) in[i] = 1.0f;
+  ops::dropout(q, in, out, n, p, 1234u, dt, Variant::sycl, true);
+  ops::dropout(q, in, out2, n, p, 1234u, dt, Variant::sycl, true);
+  std::size_t zeros = 0; int bad = 0, nondet = 0;
+  const float keep = 1.0f / (1.0f - p);
+  for (std::size_t i = 0; i < n; ++i) {
+    if (out[i] == 0.0f) ++zeros;
+    else if (std::abs(out[i] - keep) > 1e-2f) ++bad;
+    if (out[i] != out2[i]) ++nondet;
+  }
+  const double frac = static_cast<double>(zeros) / n;
+  const bool ok = std::abs(frac - p) < 0.02 && bad == 0 && nondet == 0;
+  std::cout << "  dropout dt=" << dtype_name(dt) << " zero_frac=" << frac
+            << " bad=" << bad << " nondet=" << nondet << (ok ? "  ok" : "  FAIL") << '\n';
+  sycl::free(in, q); sycl::free(out, q); sycl::free(out2, q);
+  return ok;
+}
+
+template <typename T>
+bool check_cross_entropy(sycl::queue& q, DType dt, std::size_t rows, std::size_t vocab) {
+  T* logits = sycl::malloc_shared<T>(rows * vocab, q);
+  int* target = sycl::malloc_shared<int>(rows, q);
+  float* loss = sycl::malloc_shared<float>(rows, q);
+  for (std::size_t i = 0; i < rows * vocab; ++i) logits[i] = static_cast<T>(sample(i) * 4.0f);
+  for (std::size_t r = 0; r < rows; ++r) target[r] = static_cast<int>((r * 13 + 5) % vocab);
+  ops::cross_entropy(q, logits, target, loss, rows, vocab, dt, Variant::sycl, true);
+  double worst = 0.0;
+  for (std::size_t r = 0; r < rows; ++r) {
+    double m = -1e30;
+    for (std::size_t j = 0; j < vocab; ++j) m = std::max(m, (double)logits[r * vocab + j]);
+    double sum = 0.0;
+    for (std::size_t j = 0; j < vocab; ++j) sum += std::exp((double)logits[r * vocab + j] - m);
+    const double ref = (m + std::log(sum)) - (double)logits[r * vocab + target[r]];
+    worst = std::max(worst, std::abs((double)loss[r] - ref));
+  }
+  sycl::free(logits, q); sycl::free(target, q); sycl::free(loss, q);
+  const bool ok = worst < 3e-2;
+  std::cout << "  cross_entropy dt=" << dtype_name(dt) << " max_abs=" << worst
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+template <typename T>
+bool check_hadamard(sycl::queue& q, DType dt, std::size_t rows, std::size_t n) {
+  T* in = sycl::malloc_shared<T>(rows * n, q);
+  T* out = sycl::malloc_shared<T>(rows * n, q);
+  for (std::size_t i = 0; i < rows * n; ++i) in[i] = static_cast<T>(sample(i));
+  ops::hadamard(q, in, out, rows, n, dt, Variant::sycl, true);
+  std::vector<double> ref(n);
+  double worst = 0.0;
+  for (std::size_t r = 0; r < rows; ++r) {
+    for (std::size_t i = 0; i < n; ++i) ref[i] = (double)in[r * n + i];
+    for (std::size_t s = 1; s < n; s <<= 1)
+      for (std::size_t base = 0; base < n; base += 2 * s)
+        for (std::size_t k = 0; k < s; ++k) {
+          const double a = ref[base + k], b = ref[base + k + s];
+          ref[base + k] = a + b; ref[base + k + s] = a - b;
+        }
+    // FWHT sums n signed terms; fp32 error grows ~sqrt(n) * eps * magnitude.
+    const Tol tol = tol_for(dt);
+    const double gain = std::sqrt(static_cast<double>(n));
+    for (std::size_t i = 0; i < n; ++i) {
+      const double rr = (double)static_cast<T>(ref[i]);
+      worst = std::max(worst, std::abs((double)out[r * n + i] - rr) - (tol.atol + tol.rtol * std::abs(rr)) * gain);
+    }
+  }
+  sycl::free(in, q); sycl::free(out, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  hadamard dt=" << dtype_name(dt) << " (n=" << n << ") worst_excess=" << worst
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // Explicit mantissa bits per storage dtype (for the 1-ULP allowance below).
 int mantissa_bits(DType dt) {
   switch (dt) {
@@ -863,6 +942,13 @@ int main() {
   // serving: embedding + kv-cache scatter/gather (exact copy).
   failures += check_serving<float>(q, DType::f32) ? 0 : 1;
   failures += check_serving<bf16_t>(q, DType::bf16) ? 0 : 1;
+
+  // utils: dropout, cross_entropy, hadamard.
+  failures += check_dropout(q, DType::f32) ? 0 : 1;
+  failures += check_cross_entropy<float>(q, DType::f32, 64, 4000) ? 0 : 1;
+  failures += check_cross_entropy<bf16_t>(q, DType::bf16, 64, 4000) ? 0 : 1;
+  failures += check_hadamard<float>(q, DType::f32, 64, 1024) ? 0 : 1;
+  failures += check_hadamard<bf16_t>(q, DType::bf16, 64, 256) ? 0 : 1;
 
   const std::size_t rows = 64, dim = 1024;
   for (const Variant v : variants) {

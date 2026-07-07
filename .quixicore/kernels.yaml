@@ -58,8 +58,9 @@ families:
     status: planned
     paths: []
   utils:
-    status: planned
-    paths: []
+    status: partial
+    paths:
+      - kernels/utils
 operations:
   gelu:
     family: activations
@@ -194,6 +195,30 @@ operations:
     note: Correct on B60 (e4m3/e5m2) but not hardware-accelerated this generation.
     variants:
       - {name: xpu_onednn, status: experimental, path: kernels/quantization/fp8_gemm/variants/xpu_onednn}
+  dropout:
+    family: utils
+    status: implemented
+    path: kernels/utils/dropout
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/utils/dropout/variants/xpu_sycl}
+  cross_entropy:
+    family: utils
+    status: implemented
+    path: kernels/utils/cross_entropy
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/utils/cross_entropy/variants/xpu_sycl}
+  hadamard:
+    family: utils
+    status: implemented
+    path: kernels/utils/hadamard
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/utils/hadamard/variants/xpu_sycl}
   embedding_lookup:
     family: serving
     status: implemented

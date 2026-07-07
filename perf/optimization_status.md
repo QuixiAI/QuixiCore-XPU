@@ -460,6 +460,16 @@ Correctness: exact match (embedding gather; scatter->gather round-trip),
 f32 + bf16, 0 mismatches. Baseline: embedding bf16 8192x4096 = 258 GB/s
 (scattered table gather, below streaming roofline as expected). Native-only.
 
+### utils — dropout + cross_entropy + hadamard (native)
+New `kernels/common/rng.hpp` (stateless PCG counter-based uniform). dropout
+(inverted, elementwise + RNG), cross_entropy (per-row logsumexp - logit[target],
+softmax-shaped reduction), hadamard (FWHT, SLM butterfly, log2(n) passes).
+Correctness: dropout zero-frac 0.302≈p + deterministic + kept=1/(1-p);
+cross_entropy vs fp64 (max_abs 1.2e-6); hadamard vs fp64 FWHT with sqrt(n)-scaled
+tolerance (accumulation error grows ~sqrt(n)). Baselines bf16: dropout 150,
+cross_entropy 93, hadamard(n=1024) 69 GB/s (RNG/exp/butterfly compute-bound).
+Native-only.
+
 ## First Kernel Plan
 
 Status: in progress — 7 families now have implementations: activations (gelu,
