@@ -270,9 +270,9 @@ int main(int argc, char** argv) {
 
   if (kernel == "gguf_gemv") {
     const std::size_t Nn = rows, Kk = dim;
-    const int gt = (approx_s == "q4_0") ? 1 : 0;  // reuse --approx to pick type
-    const int bb = gt == 0 ? 34 : 18;
-    const std::size_t row_bytes = (Kk / 32) * bb;
+    const int gt = (approx_s == "q4_0") ? 1 : (approx_s == "q6_K" ? 2 : 0);  // --approx picks type
+    const std::size_t row_bytes = (gt == 2) ? (Kk / 256) * 210
+                                            : (Kk / 32) * (gt == 0 ? 34 : 18);
     void* w = sycl::malloc_device(Nn * row_bytes, q);
     void* xx = sycl::malloc_device(Kk * elem, q);
     void* yy = sycl::malloc_device(Nn * elem, q);
@@ -286,7 +286,7 @@ int main(int argc, char** argv) {
     const double med = s[s.size() / 2];
     const double wbytes = static_cast<double>(Nn) * static_cast<double>(row_bytes);
     std::cout << "{\"schema_version\":2,\"kernel\":\"gguf_gemv\",\"variant\":\"sycl\",\"gguf\":\""
-              << (gt ? "q4_0" : "q8_0") << "\",\"dtype\":\"" << dtype_name(dt)
+              << (gt == 2 ? "q6_K" : gt == 1 ? "q4_0" : "q8_0") << "\",\"dtype\":\"" << dtype_name(dt)
               << "\",\"N\":" << Nn << ",\"K\":" << Kk << ",\"iters\":" << iters
               << ",\"median_ms\":" << med << ",\"weight_gbps\":" << (wbytes / (med * 1e-3) / 1e9)
               << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>()

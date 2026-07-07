@@ -65,9 +65,60 @@ sycl::event gguf_typed(sycl::queue& q, const std::uint8_t* w, const T* x, T* y,
   });
 }
 
+// GGUF q6_K: 256-element super-block (210 bytes): ql[128], qh[64], int8
+// scales[16], fp16 d. 6-bit quant = 4 low bits (ql) + 2 high bits (qh),
+// recentred by -32. Follows ggml dequantize_row_q6_K exactly. One 32-wide
+// subgroup per row; each lane decodes whole super-blocks.
+template <typename T>
+sycl::event gguf_q6k_typed(sycl::queue& q, const std::uint8_t* w, const T* x,
+                           T* y, std::size_t N, std::size_t K) {
+  const std::size_t sblocks = K / 256;
+  const std::size_t row_bytes = sblocks * 210;
+  const std::size_t nwg = (N + kRowsPerWG - 1) / kRowsPerWG;
+  const sycl::nd_range<1> ndr(sycl::range<1>(nwg * kWG), sycl::range<1>(kWG));
+  return q.parallel_for(ndr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSG)]] {
+    const sycl::sub_group sg = it.get_sub_group();
+    const int sgid = static_cast<int>(sg.get_group_linear_id());
+    const int lane = static_cast<int>(sg.get_local_linear_id());
+    const std::size_t n = it.get_group(0) * kRowsPerWG + sgid;
+    if (n >= N) return;
+    const std::uint8_t* wrow = w + n * row_bytes;
+
+    float acc = 0.0f;
+    for (std::size_t b = lane; b < sblocks; b += kSG) {
+      const std::uint8_t* blk = wrow + b * 210;
+      const std::uint8_t* ql = blk;
+      const std::uint8_t* qh = blk + 128;
+      const std::int8_t* sc = reinterpret_cast<const std::int8_t*>(blk + 192);
+      const float d = load_half(blk + 208);
+      const std::size_t kbase = b * 256;
+      for (int half = 0; half < 2; ++half) {
+        const std::uint8_t* qlh = ql + half * 64;
+        const std::uint8_t* qhh = qh + half * 32;
+        const std::int8_t* sch = sc + half * 8;
+        const std::size_t yoff = kbase + static_cast<std::size_t>(half) * 128;
+        for (int l = 0; l < 32; ++l) {
+          const int is = l / 16;
+          const int q1 = static_cast<int>((qlh[l] & 0xF) | (((qhh[l] >> 0) & 3) << 4)) - 32;
+          const int q2 = static_cast<int>((qlh[l + 32] & 0xF) | (((qhh[l] >> 2) & 3) << 4)) - 32;
+          const int q3 = static_cast<int>((qlh[l] >> 4) | (((qhh[l] >> 4) & 3) << 4)) - 32;
+          const int q4 = static_cast<int>((qlh[l + 32] >> 4) | (((qhh[l] >> 6) & 3) << 4)) - 32;
+          acc += d * static_cast<float>(sch[is + 0]) * q1 * static_cast<float>(x[yoff + l + 0]);
+          acc += d * static_cast<float>(sch[is + 2]) * q2 * static_cast<float>(x[yoff + l + 32]);
+          acc += d * static_cast<float>(sch[is + 4]) * q3 * static_cast<float>(x[yoff + l + 64]);
+          acc += d * static_cast<float>(sch[is + 6]) * q4 * static_cast<float>(x[yoff + l + 96]);
+        }
+      }
+    }
+    const float sum = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+    if (lane == 0) y[n] = static_cast<T>(sum);
+  });
+}
+
 template <typename T>
 sycl::event dispatch_type(sycl::queue& q, const std::uint8_t* w, const T* x, T* y,
                           std::size_t N, std::size_t K, int type) {
+  if (type == 2) return gguf_q6k_typed<T>(q, w, x, y, N, K);
   return type == 0 ? gguf_typed<T, 0>(q, w, x, y, N, K)
                    : gguf_typed<T, 1>(q, w, x, y, N, K);
 }

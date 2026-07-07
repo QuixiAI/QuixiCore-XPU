@@ -460,6 +460,17 @@ Correctness: exact match (embedding gather; scatter->gather round-trip),
 f32 + bf16, 0 mismatches. Baseline: embedding bf16 8192x4096 = 258 GB/s
 (scattered table gather, below streaming roofline as expected). Native-only.
 
+## 2026-07-07: Track B quant depth — GGUF q6_K k-quant
+
+### quantization/gguf_gemv — q6_K (native k-quant decode)
+First GGUF k-quant (256-element super-block, 210 bytes: ql[128]+qh[64]+int8
+scales[16]+fp16 d; 6-bit quant = 4 low bits from ql + 2 high bits from qh,
+recentred -32; per-16 sub-block int8 scales). Follows ggml dequantize_row_q6_K
+exactly, one 32-wide subgroup per row. Correctness vs an INDEPENDENT host replica
+of the ggml reference over random-byte blocks (no shared packer): worst_excess 0,
+f32+bf16. Baseline 8192x8192 bf16 = 82 GB/s weight bandwidth. Proves the k-quant
+super-block layout decodes natively on Intel. q4_K/q5_K/q2_K/q3_K + i-quants next.
+
 ## 2026-07-07: Track B depth begins — attention + sampling suite
 
 ### sampling — sample_categorical + top_k_sample (native)

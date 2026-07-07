@@ -639,6 +639,64 @@ bool check_qgemm_int8(sycl::queue& q, DType out_dt, Variant variant,
 }
 
 template <typename T>
+bool check_gguf_q6k(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K) {
+  const std::size_t sb = K / 256, row_bytes = sb * 210;
+  std::uint8_t* w = sycl::malloc_shared<std::uint8_t>(N * row_bytes, q);
+  T* x = sycl::malloc_shared<T>(K, q);
+  T* y = sycl::malloc_shared<T>(N, q);
+  // Random bytes for ql/qh; small int8 scales; a fixed small fp16 d per block.
+  const half_t hd = static_cast<half_t>(0.01f);
+  const std::uint16_t db = sycl::bit_cast<std::uint16_t>(hd);
+  for (std::size_t n = 0; n < N; ++n)
+    for (std::size_t b = 0; b < sb; ++b) {
+      std::uint8_t* blk = w + n * row_bytes + b * 210;
+      for (int i = 0; i < 192; ++i) blk[i] = static_cast<std::uint8_t>((std::size_t)(sample((n * sb + b) * 192 + i) * 128 + 128) & 0xFF);
+      for (int i = 0; i < 16; ++i) blk[192 + i] = static_cast<std::uint8_t>(static_cast<std::int8_t>(std::floor(sample((n * sb + b) * 16 + i) * 8)));
+      blk[208] = db & 0xFF; blk[209] = static_cast<std::uint8_t>(db >> 8);
+    }
+  for (std::size_t k = 0; k < K; ++k) x[k] = static_cast<T>(sample(k + 61));
+
+  ops::gguf_gemv(q, w, x, y, N, K, ops::GgufType::q6_K, act_dt, Variant::sycl, true);
+
+  auto lh = [](const std::uint8_t* p) { std::uint16_t b = p[0] | (p[1] << 8); return (double)sycl::bit_cast<half_t>(b); };
+  const Tol tol = tol_for(act_dt);
+  const double rtol = tol.rtol * std::sqrt((double)K) + 3e-3;
+  double worst = 0.0;
+  for (std::size_t n = 0; n < N; ++n) {
+    double acc = 0.0;
+    const std::uint8_t* wrow = w + n * row_bytes;
+    for (std::size_t b = 0; b < sb; ++b) {
+      const std::uint8_t* blk = wrow + b * 210;
+      const std::uint8_t* ql = blk; const std::uint8_t* qh = blk + 128;
+      const std::int8_t* sc = reinterpret_cast<const std::int8_t*>(blk + 192);
+      const double d = lh(blk + 208);
+      for (int half = 0; half < 2; ++half) {
+        const std::uint8_t* qlh = ql + half * 64; const std::uint8_t* qhh = qh + half * 32;
+        const std::int8_t* sch = sc + half * 8; const std::size_t yoff = b * 256 + (std::size_t)half * 128;
+        for (int l = 0; l < 32; ++l) {
+          const int is = l / 16;
+          const int q1 = ((qlh[l] & 0xF) | (((qhh[l] >> 0) & 3) << 4)) - 32;
+          const int q2 = ((qlh[l + 32] & 0xF) | (((qhh[l] >> 2) & 3) << 4)) - 32;
+          const int q3 = ((qlh[l] >> 4) | (((qhh[l] >> 4) & 3) << 4)) - 32;
+          const int q4 = ((qlh[l + 32] >> 4) | (((qhh[l] >> 6) & 3) << 4)) - 32;
+          acc += d * sch[is + 0] * q1 * (double)x[yoff + l + 0];
+          acc += d * sch[is + 2] * q2 * (double)x[yoff + l + 32];
+          acc += d * sch[is + 4] * q3 * (double)x[yoff + l + 64];
+          acc += d * sch[is + 6] * q4 * (double)x[yoff + l + 96];
+        }
+      }
+    }
+    const double ref = (double)static_cast<T>(acc);
+    worst = std::max(worst, std::abs((double)y[n] - ref) - (tol.atol + rtol * std::abs(ref)));
+  }
+  sycl::free(w, q); sycl::free(x, q); sycl::free(y, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  gguf_gemv q6_K act=" << dtype_name(act_dt) << " (N=" << N << " K=" << K
+            << ") worst_excess=" << worst << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+template <typename T>
 bool check_gguf_gemv(sycl::queue& q, DType act_dt, ops::GgufType type,
                      const char* tname, std::size_t N, std::size_t K) {
   const int block_bytes = (type == ops::GgufType::q8_0) ? 34 : 18;
@@ -1127,6 +1185,8 @@ int main() {
   failures += check_gguf_gemv<bf16_t>(q, DType::bf16, ops::GgufType::q8_0, "q8_0", 128, 4096) ? 0 : 1;
   failures += check_gguf_gemv<float>(q, DType::f32, ops::GgufType::q4_0, "q4_0", 128, 4096) ? 0 : 1;
   failures += check_gguf_gemv<bf16_t>(q, DType::bf16, ops::GgufType::q4_0, "q4_0", 128, 4096) ? 0 : 1;
+  failures += check_gguf_q6k<float>(q, DType::f32, 128, 4096) ? 0 : 1;
+  failures += check_gguf_q6k<bf16_t>(q, DType::bf16, 128, 4096) ? 0 : 1;
 
   // int8 w8a8 GEMM, both variants.
   for (const Variant v : variants) {
