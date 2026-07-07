@@ -1,14 +1,41 @@
-schema_version: 0.1
+schema_version: 0.2
 backend: xpu
+# Quant formats are DATA ENCODINGS + DEQUANT ALGORITHMS, not vendor hardware
+# features. mxfp4/mxfp6/mxfp8 (OCP microscaling), nvfp4 (E2M1 + fp8 block scale),
+# fp8 (e4m3/e5m2), AWQ (activation-aware int4 weights + scales), GGUF k-quants,
+# and bitnet all decode to a compute dtype and/or feed Intel XMX/DPAS int8/fp8
+# paths. The "these are NVIDIA-only" framing is marketing, not a hardware limit.
+# Every format below is IN SCOPE for XPU and must be marked `planned` (or better)
+# as it lands -- never `unsupported` on the assumption that it needs NVIDIA
+# silicon. If a format is ever marked `unsupported`, that must be backed by an
+# actual on-B60 measurement/attempt, not inherited wisdom.
 formats:
   gguf:
     status: planned
-  mx:
+    note: GGUF k-quants (q4_0/q8_0/q4_K/q5_K/q6_K/q2_K/q3_K/iq4_xs/iq2_xxs/iq1_s...).
+  mxfp8:
     status: planned
+    note: OCP microscaling FP8 (e4m3/e5m2 elements, e8m0 block scale).
+  mxfp6:
+    status: planned
+  mxfp4:
+    status: planned
+    note: OCP microscaling FP4 (e2m1 elements, e8m0 block scale).
+  nvfp4:
+    status: planned
+    note: FP4 e2m1 with an fp8 (e4m3) block scale. Portable; decode + DPAS/XMX.
   fp8:
     status: planned
+    note: e4m3 / e5m2, per-tensor / per-token / per-block scales.
   fp4:
     status: planned
+    note: generic fp4_e2m1 packing.
+  awq:
+    status: planned
+    note: Activation-aware weight quant (int4 weights + scales); a method, fully portable.
+  int8:
+    status: planned
+    note: w8a8 / azp zero-point; native Intel XMX/DPAS int8.
   bitnet:
     status: planned
 status_values:
@@ -17,4 +44,7 @@ status_values:
   - experimental
   - planned
   - unsupported
-notes: Initial XPU scaffold. Quant format support is planned but not yet claimed.
+notes: >-
+  Quant format support is planned but not yet claimed. Support is claimed only
+  after a native XPU decode/compute path, correctness vs the shared byte layout,
+  and benchmark coverage land. Nothing here is out of scope on hardware grounds.

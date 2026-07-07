@@ -32,3 +32,12 @@ Concretely:
   on the B60, ship both as co-equal variants, and route `Variant::best` from the
   data per (op, dtype). Record the reversal at the call site and in
   `perf/optimization_status.md` so the next pass starts from evidence.
+
+Corollary for quantization: **all quant formats work on XPU** — mxfp4, nvfp4,
+mxfp8, fp8, AWQ, GGUF k-quants, int8/w8a8, bitnet. They are data encodings +
+dequant algorithms, not NVIDIA hardware features (NVIDIA marketing pushed the
+"these are ours" myth). They decode to a compute dtype and/or feed Intel
+XMX/DPAS int8/fp8 paths. Do not waste cycles reasoning about whether a format is
+"supported" on Intel — assume it is in scope and implement the decode. A format
+may be marked `unsupported` in `.quixicore/quant-formats.yaml` ONLY after an
+actual on-B60 attempt shows a concrete blocker, never on inherited assumption.
