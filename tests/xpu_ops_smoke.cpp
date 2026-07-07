@@ -749,6 +749,49 @@ using quixicore::xpu::kernels::iq2xs_grid;
 using quixicore::xpu::kernels::iq3xxs_grid;
 using quixicore::xpu::kernels::ksigns_iq2xs;
 using quixicore::xpu::kernels::kmask_iq2xs;
+using quixicore::xpu::kernels::iq1s_grid;
+
+template <typename T>
+bool check_gguf_iq1s(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K) {
+  const std::size_t sb = K / 256, row_bytes = sb * 50;
+  std::uint8_t* w = sycl::malloc_shared<std::uint8_t>(N * row_bytes, q);
+  T* x = sycl::malloc_shared<T>(K, q); T* y = sycl::malloc_shared<T>(N, q);
+  const std::uint16_t db = sycl::bit_cast<std::uint16_t>(static_cast<half_t>(0.05f));
+  for (std::size_t n = 0; n < N; ++n)
+    for (std::size_t b = 0; b < sb; ++b) {
+      std::uint8_t* blk = w + n * row_bytes + b * 50;
+      blk[0] = db & 0xFF; blk[1] = db >> 8;
+      for (int i = 2; i < 50; ++i) blk[i] = static_cast<std::uint8_t>((std::size_t)(sample((n * sb + b) * 50 + i) * 128 + 128) & 0xFF);
+    }
+  for (std::size_t k = 0; k < K; ++k) x[k] = static_cast<T>(sample(k + 151));
+  ops::gguf_gemv(q, w, x, y, N, K, ops::GgufType::iq1_s, act_dt, Variant::sycl, true);
+
+  auto lh = [](const std::uint8_t* p) { std::uint16_t b = p[0] | (p[1] << 8); return (double)sycl::bit_cast<half_t>(b); };
+  const Tol tol = tol_for(act_dt); const double rtol = tol.rtol * std::sqrt((double)K) + 5e-3; const double kDelta = 0.125;
+  double worst = 0.0;
+  for (std::size_t n = 0; n < N; ++n) {
+    double acc = 0.0; const std::uint8_t* wrow = w + n * row_bytes;
+    for (std::size_t b = 0; b < sb; ++b) {
+      const std::uint8_t* blk = wrow + b * 50; const double d = lh(blk);
+      const std::uint8_t* qs = blk + 2; const std::uint8_t* qhb = blk + 34; const std::size_t kbase = b * 256;
+      for (int ib = 0; ib < 8; ++ib) {
+        const std::uint16_t qh = qhb[2 * ib] | (qhb[2 * ib + 1] << 8);
+        const double dl = d * (2 * ((qh >> 12) & 7) + 1); const double delta = (qh & 0x8000) ? -kDelta : kDelta;
+        for (int l = 0; l < 4; ++l) {
+          const std::uint32_t gi = qs[4 * ib + l] | (((qh >> (3 * l)) & 7) << 8); const std::uint64_t g = iq1s_grid[gi];
+          const std::size_t yb = kbase + ib * 32 + l * 8;
+          for (int j = 0; j < 8; ++j) { const int gv = (std::int8_t)((g >> (8 * j)) & 0xFF); acc += dl * (gv + delta) * (double)x[yb + j]; }
+        }
+      }
+    }
+    const double ref = (double)static_cast<T>(acc);
+    worst = std::max(worst, std::abs((double)y[n] - ref) - (tol.atol + rtol * std::abs(ref)));
+  }
+  sycl::free(w, q); sycl::free(x, q); sycl::free(y, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  gguf_gemv iq1_s act=" << dtype_name(act_dt) << " worst_excess=" << worst << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
 
 template <typename T>
 bool check_gguf_iquant(sycl::queue& q, DType act_dt, ops::GgufType gt, const char* name,
@@ -1654,6 +1697,8 @@ int main() {
   failures += check_gguf_iquant<float>(q, DType::f32, ops::GgufType::iq2_xxs, "iq2_xxs", 128, 4096) ? 0 : 1;
   failures += check_gguf_iquant<bf16_t>(q, DType::bf16, ops::GgufType::iq2_xs, "iq2_xs", 128, 4096) ? 0 : 1;
   failures += check_gguf_iquant<float>(q, DType::f32, ops::GgufType::iq3_xxs, "iq3_xxs", 128, 4096) ? 0 : 1;
+  failures += check_gguf_iq1s<float>(q, DType::f32, 128, 4096) ? 0 : 1;
+  failures += check_gguf_iq1s<bf16_t>(q, DType::bf16, 128, 4096) ? 0 : 1;
 
   // int8 w8a8 GEMM, both variants.
   for (const Variant v : variants) {

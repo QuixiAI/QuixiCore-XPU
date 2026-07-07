@@ -11,12 +11,13 @@ backend: xpu
 # actual on-B60 measurement/attempt, not inherited wisdom.
 formats:
   gguf:
-    status: experimental
+    status: implemented
     note: >-
-      GGUF (llama.cpp) block quants. q8_0/q4_0 + all k-quants (q6_K/q4_K/q5_K/q2_K/q3_K) landed as quantization/gguf_gemv
-      with a native decoder from the authentic on-disk block layout — correct on
-      B60. k-quants (q4_K/q5_K/q6_K/q2_K/q3_K/iq*) are next. GGUF decodes natively
-      on Intel; the interleaved layout is decode-correct but not yet GPU-tuned.
+      GGUF (llama.cpp) block quants -- ALL 16 weight formats decode natively on
+      B60 via hand-written kernels: q8_0/q4_0/q4_1/q5_0/q5_1, all k-quants
+      (q6_K/q4_K/q5_K/q2_K/q3_K), and all i-quants (iq4_nl/iq4_xs/iq2_xxs/iq2_xs/
+      iq3_xxs/iq1_s, grid/codebook tables ported from ggml). Each validated vs an
+      independent ggml host replica. (q8_1/q8_K are activation intermediates, N/A.)
   mxfp8:
     status: planned
     note: OCP microscaling FP8 (e4m3/e5m2 elements, e8m0 block scale).
