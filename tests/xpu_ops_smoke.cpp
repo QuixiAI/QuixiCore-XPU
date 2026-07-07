@@ -219,6 +219,39 @@ bool check_hadamard(sycl::queue& q, DType dt, std::size_t rows, std::size_t n) {
   return ok;
 }
 
+template <typename T>
+bool check_moe_route(sycl::queue& q, DType dt, std::size_t nt, std::size_t ne, int k) {
+  T* logits = sycl::malloc_shared<T>(nt * ne, q);
+  int* ids = sycl::malloc_shared<int>(nt * k, q);
+  float* w = sycl::malloc_shared<float>(nt * k, q);
+  for (std::size_t i = 0; i < nt * ne; ++i) logits[i] = static_cast<T>(sample(i) * 3.0f);
+  ops::moe_route_topk(q, logits, ids, w, nt, ne, k, dt, Variant::sycl, true);
+
+  int bad_id = 0; double worst_w = 0.0;
+  std::vector<char> taken(ne);
+  for (std::size_t t = 0; t < nt; ++t) {
+    std::fill(taken.begin(), taken.end(), 0);
+    std::vector<int> rid(k); std::vector<double> rval(k);
+    for (int i = 0; i < k; ++i) {
+      double best = -1e30; int be = 0;
+      for (std::size_t e = 0; e < ne; ++e)
+        if (!taken[e] && (double)logits[t * ne + e] > best) { best = (double)logits[t * ne + e]; be = (int)e; }
+      taken[be] = 1; rid[i] = be; rval[i] = best;
+    }
+    double m = rval[0]; for (int i = 1; i < k; ++i) m = std::max(m, rval[i]);
+    double sum = 0; for (int i = 0; i < k; ++i) { rval[i] = std::exp(rval[i] - m); sum += rval[i]; }
+    for (int i = 0; i < k; ++i) {
+      if (ids[t * k + i] != rid[i]) ++bad_id;
+      worst_w = std::max(worst_w, std::abs((double)w[t * k + i] - rval[i] / sum));
+    }
+  }
+  sycl::free(logits, q); sycl::free(ids, q); sycl::free(w, q);
+  const bool ok = (bad_id == 0) && (worst_w < 1e-5);
+  std::cout << "  moe_route_topk dt=" << dtype_name(dt) << " k=" << k << " bad_id=" << bad_id
+            << " worst_w=" << worst_w << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // Explicit mantissa bits per storage dtype (for the 1-ULP allowance below).
 int mantissa_bits(DType dt) {
   switch (dt) {
@@ -942,6 +975,10 @@ int main() {
   // serving: embedding + kv-cache scatter/gather (exact copy).
   failures += check_serving<float>(q, DType::f32) ? 0 : 1;
   failures += check_serving<bf16_t>(q, DType::bf16) ? 0 : 1;
+
+  // moe: top-k routing.
+  failures += check_moe_route<float>(q, DType::f32, 512, 64, 2) ? 0 : 1;
+  failures += check_moe_route<bf16_t>(q, DType::bf16, 512, 128, 4) ? 0 : 1;
 
   // utils: dropout, cross_entropy, hadamard.
   failures += check_dropout(q, DType::f32) ? 0 : 1;

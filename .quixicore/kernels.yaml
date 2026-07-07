@@ -40,8 +40,9 @@ families:
     paths:
       - kernels/quantization
   moe:
-    status: planned
-    paths: []
+    status: partial
+    paths:
+      - kernels/moe
   sampling:
     status: partial
     paths:
@@ -195,6 +196,14 @@ operations:
     note: Correct on B60 (e4m3/e5m2) but not hardware-accelerated this generation.
     variants:
       - {name: xpu_onednn, status: experimental, path: kernels/quantization/fp8_gemm/variants/xpu_onednn}
+  moe_route_topk:
+    family: moe
+    status: implemented
+    path: kernels/moe/moe_route
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/moe/moe_route/variants/xpu_sycl}
   dropout:
     family: utils
     status: implemented

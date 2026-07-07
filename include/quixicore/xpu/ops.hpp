@@ -159,6 +159,18 @@ void hadamard(sycl::queue& q, const void* in, void* out, std::size_t rows,
               bool blocking = true);
 
 // ----------------------------------------------------------------------------
+// moe
+// ----------------------------------------------------------------------------
+
+// MoE top-k routing. `router_logits` [n_tokens, n_experts] dtype dt. Selects the
+// top-k experts per token and softmax-normalizes over the selected k. Outputs
+// `expert_ids` [n_tokens, k] int32 and `expert_weights` [n_tokens, k] fp32.
+void moe_route_topk(sycl::queue& q, const void* router_logits, int* expert_ids,
+                    float* expert_weights, std::size_t n_tokens,
+                    std::size_t n_experts, int k, DType dt,
+                    Variant variant = Variant::sycl, bool blocking = true);
+
+// ----------------------------------------------------------------------------
 // matmul
 // ----------------------------------------------------------------------------
 

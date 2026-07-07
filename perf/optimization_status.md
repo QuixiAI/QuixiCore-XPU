@@ -460,6 +460,13 @@ Correctness: exact match (embedding gather; scatter->gather round-trip),
 f32 + bf16, 0 mismatches. Baseline: embedding bf16 8192x4096 = 258 GB/s
 (scattered table gather, below streaming roofline as expected). Native-only.
 
+### moe — moe_route_topk (native)
+Top-k expert routing: one work-item per token, iterative argmax selection over
+expert logits + softmax over the k selected. Correctness vs fp64 (exact top-k
+ids, weights max_abs 5e-8), f32 + bf16. Baseline: 32768 tok x 128 experts, k=4 =
+70 Mtok/s. Native-only (no oneDNN routing primitive). moe_grouped_gemm + the
+gather/scatter/finalize ops land in the moe depth wave.
+
 ### utils — dropout + cross_entropy + hadamard (native)
 New `kernels/common/rng.hpp` (stateless PCG counter-based uniform). dropout
 (inverted, elementwise + RNG), cross_entropy (per-row logsumexp - logit[target],

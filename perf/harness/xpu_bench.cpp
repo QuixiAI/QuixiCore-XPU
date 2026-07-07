@@ -48,6 +48,7 @@
 #include "quantization/qgemm/qgemm_kernel.hpp"
 #include "quantization/qgemv/qgemv_kernel.hpp"
 #include "sampling/argmax/argmax_kernel.hpp"
+#include "moe/moe_route/moe_route_kernel.hpp"
 #include "serving/serving_kernel.hpp"
 #include "utils/utils_kernel.hpp"
 
@@ -355,6 +356,21 @@ int main(int argc, char** argv) {
               << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>()
               << "\"}" << std::endl;
   };
+  if (kernel == "moe_route") {
+    const std::size_t nt = rows, ne = dim; const int kk = 4;
+    void* lg = sycl::malloc_device(nt * ne * elem, q);
+    int* ids = sycl::malloc_device<int>(nt * kk, q);
+    float* w = sycl::malloc_device<float>(nt * kk, q);
+    q.memset(lg, 0, nt * ne * elem).wait();
+    const double med = time_median([&] { return kernels::moe_route_topk_sycl(q, lg, ids, w, nt, ne, kk, dt); });
+    std::cout << "{\"schema_version\":2,\"kernel\":\"moe_route\",\"variant\":\"sycl\",\"dtype\":\""
+              << dtype_name(dt) << "\",\"n_tokens\":" << nt << ",\"n_experts\":" << ne
+              << ",\"k\":" << kk << ",\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"Mtok_s\":" << (nt / (med * 1e-3) / 1e6) << ",\"device\":\""
+              << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(lg, q); sycl::free(ids, q); sycl::free(w, q);
+    return 0;
+  }
   if (kernel == "dropout") {
     const std::size_t ne = rows * dim;
     void* in = sycl::malloc_device(ne * elem, q);
