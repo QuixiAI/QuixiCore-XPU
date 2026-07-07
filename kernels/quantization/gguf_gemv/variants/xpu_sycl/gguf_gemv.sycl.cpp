@@ -9,8 +9,22 @@
 // optimization. GGUF k-quants are data encodings -> decode natively on Intel.
 
 #include "quantization/gguf_gemv/gguf_kernel.hpp"
+#include "quantization/gguf_gemv/gguf_iq_tables.hpp"
 
 namespace quixicore::xpu::kernels {
+
+// Lazy per-process device copies of the (small, read-only) i-quant tables. First
+// use uploads; later calls reuse. Leaks at exit (fine for a table cache).
+template <typename E>
+const E* dev_table(sycl::queue& q, const E* host, std::size_t n, const E** slot) {
+  if (!*slot) {
+    E* d = sycl::malloc_device<E>(n, q);
+    q.memcpy(d, host, n * sizeof(E)).wait();
+    *slot = d;
+  }
+  return *slot;
+}
+
 namespace {
 
 constexpr int kSG = 32;
@@ -454,9 +468,155 @@ sycl::event gguf_iq4xs_typed(sycl::queue& q, const std::uint8_t* w, const T* x,
   });
 }
 
+// Table cache slots for this TU.
+const std::uint64_t* g_iq2xxs = nullptr;
+const std::uint64_t* g_iq2xs = nullptr;
+const std::uint32_t* g_iq3xxs = nullptr;
+const std::uint8_t* g_ksigns = nullptr;
+const std::uint8_t* g_kmask = nullptr;
+
+// IQ2_XXS (66B: fp16 d + qs[uint16*32]). Per 32-group: 4 grid lookups from
+// iq2xxs_grid[aux8[l]] (uint64 = 8 int8), signs from ksigns, db scale from the
+// top nibble of the second word. Follows ggml dequantize_row_iq2_xxs.
+template <typename T>
+sycl::event iq2xxs_typed(sycl::queue& q, const std::uint8_t* w, const T* x, T* y,
+                         std::size_t N, std::size_t K, const std::uint64_t* grid,
+                         const std::uint8_t* ksigns, const std::uint8_t* kmask) {
+  const std::size_t sb = K / 256, row_bytes = sb * 66;
+  const std::size_t nwg = (N + kRowsPerWG - 1) / kRowsPerWG;
+  return q.parallel_for(sycl::nd_range<1>(nwg * kWG, kWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSG)]] {
+    const sycl::sub_group sg = it.get_sub_group();
+    const std::size_t n = it.get_group(0) * kRowsPerWG + sg.get_group_linear_id();
+    const int lane = static_cast<int>(sg.get_local_linear_id());
+    if (n >= N) return;
+    const std::uint8_t* wrow = w + n * row_bytes;
+    float acc = 0.0f;
+    for (std::size_t b = lane; b < sb; b += kSG) {
+      const std::uint8_t* blk = wrow + b * 66;
+      const float d = load_half(blk);
+      const std::uint8_t* qs = blk + 2;
+      const std::size_t kbase = b * 256;
+      for (int ib = 0; ib < 8; ++ib) {
+        const std::uint8_t* aux = qs + 8 * ib;
+        const std::uint32_t a1 = rd_u32(aux + 4);
+        const float db = d * (0.5f + (a1 >> 28)) * 0.25f;
+        for (int l = 0; l < 4; ++l) {
+          const std::uint64_t g = grid[aux[l]];
+          const std::uint8_t signs = ksigns[(a1 >> (7 * l)) & 127];
+          const std::size_t yb = kbase + ib * 32 + l * 8;
+          for (int j = 0; j < 8; ++j) {
+            const int gv = static_cast<int>(static_cast<std::int8_t>((g >> (8 * j)) & 0xFF));
+            const float s = (signs & kmask[j]) ? -1.0f : 1.0f;
+            acc += db * gv * s * static_cast<float>(x[yb + j]);
+          }
+        }
+      }
+    }
+    const float sum = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+    if (lane == 0) y[n] = static_cast<T>(sum);
+  });
+}
+
+// IQ2_XS (74B: fp16 d + qs[uint16*32] + scales[8]). grid index = q2[l] & 511,
+// sign = q2[l] >> 9; sub-scales from the scales byte nibbles.
+template <typename T>
+sycl::event iq2xs_typed(sycl::queue& q, const std::uint8_t* w, const T* x, T* y,
+                        std::size_t N, std::size_t K, const std::uint64_t* grid,
+                        const std::uint8_t* ksigns, const std::uint8_t* kmask) {
+  const std::size_t sb = K / 256, row_bytes = sb * 74;
+  const std::size_t nwg = (N + kRowsPerWG - 1) / kRowsPerWG;
+  return q.parallel_for(sycl::nd_range<1>(nwg * kWG, kWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSG)]] {
+    const sycl::sub_group sg = it.get_sub_group();
+    const std::size_t n = it.get_group(0) * kRowsPerWG + sg.get_group_linear_id();
+    const int lane = static_cast<int>(sg.get_local_linear_id());
+    if (n >= N) return;
+    const std::uint8_t* wrow = w + n * row_bytes;
+    float acc = 0.0f;
+    for (std::size_t b = lane; b < sb; b += kSG) {
+      const std::uint8_t* blk = wrow + b * 74;
+      const float d = load_half(blk);
+      const std::uint8_t* qsb = blk + 2;
+      const std::uint8_t* scales = blk + 66;
+      const std::size_t kbase = b * 256;
+      for (int ib = 0; ib < 8; ++ib) {
+        const int ls1 = scales[ib] & 0xF, ls2 = scales[ib] >> 4;
+        const float db1 = d * (0.5f + ls1) * 0.25f, db2 = d * (0.5f + ls2) * 0.25f;
+        for (int l = 0; l < 4; ++l) {
+          const std::uint8_t* p = qsb + 8 * ib + 2 * l;
+          const std::uint16_t q2 = static_cast<std::uint16_t>(p[0]) | (static_cast<std::uint16_t>(p[1]) << 8);
+          const std::uint64_t g = grid[q2 & 511];
+          const std::uint8_t signs = ksigns[q2 >> 9];
+          const float db = (l < 2) ? db1 : db2;
+          const std::size_t yb = kbase + ib * 32 + l * 8;
+          for (int j = 0; j < 8; ++j) {
+            const int gv = static_cast<int>(static_cast<std::int8_t>((g >> (8 * j)) & 0xFF));
+            const float s = (signs & kmask[j]) ? -1.0f : 1.0f;
+            acc += db * gv * s * static_cast<float>(x[yb + j]);
+          }
+        }
+      }
+    }
+    const float sum = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+    if (lane == 0) y[n] = static_cast<T>(sum);
+  });
+}
+
+// IQ3_XXS (98B: fp16 d + qs[96] = 64 grid-index bytes + 32 scale/sign bytes).
+// iq3xxs_grid is uint32 (4 int8 each); two grid lookups per l. Follows ggml.
+template <typename T>
+sycl::event iq3xxs_typed(sycl::queue& q, const std::uint8_t* w, const T* x, T* y,
+                         std::size_t N, std::size_t K, const std::uint32_t* grid,
+                         const std::uint8_t* ksigns, const std::uint8_t* kmask) {
+  const std::size_t sb = K / 256, row_bytes = sb * 98;
+  const std::size_t nwg = (N + kRowsPerWG - 1) / kRowsPerWG;
+  return q.parallel_for(sycl::nd_range<1>(nwg * kWG, kWG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSG)]] {
+    const sycl::sub_group sg = it.get_sub_group();
+    const std::size_t n = it.get_group(0) * kRowsPerWG + sg.get_group_linear_id();
+    const int lane = static_cast<int>(sg.get_local_linear_id());
+    if (n >= N) return;
+    const std::uint8_t* wrow = w + n * row_bytes;
+    float acc = 0.0f;
+    for (std::size_t b = lane; b < sb; b += kSG) {
+      const std::uint8_t* blk = wrow + b * 98;
+      const float d = load_half(blk);
+      const std::uint8_t* q3 = blk + 2;          // 64 grid-index bytes
+      const std::uint8_t* gas = blk + 2 + 64;    // 32 scale/sign bytes
+      const std::size_t kbase = b * 256;
+      for (int ib = 0; ib < 8; ++ib) {
+        const std::uint32_t a = rd_u32(gas + 4 * ib);
+        const float db = d * (0.5f + (a >> 28)) * 0.5f;
+        const std::uint8_t* q3b = q3 + 8 * ib;
+        for (int l = 0; l < 4; ++l) {
+          const std::uint8_t signs = ksigns[(a >> (7 * l)) & 127];
+          const std::uint32_t g1 = grid[q3b[2 * l + 0]];
+          const std::uint32_t g2 = grid[q3b[2 * l + 1]];
+          const std::size_t yb = kbase + ib * 32 + l * 8;
+          for (int j = 0; j < 4; ++j) {
+            const int v1 = static_cast<int>(static_cast<std::int8_t>((g1 >> (8 * j)) & 0xFF));
+            const int v2 = static_cast<int>(static_cast<std::int8_t>((g2 >> (8 * j)) & 0xFF));
+            const float s1 = (signs & kmask[j + 0]) ? -1.0f : 1.0f;
+            const float s2 = (signs & kmask[j + 4]) ? -1.0f : 1.0f;
+            acc += db * v1 * s1 * static_cast<float>(x[yb + j]);
+            acc += db * v2 * s2 * static_cast<float>(x[yb + 4 + j]);
+          }
+        }
+      }
+    }
+    const float sum = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+    if (lane == 0) y[n] = static_cast<T>(sum);
+  });
+}
+
 template <typename T>
 sycl::event dispatch_type(sycl::queue& q, const std::uint8_t* w, const T* x, T* y,
                           std::size_t N, std::size_t K, int type) {
+  if (type == 12 || type == 13 || type == 14) {
+    const auto* ks = dev_table(q, ksigns_iq2xs, 128, &g_ksigns);
+    const auto* km = dev_table(q, kmask_iq2xs, 8, &g_kmask);
+    if (type == 12) return iq2xxs_typed<T>(q, w, x, y, N, K, dev_table(q, iq2xxs_grid, 256, &g_iq2xxs), ks, km);
+    if (type == 13) return iq2xs_typed<T>(q, w, x, y, N, K, dev_table(q, iq2xs_grid, 512, &g_iq2xs), ks, km);
+    return iq3xxs_typed<T>(q, w, x, y, N, K, dev_table(q, iq3xxs_grid, 256, &g_iq3xxs), ks, km);
+  }
   if (type == 7) return gguf_iq4nl_typed<T>(q, w, x, y, N, K);
   if (type == 8) return gguf_legacy_typed<T, 8>(q, w, x, y, N, K);
   if (type == 9) return gguf_legacy_typed<T, 9>(q, w, x, y, N, K);

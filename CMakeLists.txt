@@ -123,6 +123,7 @@ if(QUIXICORE_XPU_ENABLE_SYCL)
 
     add_executable(quixicore_xpu_ops_smoke tests/xpu_ops_smoke.cpp)
     target_link_libraries(quixicore_xpu_ops_smoke PRIVATE QuixiCore::XPUOps)
+    target_include_directories(quixicore_xpu_ops_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/kernels)
     add_test(NAME quixicore_xpu_ops_smoke COMMAND quixicore_xpu_ops_smoke)
   endif()
 

@@ -471,6 +471,15 @@ of the ggml reference over random-byte blocks (no shared packer): worst_excess 0
 f32+bf16. Baseline 8192x8192 bf16 = 82 GB/s weight bandwidth. Proves the k-quant
 super-block layout decodes natively on Intel.
 
+### quantization/gguf_gemv — grid i-quants iq2_xxs/iq2_xs/iq3_xxs
+Codebook/grid i-quants. Ported the ggml grid tables (iq2xxs_grid[256] u64,
+iq2xs_grid[512] u64, iq3xxs_grid[256] u32, ksigns_iq2xs[128], kmask_iq2xs[8]) to
+a header (kernels/.../gguf_iq_tables.hpp), lazily uploaded to a device buffer and
+cached. Decoders follow ggml dequantize_row_iq2_xxs/iq2_xs/iq3_xxs (grid lookup +
+sign mask + block scale). Correctness vs independent host replicas using the same
+tables: worst_excess 0, f32+bf16. Grid decode works natively on Intel. GGUF now
+15 formats; only iq1_s (needs the u64 iq1s_grid) remains.
+
 ### quantization/gguf_gemv — q4_1/q5_0/q5_1 (legacy linear) + iq4_xs
 Legacy 32-elem blocks: q4_1 (20B affine d/m), q5_0 (22B, 5-bit signed -16, 5th
 bit from qh), q5_1 (24B, 5-bit affine). iq4_xs (136B super-block: 6-bit split

@@ -326,6 +326,9 @@ enum class GgufType {
   q5_0,
   q5_1,
   iq4_xs,
+  iq2_xxs,
+  iq2_xs,
+  iq3_xxs,
 };
 
 void gguf_gemv(sycl::queue& q, const void* w_blocks, const void* x, void* y,
