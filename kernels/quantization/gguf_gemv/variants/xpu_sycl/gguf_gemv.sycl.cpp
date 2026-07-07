@@ -326,9 +326,45 @@ sycl::event gguf_q3k_typed(sycl::queue& q, const std::uint8_t* w, const T* x,
   });
 }
 
+// GGUF IQ4_NL: q4_0 footprint (18-byte block: fp16 d + qs[16]) but the 4-bit
+// index maps through a fixed 16-entry non-linear codebook instead of a linear
+// scale. QK=32, w = d * kvalues_iq4nl[nibble]. Follows ggml dequantize_row_iq4_nl.
+constexpr int kIQ4NL[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                            1, 13, 25, 38, 53, 69, 89, 113};
+
+template <typename T>
+sycl::event gguf_iq4nl_typed(sycl::queue& q, const std::uint8_t* w, const T* x,
+                             T* y, std::size_t N, std::size_t K) {
+  const std::size_t blocks_per_row = K / 32;
+  const std::size_t row_bytes = blocks_per_row * 18;
+  const std::size_t nwg = (N + kRowsPerWG - 1) / kRowsPerWG;
+  const sycl::nd_range<1> ndr(sycl::range<1>(nwg * kWG), sycl::range<1>(kWG));
+  return q.parallel_for(ndr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSG)]] {
+    const sycl::sub_group sg = it.get_sub_group();
+    const std::size_t n = it.get_group(0) * kRowsPerWG + sg.get_group_linear_id();
+    const int lane = static_cast<int>(sg.get_local_linear_id());
+    if (n >= N) return;
+    const std::uint8_t* wrow = w + n * row_bytes;
+    float acc = 0.0f;
+    for (std::size_t b = lane; b < blocks_per_row; b += kSG) {
+      const std::uint8_t* blk = wrow + b * 18;
+      const float d = load_half(blk);
+      const std::uint8_t* qs = blk + 2;
+      const std::size_t kbase = b * 32;
+      for (int j = 0; j < 16; ++j) {
+        acc += d * kIQ4NL[qs[j] & 0xF] * static_cast<float>(x[kbase + j]);
+        acc += d * kIQ4NL[qs[j] >> 4] * static_cast<float>(x[kbase + 16 + j]);
+      }
+    }
+    const float sum = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+    if (lane == 0) y[n] = static_cast<T>(sum);
+  });
+}
+
 template <typename T>
 sycl::event dispatch_type(sycl::queue& q, const std::uint8_t* w, const T* x, T* y,
                           std::size_t N, std::size_t K, int type) {
+  if (type == 7) return gguf_iq4nl_typed<T>(q, w, x, y, N, K);
   if (type == 2) return gguf_q6k_typed<T>(q, w, x, y, N, K);
   if (type == 3) return gguf_q4k_typed<T>(q, w, x, y, N, K);
   if (type == 4) return gguf_q5k_typed<T>(q, w, x, y, N, K);

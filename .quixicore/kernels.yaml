@@ -193,7 +193,7 @@ operations:
     path: kernels/quantization/gguf_gemv
     dtypes: [f32, f16, bf16]
     quant_format: gguf
-    gguf_types: [q8_0, q4_0, q6_K, q4_K, q5_K, q2_K, q3_K]
+    gguf_types: [q8_0, q4_0, q6_K, q4_K, q5_K, q2_K, q3_K, iq4_nl]
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/quantization/gguf_gemv/variants/xpu_sycl}
