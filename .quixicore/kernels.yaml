@@ -22,8 +22,9 @@ families:
     paths:
       - kernels/activations
   attention:
-    status: planned
-    paths: []
+    status: partial
+    paths:
+      - kernels/attention
   linear_attention:
     status: planned
     paths: []
@@ -41,14 +42,16 @@ families:
     status: planned
     paths: []
   sampling:
-    status: planned
-    paths: []
+    status: partial
+    paths:
+      - kernels/sampling
   serving:
     status: planned
     paths: []
   optimizers:
-    status: planned
-    paths: []
+    status: partial
+    paths:
+      - kernels/optimizers
   collectives:
     status: planned
     paths: []
@@ -132,6 +135,30 @@ operations:
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/matmul/dense_gemm/variants/xpu_sycl}
       - {name: xpu_onednn, status: implemented, path: kernels/matmul/dense_gemm/variants/xpu_onednn}
+  rope:
+    family: attention
+    status: implemented
+    path: kernels/attention/rope
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/attention/rope/variants/xpu_sycl}
+  adamw:
+    family: optimizers
+    status: implemented
+    path: kernels/optimizers/adamw
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/optimizers/adamw/variants/xpu_sycl}
+  argmax:
+    family: sampling
+    status: implemented
+    path: kernels/sampling/argmax
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/sampling/argmax/variants/xpu_sycl}
   layernorm:
     family: norms
     status: implemented

@@ -82,6 +82,39 @@ void glu(sycl::queue& q, const void* x, void* out, std::size_t rows,
          Variant variant = Variant::sycl, bool blocking = true);
 
 // ----------------------------------------------------------------------------
+// attention
+// ----------------------------------------------------------------------------
+
+// Rotary position embedding (RoPE), NeoX half-split form. `x`, `out` are
+// [tokens, n_heads, head_dim] row-major of dtype `dt`; token t uses position
+// (pos0 + t). Rotates pairs (i, i + head_dim/2). head_dim must be even.
+void rope(sycl::queue& q, const void* x, void* out, std::size_t tokens,
+          std::size_t n_heads, std::size_t head_dim, float base,
+          std::size_t pos0, DType dt, Variant variant = Variant::sycl,
+          bool blocking = true);
+
+// ----------------------------------------------------------------------------
+// optimizers
+// ----------------------------------------------------------------------------
+
+// Fused AdamW, in-place. `p` (params), `m`, `v` (moments) are updated; `g` is
+// the gradient. All are [n] of dtype `dt`. `step` is 1-based (bias correction).
+void adamw(sycl::queue& q, void* p, const void* g, void* m, void* v,
+           std::size_t n, float lr, float beta1, float beta2, float eps,
+           float weight_decay, int step, DType dt,
+           Variant variant = Variant::sycl, bool blocking = true);
+
+// ----------------------------------------------------------------------------
+// sampling
+// ----------------------------------------------------------------------------
+
+// Greedy argmax over the last axis. `logits` is [rows, vocab] of dtype `dt`;
+// `out` is [rows] int32 (lowest index on ties).
+void argmax(sycl::queue& q, const void* logits, int* out, std::size_t rows,
+            std::size_t vocab, DType dt, Variant variant = Variant::sycl,
+            bool blocking = true);
+
+// ----------------------------------------------------------------------------
 // matmul
 // ----------------------------------------------------------------------------
 

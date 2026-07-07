@@ -233,6 +233,86 @@ bool check_softmax(sycl::queue& q, DType dt, Variant variant, std::size_t rows,
 }
 
 template <typename T>
+bool check_rope(sycl::queue& q, DType dt, std::size_t tokens, std::size_t heads,
+                std::size_t hd) {
+  const std::size_t n = tokens * heads * hd;
+  T* x = sycl::malloc_shared<T>(n, q);
+  T* out = sycl::malloc_shared<T>(n, q);
+  for (std::size_t i = 0; i < n; ++i) x[i] = static_cast<T>(sample(i));
+  const float base = 10000.0f;
+  ops::rope(q, x, out, tokens, heads, hd, base, 0, dt, Variant::sycl, true);
+
+  const std::size_t half = hd / 2;
+  std::vector<float> o(n);
+  std::vector<double> r(n);
+  for (std::size_t t = 0; t < tokens; ++t)
+    for (std::size_t h = 0; h < heads; ++h)
+      for (std::size_t i = 0; i < half; ++i) {
+        const std::size_t bi = (t * heads + h) * hd;
+        const double freq = std::pow((double)base, -2.0 * (double)i / (double)hd);
+        const double ang = (double)t * freq;
+        const double x1 = (double)x[bi + i], x2 = (double)x[bi + i + half];
+        r[bi + i] = x1 * std::cos(ang) - x2 * std::sin(ang);
+        r[bi + i + half] = x1 * std::sin(ang) + x2 * std::cos(ang);
+        o[bi + i] = (float)out[bi + i];
+        o[bi + i + half] = (float)out[bi + i + half];
+      }
+  const bool ok = report<T>("rope", dt, o, r);
+  sycl::free(x, q); sycl::free(out, q);
+  return ok;
+}
+
+bool check_argmax(sycl::queue& q, DType dt, std::size_t rows, std::size_t vocab) {
+  float* logits = sycl::malloc_shared<float>(rows * vocab, q);
+  int* out = sycl::malloc_shared<int>(rows, q);
+  for (std::size_t i = 0; i < rows * vocab; ++i) logits[i] = sample(i * 3 + 1);
+  ops::argmax(q, logits, out, rows, vocab, DType::f32, Variant::sycl, true);
+  int mism = 0;
+  for (std::size_t r = 0; r < rows; ++r) {
+    int ref = 0;
+    float best = logits[r * vocab];
+    for (std::size_t j = 1; j < vocab; ++j)
+      if (logits[r * vocab + j] > best) { best = logits[r * vocab + j]; ref = (int)j; }
+    if (out[r] != ref) ++mism;
+  }
+  sycl::free(logits, q); sycl::free(out, q);
+  const bool ok = (mism == 0);
+  std::cout << "  argmax dt=" << dtype_name(dt) << " mismatches=" << mism
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+bool check_adamw(sycl::queue& q, DType dt, std::size_t n) {
+  // f32 params/moments for a clean numeric check.
+  float* p = sycl::malloc_shared<float>(n, q);
+  float* g = sycl::malloc_shared<float>(n, q);
+  float* m = sycl::malloc_shared<float>(n, q);
+  float* v = sycl::malloc_shared<float>(n, q);
+  std::vector<double> rp(n);
+  const float lr = 1e-3f, b1 = 0.9f, b2 = 0.999f, eps = 1e-8f, wd = 0.01f;
+  const int step = 5;
+  for (std::size_t i = 0; i < n; ++i) {
+    p[i] = sample(i); g[i] = sample(i + 2) * 0.5f;
+    m[i] = sample(i + 4) * 0.1f; v[i] = std::abs(sample(i + 6)) * 0.1f;
+  }
+  // fp64 reference
+  const double bc1 = 1.0 - std::pow((double)b1, step);
+  const double bc2 = 1.0 - std::pow((double)b2, step);
+  for (std::size_t i = 0; i < n; ++i) {
+    const double grad = g[i];
+    const double mi = b1 * (double)m[i] + (1 - b1) * grad;
+    const double vi = b2 * (double)v[i] + (1 - b2) * grad * grad;
+    rp[i] = (double)p[i] - lr * ((mi / bc1) / (std::sqrt(vi / bc2) + eps) + wd * (double)p[i]);
+  }
+  ops::adamw(q, p, g, m, v, n, lr, b1, b2, eps, wd, step, dt, Variant::sycl, true);
+  std::vector<float> op(n);
+  for (std::size_t i = 0; i < n; ++i) op[i] = p[i];
+  const bool ok = report<float>("adamw", dt, op, rp);
+  sycl::free(p, q); sycl::free(g, q); sycl::free(m, q); sycl::free(v, q);
+  return ok;
+}
+
+template <typename T>
 bool check_gemm(sycl::queue& q, DType dt, Variant variant, std::size_t M,
                 std::size_t N, std::size_t K) {
   T* A = sycl::malloc_shared<T>(M * K, q);
@@ -400,6 +480,12 @@ int main() {
     failures += check_gemm<float>(q, DType::f32, v, 128, 96, 160) ? 0 : 1;
     failures += check_gemm<bf16_t>(q, DType::bf16, v, 128, 96, 160) ? 0 : 1;
   }
+
+  // rope / adamw / argmax (native only).
+  failures += check_rope<float>(q, DType::f32, 32, 8, 64) ? 0 : 1;
+  failures += check_rope<bf16_t>(q, DType::bf16, 32, 8, 64) ? 0 : 1;
+  failures += check_adamw(q, DType::f32, 4096) ? 0 : 1;
+  failures += check_argmax(q, DType::f32, 64, 4000) ? 0 : 1;
 
   const std::size_t rows = 64, dim = 1024;
   for (const Variant v : variants) {

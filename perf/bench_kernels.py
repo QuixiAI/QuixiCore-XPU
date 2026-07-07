@@ -58,6 +58,9 @@ DEFAULT_KERNEL_BENCH = [
     {"kernel": "gelu_backward", "variant": "sycl", "dtype": "bf16", "n": 4194304},
     {"kernel": "dense_gemm", "variant": "sycl", "dtype": "bf16", "M": 2048, "N": 2048, "K": 2048},
     {"kernel": "dense_gemm", "variant": "vendor", "dtype": "bf16", "M": 2048, "N": 2048, "K": 2048},
+    {"kernel": "rope", "variant": "sycl", "dtype": "bf16", "rows": 65536, "dim": 128},
+    {"kernel": "adamw", "variant": "sycl", "dtype": "f32", "n": 16777216},
+    {"kernel": "argmax", "variant": "sycl", "dtype": "f32", "rows": 4096, "dim": 131072},
 ]
 
 

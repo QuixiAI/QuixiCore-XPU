@@ -37,8 +37,11 @@
 #include "activations/glu/glu_kernel.hpp"
 #include "activations/silu/silu_kernel.hpp"
 #include "activations/softmax/softmax_kernel.hpp"
+#include "attention/rope/rope_kernel.hpp"
 #include "matmul/dense_gemm/dense_gemm_kernel.hpp"
 #include "norms/norms_kernel.hpp"
+#include "optimizers/adamw/adamw_kernel.hpp"
+#include "sampling/argmax/argmax_kernel.hpp"
 
 namespace {
 
@@ -161,6 +164,58 @@ int main(int argc, char** argv) {
               << ",\"gflops\":" << gflops << ",\"device\":\""
               << q.get_device().get_info<sycl::info::device::name>() << "\"}"
               << std::endl;
+    return 0;
+  }
+
+  // rope / adamw / argmax: self-contained buffer sets + timing.
+  auto time_median = [&](auto thunk) {
+    for (int i = 0; i < warmup; ++i) thunk().wait();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) { sycl::event e = thunk(); e.wait(); s.push_back(event_ms(e)); }
+    std::sort(s.begin(), s.end());
+    return s[s.size() / 2];
+  };
+  auto emit = [&](double median, double gbps) {
+    std::cout << "{\"schema_version\":2,\"kernel\":\"" << kernel << "\",\"variant\":\"sycl\""
+              << ",\"dtype\":\"" << dtype_name(dt) << "\",\"rows\":" << rows
+              << ",\"dim\":" << dim << ",\"iters\":" << iters
+              << ",\"median_ms\":" << median << ",\"gbps\":" << gbps
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>()
+              << "\"}" << std::endl;
+  };
+  if (kernel == "rope") {
+    const std::size_t ne = rows * dim;  // tokens=rows, heads=1, head_dim=dim
+    void* x = sycl::malloc_device(ne * elem, q);
+    void* o = sycl::malloc_device(ne * elem, q);
+    q.memset(x, 0, ne * elem).wait();
+    const double med = time_median([&] { return kernels::rope_sycl(q, x, o, rows, 1, dim, 10000.0f, 0, dt); });
+    emit(med, 2.0 * ne * elem / (med * 1e-3) / 1e9);
+    sycl::free(x, q); sycl::free(o, q);
+    return 0;
+  }
+  if (kernel == "adamw") {
+    void* p = sycl::malloc_device(n * elem, q);
+    void* g = sycl::malloc_device(n * elem, q);
+    void* m = sycl::malloc_device(n * elem, q);
+    void* vv = sycl::malloc_device(n * elem, q);
+    q.memset(p, 0, n * elem).wait(); q.memset(g, 0, n * elem).wait();
+    q.memset(m, 0, n * elem).wait(); q.memset(vv, 0, n * elem).wait();
+    const double med = time_median([&] { return kernels::adamw_sycl(q, p, g, m, vv, n, 1e-3f, 0.9f, 0.999f, 1e-8f, 0.01f, 0.5f, 0.5f, dt); });
+    std::cout << "{\"schema_version\":2,\"kernel\":\"adamw\",\"variant\":\"sycl\",\"dtype\":\""
+              << dtype_name(dt) << "\",\"n\":" << n << ",\"iters\":" << iters
+              << ",\"median_ms\":" << med << ",\"gbps\":" << (6.0 * n * elem / (med * 1e-3) / 1e9)
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>()
+              << "\"}" << std::endl;
+    sycl::free(p, q); sycl::free(g, q); sycl::free(m, q); sycl::free(vv, q);
+    return 0;
+  }
+  if (kernel == "argmax") {
+    void* lg = sycl::malloc_device(rows * dim * elem, q);
+    int* o = sycl::malloc_device<int>(rows, q);
+    q.memset(lg, 0, rows * dim * elem).wait();
+    const double med = time_median([&] { return kernels::argmax_sycl(q, lg, o, rows, dim, dt); });
+    emit(med, static_cast<double>(rows * dim) * elem / (med * 1e-3) / 1e9);
+    sycl::free(lg, q); sycl::free(o, q);
     return 0;
   }
 

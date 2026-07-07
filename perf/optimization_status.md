@@ -289,11 +289,26 @@ optimization (deferred under breadth-first). The ~90 TFLOP/s bf16 oneDNN number
 confirms the B60 XMX is real and is exactly why the quantization/XMX surface is
 the high-value frontier.
 
+## 2026-07-06: three more families — rope (attention), adamw (optimizers), argmax (sampling)
+
+Status: landed (native SYCL). Breadth pass; baselines recorded, optimization
+deferred.
+
+Correctness: rope (f32/bf16) vs an fp64 NeoX-rotation reference; adamw (f32
+params) vs an fp64 fused-update reference; argmax (f32) exact-match vs a host
+scan (0 mismatches). All pass.
+
+Baselines (B60): adamw f32 339 GB/s (memory-bound, 6 buffer touches);
+argmax f32 390 GB/s (near roofline); rope bf16 62 GB/s. rope is
+transcendental-bound (sin/cos/pow per element) — the clear optimization is
+precomputed per-position cos/sin (or a freq table), deferred.
+
 ## First Kernel Plan
 
-Status: in progress — families lit up: activations (gelu, gelu_backward, silu,
-glu, softmax), norms (rms_norm, layernorm), matmul (dense_gemm). Next matrix
-growth: quantization surface (decode + qgemv/qgemm) on XMX, then attention.
+Status: in progress — 6 families now have implementations: activations (gelu,
+gelu_backward, silu, glu, softmax), norms (rms_norm, layernorm), matmul
+(dense_gemm), attention (rope), optimizers (adamw), sampling (argmax). Next
+matrix growth: quantization surface (decode + qgemv/qgemm) on XMX/DPAS.
 
 Priority order:
 
