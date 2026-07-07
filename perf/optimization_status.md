@@ -172,10 +172,38 @@ small dim.
 
 Raw results: `perf/results/<date>/<run-id>/`.
 
+## 2026-07-06: softmax (activations/softmax) — SYCL + oneDNN
+
+Status: landed (SYCL + oneDNN vendor, best-routed).
+
+Environment: same as the GELU entry (Arc Pro B60, oneAPI 2026.0, oneDNN 3.11).
+
+Implementation: one work-group per row, two fp32 reductions (row max for
+stability, then sum of exp). `kernels/activations/softmax/variants/{xpu_sycl,
+xpu_onednn}` (oneDNN `softmax_accurate`, axis=1). Dispatch in
+`src/dispatch/activations.cpp`.
+
+Correctness: softmax x {f32,f16,bf16} x {sycl,vendor}, rows=64 dim=1024, vs an
+fp64 max-subtract reference rounded to storage dtype; also checks each row sums
+to 1. All 6 pass (row-sum error <= 5e-4).
+
+Baseline (8192x4096, median device time): softmax f32 SYCL 316 / oneDNN 223
+GB/s; softmax bf16 SYCL 195 / oneDNN 346 GB/s.
+
+Decision: this REPRODUCES the layernorm per-dtype split on a second, independent
+reduction kernel — native SYCL wins f32 (1.42x), oneDNN wins bf16 (1.78x). Not a
+fluke; a robust pattern on B60: hand-written SYCL is competitive-to-winning at
+f32, while oneDNN's 16-bit path is better tuned. `Variant::best` routes softmax
+f32 -> sycl, 16-bit -> vendor. The bf16 native gap (195 vs f32 316) is again the
+scalar-16-bit-access bottleneck flagged for a vectorization pass.
+
+Raw results: `perf/results/<date>/<run-id>/`.
+
 ## First Kernel Plan
 
-Status: in progress — GELU + RMSNorm + LayerNorm landed (native, and oneDNN
-where a primitive exists). Next: Softmax, then GLU modes + GELU backward.
+Status: in progress — GELU + RMSNorm + LayerNorm + Softmax landed (native, and
+oneDNN where a primitive exists). Next: GLU modes + GELU backward, then the bf16
+row-kernel vectorization pass. After that, Phase 2 quantization surface.
 
 Priority order:
 

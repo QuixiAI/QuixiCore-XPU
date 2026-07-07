@@ -71,6 +71,20 @@ operations:
       - name: xpu_onednn
         status: implemented
         path: kernels/activations/gelu/variants/xpu_onednn
+  softmax:
+    family: activations
+    status: implemented
+    path: kernels/activations/softmax
+    dtypes: [f32, f16, bf16]
+    tests:
+      correctness: tests/xpu_ops_smoke.cpp
+    variants:
+      - name: xpu_sycl
+        status: implemented
+        path: kernels/activations/softmax/variants/xpu_sycl
+      - name: xpu_onednn
+        status: implemented
+        path: kernels/activations/softmax/variants/xpu_onednn
   rms_norm:
     family: norms
     status: implemented

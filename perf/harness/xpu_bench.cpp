@@ -33,6 +33,7 @@
 #include "quixicore/xpu/variants.hpp"
 
 #include "activations/gelu/gelu_kernel.hpp"
+#include "activations/softmax/softmax_kernel.hpp"
 #include "norms/norms_kernel.hpp"
 
 namespace {
@@ -110,8 +111,10 @@ int main(int argc, char** argv) {
   sycl::queue q = make_gpu_queue(device_index, /*enable_profiling=*/true);
 
   const std::size_t elem = dtype_size(dt);
+  const bool is_softmax = (kernel == "softmax");
   const bool is_norm = (kernel == "rms_norm" || kernel == "layernorm");
-  const std::size_t n_elems = is_norm ? rows * dim : n;
+  const bool is_row = is_norm || is_softmax;
+  const std::size_t n_elems = is_row ? rows * dim : n;
 
   void* d_in = sycl::malloc_device(n_elems * elem, q);
   void* d_out = sycl::malloc_device(n_elems * elem, q);
@@ -145,6 +148,14 @@ int main(int argc, char** argv) {
       }
       return kernels::layernorm_sycl(q, d_in, d_w, d_b, d_out, rows, dim, eps, dt);
     }
+    if (kernel == "softmax") {
+      if (variant == Variant::vendor) {
+#if defined(QUIXICORE_XPU_HAS_ONEDNN)
+        return kernels::softmax_onednn(q, d_in, d_out, rows, dim, dt);
+#endif
+      }
+      return kernels::softmax_sycl(q, d_in, d_out, rows, dim, dt);
+    }
     throw std::invalid_argument("unknown kernel: " + kernel);
   };
 
@@ -169,6 +180,8 @@ int main(int argc, char** argv) {
     const double affine = (kernel == "layernorm") ? 2.0 : 1.0;
     bytes = (2.0 * static_cast<double>(rows * dim) + affine * static_cast<double>(dim)) *
             static_cast<double>(elem);
+  } else if (is_softmax) {
+    bytes = 2.0 * static_cast<double>(rows * dim) * static_cast<double>(elem);
   } else {
     bytes = static_cast<double>(n) * static_cast<double>(elem) * 2.0;
   }

@@ -1,0 +1,18 @@
+# Benchmark configuration for activations/softmax.
+#
+# Consumed by perf/bench_kernels.py (--phase kernels, --preset sycl). Both shipped
+# variants are benchmarked; on B60 native SYCL leads f32 and oneDNN leads the
+# 16-bit dtypes (perf/optimization_status.md 2026-07-06). Parsed only when PyYAML
+# is available; otherwise the harness falls back to its built-in default matrix.
+
+kernel: softmax
+family: activations
+operation: softmax
+
+runs:
+  - {kernel: softmax, variant: sycl,   dtype: f32,  rows: 8192, dim: 4096, iters: 60, warmup: 15}
+  - {kernel: softmax, variant: vendor, dtype: f32,  rows: 8192, dim: 4096, iters: 60, warmup: 15}
+  - {kernel: softmax, variant: sycl,   dtype: bf16, rows: 8192, dim: 4096, iters: 60, warmup: 15}
+  - {kernel: softmax, variant: vendor, dtype: bf16, rows: 8192, dim: 4096, iters: 60, warmup: 15}
+  - {kernel: softmax, variant: sycl,   dtype: f16,  rows: 8192, dim: 4096, iters: 60, warmup: 15}
+  - {kernel: softmax, variant: vendor, dtype: f16,  rows: 8192, dim: 4096, iters: 60, warmup: 15}

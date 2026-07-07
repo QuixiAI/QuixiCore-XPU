@@ -48,6 +48,14 @@ void gelu(sycl::queue& q, const void* in, void* out, std::size_t n, DType dt,
           GeluApprox approx = GeluApprox::erf, Variant variant = Variant::sycl,
           bool blocking = true);
 
+// Numerically stable softmax over the last axis of a [rows, dim] row-major
+// tensor: subtract the row max, exponentiate, normalize by the row sum. `x`,
+// `out` are device pointers of dtype `dt` ([rows*dim]); exp/sum accumulate in
+// fp32.
+void softmax(sycl::queue& q, const void* x, void* out, std::size_t rows,
+             std::size_t dim, DType dt, Variant variant = Variant::sycl,
+             bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // norms
 // ----------------------------------------------------------------------------

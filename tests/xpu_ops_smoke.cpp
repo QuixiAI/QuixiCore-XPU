@@ -94,6 +94,42 @@ float sample(std::size_t i) {
 }
 
 template <typename T>
+bool check_softmax(sycl::queue& q, DType dt, Variant variant, std::size_t rows,
+                   std::size_t dim) {
+  const std::size_t n = rows * dim;
+  T* x = sycl::malloc_shared<T>(n, q);
+  T* out = sycl::malloc_shared<T>(n, q);
+  for (std::size_t i = 0; i < n; ++i) x[i] = static_cast<T>(sample(i) * 3.0f);
+
+  ops::softmax(q, x, out, rows, dim, dt, variant, /*blocking=*/true);
+
+  const Tol tol = tol_for(dt);
+  double worst_excess = 0.0, max_abs = 0.0, worst_rowsum = 0.0;
+  for (std::size_t r = 0; r < rows; ++r) {
+    double m = -1e30;
+    for (std::size_t i = 0; i < dim; ++i) m = std::max(m, static_cast<double>(x[r * dim + i]));
+    double sum = 0.0;
+    for (std::size_t i = 0; i < dim; ++i) sum += std::exp(static_cast<double>(x[r * dim + i]) - m);
+    double rowsum = 0.0;
+    for (std::size_t i = 0; i < dim; ++i) {
+      const double ref_hi = std::exp(static_cast<double>(x[r * dim + i]) - m) / sum;
+      const double ref = static_cast<double>(static_cast<T>(ref_hi));
+      const double err = std::abs(static_cast<double>(out[r * dim + i]) - ref);
+      max_abs = std::max(max_abs, err);
+      worst_excess = std::max(worst_excess, err - (tol.atol + tol.rtol * std::abs(ref)));
+      rowsum += static_cast<double>(out[r * dim + i]);
+    }
+    worst_rowsum = std::max(worst_rowsum, std::abs(rowsum - 1.0));
+  }
+  sycl::free(x, q); sycl::free(out, q);
+  const bool ok = worst_excess <= 0.0 && worst_rowsum < 5e-2;
+  std::cout << "  softmax dt=" << dtype_name(dt) << " variant=" << variant_name(variant)
+            << " max_abs=" << max_abs << " rowsum_err=" << worst_rowsum
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+template <typename T>
 bool check_rms_norm(sycl::queue& q, DType dt, Variant variant, std::size_t rows,
                     std::size_t dim) {
   const std::size_t n = rows * dim;
@@ -206,6 +242,9 @@ int main() {
 
   const std::size_t rows = 64, dim = 1024;
   for (const Variant v : variants) {
+    failures += check_softmax<float>(q, DType::f32, v, rows, dim) ? 0 : 1;
+    failures += check_softmax<half_t>(q, DType::f16, v, rows, dim) ? 0 : 1;
+    failures += check_softmax<bf16_t>(q, DType::bf16, v, rows, dim) ? 0 : 1;
     failures += check_rms_norm<float>(q, DType::f32, v, rows, dim) ? 0 : 1;
     failures += check_rms_norm<half_t>(q, DType::f16, v, rows, dim) ? 0 : 1;
     failures += check_rms_norm<bf16_t>(q, DType::bf16, v, rows, dim) ? 0 : 1;

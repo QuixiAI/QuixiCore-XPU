@@ -5,6 +5,7 @@
 #include "quixicore/xpu/ops.hpp"
 
 #include "activations/gelu/gelu_kernel.hpp"
+#include "activations/softmax/softmax_kernel.hpp"
 
 namespace quixicore::xpu::ops {
 
@@ -31,6 +32,31 @@ void gelu(sycl::queue& q, const void* in, void* out, std::size_t n, DType dt,
   if (blocking) {
     ev.wait();
   }
+}
+
+void softmax(sycl::queue& q, const void* x, void* out, std::size_t rows,
+             std::size_t dim, DType dt, Variant variant, bool blocking) {
+  // Data-driven best routing (perf/optimization_status.md 2026-07-06, B60): same
+  // per-dtype split as layernorm -- native SYCL wins f32 softmax (316 vs 223
+  // GB/s), oneDNN wins 16-bit (bf16 346 vs 195).
+  if (variant == Variant::best) {
+    variant = (dt == DType::f32) ? Variant::sycl : Variant::vendor;
+  }
+  const Variant v = resolve_variant(variant);
+  sycl::event ev;
+  switch (v) {
+    case Variant::vendor:
+#if defined(QUIXICORE_XPU_HAS_ONEDNN)
+      ev = kernels::softmax_onednn(q, x, out, rows, dim, dt);
+      break;
+#endif
+    case Variant::sycl:
+    case Variant::best:
+    default:
+      ev = kernels::softmax_sycl(q, x, out, rows, dim, dt);
+      break;
+  }
+  if (blocking) ev.wait();
 }
 
 }  // namespace quixicore::xpu::ops

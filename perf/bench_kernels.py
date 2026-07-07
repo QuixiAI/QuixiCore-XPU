@@ -49,6 +49,10 @@ DEFAULT_KERNEL_BENCH = [
     {"kernel": "layernorm", "variant": "vendor", "dtype": "f32", "rows": 8192, "dim": 4096},
     {"kernel": "layernorm", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 4096},
     {"kernel": "layernorm", "variant": "vendor", "dtype": "bf16", "rows": 8192, "dim": 4096},
+    {"kernel": "softmax", "variant": "sycl", "dtype": "f32", "rows": 8192, "dim": 4096},
+    {"kernel": "softmax", "variant": "vendor", "dtype": "f32", "rows": 8192, "dim": 4096},
+    {"kernel": "softmax", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 4096},
+    {"kernel": "softmax", "variant": "vendor", "dtype": "bf16", "rows": 8192, "dim": 4096},
 ]
 
 
