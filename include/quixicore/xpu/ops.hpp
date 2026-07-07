@@ -175,6 +175,17 @@ void mxfp4_gemv(sycl::queue& q, const void* w_packed, const void* block_scales,
                 DType act_dt, Variant variant = Variant::sycl,
                 bool blocking = true);
 
+// nvfp4 GEMV (NVIDIA FP4), native decode. Weight W is [N, K] of e2m1 (fp4)
+// packed 2/byte, with one e4m3 (fp8) block scale per 16 elements
+// (`block_scales` is [N, K/16] uint8) and a per-tensor fp32 `global_scale`.
+// Activation `x` is [K], output `y` is [N], dtype `act_dt`. Dequant in fp32:
+//   w = e2m1(nibble) * e4m3(block_scale) * global_scale;  y[n] = sum_k w * x[k]
+// K must be a multiple of 32. Proves nvfp4 decodes natively on Intel.
+void nvfp4_gemv(sycl::queue& q, const void* w_packed, const void* block_scales,
+                float global_scale, const void* x, void* y, std::size_t N,
+                std::size_t K, DType act_dt, Variant variant = Variant::sycl,
+                bool blocking = true);
+
 // int8 w8a8 GEMM: C[M,N] = (A_int8[M,K] @ B_int8[K,N]) * a_scale[M] * b_scale[N].
 // A, B are int8 device pointers; a_scale (per-row/token) and b_scale (per-col/
 // channel) are fp32 [M] and [N]; C is `out_dt` (f32/f16/bf16). Accumulates int32.

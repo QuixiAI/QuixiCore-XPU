@@ -405,6 +405,30 @@ extra e2m1 LUT + per-block exp2 decode ALU is the difference. Correct and
 functional; optimization (hoist the block scale to a float pre-pass, cut decode
 ALU) deferred. mxfp4 -> experimental in quant-formats.yaml.
 
+## 2026-07-07: quantization/nvfp4_gemv — NVIDIA FP4 decodes natively on Intel too
+
+Status: landed (native SYCL, hand-written decoder). Completes the FP4 story
+alongside mxfp4.
+
+Format: nvfp4 — e2m1 (fp4) elements + e4m3 (fp8) block scale per 16 + a
+per-tensor fp32 global scale. Decoder: e2m1 LUT + a hand-written e4m3->float
+(1-4-3, bias 7, subnormals). A 16-byte chunk (32 fp4) spans two 16-element
+blocks, so two e4m3 scales per chunk.
+
+Correctness (act f32 + bf16, N=128 K=4096): pass. The block-scale bytes are built
+with the oneDNN fp8 codec (fp8_encode) and decoded back for the reference, so
+passing ALSO confirms the hand-written e4m3 decode matches oneDNN's exactly --
+a nice cross-check.
+
+Baseline (8192x8192, bf16): 0.343 ms, 98 GB/s -- between mxfp4 (0.386) and int4
+(0.257); the ldexp-based e4m3 decode is a touch cheaper than mxfp4's per-block
+exp2. Correct + functional; same decode-ALU optimization headroom. nvfp4 ->
+experimental.
+
+Both "FP4 is Blackwell-only" (mxfp4 = OCP, nvfp4 = NVIDIA) claims are now
+empirically false on Intel: both decode natively via hand-written kernels, no
+special silicon.
+
 ## First Kernel Plan
 
 Status: in progress — 7 families now have implementations: activations (gelu,

@@ -368,6 +368,65 @@ bool check_mxfp4_gemv(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K
 }
 
 template <typename T>
+bool check_nvfp4_gemv(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K) {
+  const float e2m1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+  const std::size_t bpr = K / 2, blkpr = K / 16;  // block 16
+  std::uint8_t* w = sycl::malloc_shared<std::uint8_t>(N * bpr, q);
+  std::uint8_t* bs = sycl::malloc_shared<std::uint8_t>(N * blkpr, q);  // e4m3 bytes
+  float* bs_f = sycl::malloc_shared<float>(N * blkpr, q);   // desired scale floats
+  float* bs_rt = sycl::malloc_shared<float>(N * blkpr, q);  // round-tripped exact
+  T* x = sycl::malloc_shared<T>(K, q);
+  T* y = sycl::malloc_shared<T>(N, q);
+  const float gscale = 0.75f;
+
+  auto nib = [&](std::size_t i) {
+    int mag = static_cast<int>(std::floor((sample(i) * 0.5f + 0.5f) * 8.0f)) & 7;
+    int sign = (sample(i + 1) < 0.0f) ? 8 : 0;
+    return static_cast<std::uint8_t>(sign | mag);
+  };
+  for (std::size_t n = 0; n < N; ++n)
+    for (std::size_t b = 0; b < bpr; ++b)
+      w[n * bpr + b] = static_cast<std::uint8_t>(nib(n * K + 2 * b) | (nib(n * K + 2 * b + 1) << 4));
+  for (std::size_t i = 0; i < N * blkpr; ++i) bs_f[i] = 0.5f + 0.5f * std::abs(sample(i + 31));
+  for (std::size_t k = 0; k < K; ++k) x[k] = static_cast<T>(sample(k + 41));
+
+  bool ok = true;
+  try {
+    // Build e4m3 block-scale bytes via the public codec; decode back for the exact
+    // scale values the kernel consumes (its e4m3 decode must match).
+    ops::fp8_encode(q, bs_f, bs, N * blkpr, ops::Fp8Kind::e4m3);
+    ops::fp8_decode(q, bs, bs_rt, N * blkpr, ops::Fp8Kind::e4m3);
+    ops::nvfp4_gemv(q, w, bs, gscale, x, y, N, K, act_dt, Variant::sycl, true);
+
+    const Tol base = tol_for(act_dt);
+    const double rtol = base.rtol * std::sqrt(static_cast<double>(K)) + 3e-3;
+    double worst = 0.0, max_abs = 0.0;
+    for (std::size_t n = 0; n < N; ++n) {
+      double acc = 0.0;
+      for (std::size_t k = 0; k < K; ++k) {
+        const std::uint8_t byte = w[n * bpr + k / 2];
+        const int n4 = (k & 1) ? (byte >> 4) : (byte & 0xF);
+        double val = e2m1[n4 & 7];
+        if (n4 & 8) val = -val;
+        acc += val * (double)bs_rt[n * blkpr + k / 16] * (double)gscale * (double)x[k];
+      }
+      const double ref = static_cast<double>(static_cast<T>(acc));
+      const double err = std::abs(static_cast<double>(y[n]) - ref);
+      max_abs = std::max(max_abs, err);
+      worst = std::max(worst, err - (base.atol + rtol * std::abs(ref)));
+    }
+    ok = worst <= 0.0;
+    std::cout << "  nvfp4_gemv act=" << dtype_name(act_dt) << " (N=" << N << " K=" << K
+              << ") max_abs=" << max_abs << (ok ? "  ok" : "  FAIL") << '\n';
+  } catch (const std::exception& e) {
+    std::cout << "  nvfp4_gemv: skipped (" << e.what() << ")\n";
+  }
+  sycl::free(w, q); sycl::free(bs, q); sycl::free(bs_f, q); sycl::free(bs_rt, q);
+  sycl::free(x, q); sycl::free(y, q);
+  return ok;
+}
+
+template <typename T>
 bool check_qgemv_int4(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K,
                       std::size_t group) {
   const std::size_t bpr = K / 2;         // bytes per row
@@ -672,6 +731,10 @@ int main() {
   // mxfp4 GEMV (native e2m1 + e8m0 block-scale decode).
   failures += check_mxfp4_gemv<float>(q, DType::f32, 128, 4096) ? 0 : 1;
   failures += check_mxfp4_gemv<bf16_t>(q, DType::bf16, 128, 4096) ? 0 : 1;
+
+  // nvfp4 GEMV (native e2m1 + e4m3 block scale + per-tensor scale).
+  failures += check_nvfp4_gemv<float>(q, DType::f32, 128, 4096) ? 0 : 1;
+  failures += check_nvfp4_gemv<bf16_t>(q, DType::bf16, 128, 4096) ? 0 : 1;
 
   // int8 w8a8 GEMM, both variants.
   for (const Variant v : variants) {

@@ -43,6 +43,7 @@
 #include "optimizers/adamw/adamw_kernel.hpp"
 #include "quantization/fp8_gemm/fp8_kernel.hpp"
 #include "quantization/mxfp4_gemv/mxfp4_kernel.hpp"
+#include "quantization/nvfp4_gemv/nvfp4_kernel.hpp"
 #include "quantization/qgemm/qgemm_kernel.hpp"
 #include "quantization/qgemv/qgemv_kernel.hpp"
 #include "sampling/argmax/argmax_kernel.hpp"
@@ -250,6 +251,32 @@ int main(int argc, char** argv) {
     const double med = s[s.size() / 2];
     const double wbytes = static_cast<double>(Nn) * static_cast<double>(Kk) / 2.0;  // fp4 = 0.5 byte
     std::cout << "{\"schema_version\":2,\"kernel\":\"mxfp4_gemv\",\"variant\":\"sycl\",\"dtype\":\""
+              << dtype_name(dt) << "\",\"N\":" << Nn << ",\"K\":" << Kk
+              << ",\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"weight_gbps\":" << (wbytes / (med * 1e-3) / 1e9)
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>()
+              << "\"}" << std::endl;
+    sycl::free(w, q); sycl::free(bs, q); sycl::free(xx, q); sycl::free(yy, q);
+    return 0;
+  }
+
+  if (kernel == "nvfp4_gemv") {
+    const std::size_t Nn = rows, Kk = dim;
+    void* w = sycl::malloc_device(Nn * (Kk / 2), q);
+    void* bs = sycl::malloc_device(Nn * (Kk / 16), q);  // e4m3 block scales, block 16
+    void* xx = sycl::malloc_device(Kk * elem, q);
+    void* yy = sycl::malloc_device(Nn * elem, q);
+    q.memset(w, 0, Nn * (Kk / 2)).wait();
+    q.memset(bs, 0x38, Nn * (Kk / 16)).wait();  // e4m3 ~1.0
+    q.memset(xx, 0, Kk * elem).wait();
+    auto once = [&] { return kernels::nvfp4_gemv_sycl(q, w, bs, 1.0f, xx, yy, Nn, Kk, dt); };
+    for (int i = 0; i < warmup; ++i) once().wait();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) { sycl::event e = once(); e.wait(); s.push_back(event_ms(e)); }
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    const double wbytes = static_cast<double>(Nn) * static_cast<double>(Kk) / 2.0;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"nvfp4_gemv\",\"variant\":\"sycl\",\"dtype\":\""
               << dtype_name(dt) << "\",\"N\":" << Nn << ",\"K\":" << Kk
               << ",\"iters\":" << iters << ",\"median_ms\":" << med
               << ",\"weight_gbps\":" << (wbytes / (med * 1e-3) / 1e9)

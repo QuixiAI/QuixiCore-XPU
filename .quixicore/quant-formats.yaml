@@ -26,8 +26,12 @@ formats:
       (e2m1 LUT + 2^(e8m0-127)) -- correct on B60, ~on par with fp16 GEMV.
       Proves MX FP4 is not Blackwell-exclusive; it decodes natively on Intel.
   nvfp4:
-    status: planned
-    note: FP4 e2m1 with an fp8 (e4m3) block scale. Portable; decode + DPAS/XMX.
+    status: experimental
+    note: >-
+      FP4 e2m1 + e4m3 (fp8) block scale (block 16) + per-tensor fp32 scale. Landed
+      as quantization/nvfp4_gemv with a native decoder (e2m1 LUT + hand-written
+      e4m3 decode matching oneDNN's codec). Correct on B60. NVIDIA FP4 is not
+      NVIDIA-exclusive; it decodes natively on Intel.
   fp8:
     status: experimental
     note: >-

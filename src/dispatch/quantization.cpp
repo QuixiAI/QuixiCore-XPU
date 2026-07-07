@@ -6,6 +6,7 @@
 
 #include "quantization/fp8_gemm/fp8_kernel.hpp"
 #include "quantization/mxfp4_gemv/mxfp4_kernel.hpp"
+#include "quantization/nvfp4_gemv/nvfp4_kernel.hpp"
 #include "quantization/qgemm/qgemm_kernel.hpp"
 #include "quantization/qgemv/qgemv_kernel.hpp"
 
@@ -17,6 +18,15 @@ void mxfp4_gemv(sycl::queue& q, const void* w_packed, const void* block_scales,
   (void)variant;  // native only
   sycl::event ev =
       kernels::mxfp4_gemv_sycl(q, w_packed, block_scales, x, y, N, K, act_dt);
+  if (blocking) ev.wait();
+}
+
+void nvfp4_gemv(sycl::queue& q, const void* w_packed, const void* block_scales,
+                float global_scale, const void* x, void* y, std::size_t N,
+                std::size_t K, DType act_dt, Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::nvfp4_gemv_sycl(q, w_packed, block_scales,
+                                            global_scale, x, y, N, K, act_dt);
   if (blocking) ev.wait();
 }
 
