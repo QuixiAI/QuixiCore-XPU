@@ -104,6 +104,42 @@ double gelu_grad_ref(double x) {
   return cdf + x * pdf;
 }
 
+template <typename T>
+bool check_serving(sycl::queue& q, DType dt) {
+  const std::size_t vocab = 500, dim = 128, n = 200, slots = 400;
+  T* table = sycl::malloc_shared<T>(vocab * dim, q);
+  int* ids = sycl::malloc_shared<int>(n, q);
+  T* out = sycl::malloc_shared<T>(n * dim, q);
+  for (std::size_t i = 0; i < vocab * dim; ++i) table[i] = static_cast<T>(sample(i));
+  for (std::size_t t = 0; t < n; ++t) ids[t] = static_cast<int>((t * 7 + 3) % vocab);
+
+  ops::embedding_lookup(q, table, ids, out, n, dim, dt, Variant::sycl, true);
+  int bad = 0;
+  for (std::size_t t = 0; t < n; ++t)
+    for (std::size_t j = 0; j < dim; ++j)
+      if (out[t * dim + j] != table[ids[t] * dim + j]) ++bad;
+
+  // scatter then gather round-trip
+  T* cache = sycl::malloc_shared<T>(slots * dim, q);
+  int* slot = sycl::malloc_shared<int>(n, q);
+  int* gidx = sycl::malloc_shared<int>(n, q);
+  T* gout = sycl::malloc_shared<T>(n * dim, q);
+  for (std::size_t i = 0; i < slots * dim; ++i) cache[i] = static_cast<T>(-1.0f);
+  for (std::size_t t = 0; t < n; ++t) { slot[t] = static_cast<int>((t * 3 + 1) % slots); gidx[t] = slot[t]; }
+  ops::kv_cache_scatter(q, cache, out, slot, n, dim, dt, Variant::sycl, true);
+  ops::kv_cache_gather(q, cache, gidx, gout, n, dim, dt, Variant::sycl, true);
+  for (std::size_t t = 0; t < n; ++t)
+    for (std::size_t j = 0; j < dim; ++j)
+      if (gout[t * dim + j] != out[t * dim + j]) ++bad;
+
+  sycl::free(table, q); sycl::free(ids, q); sycl::free(out, q);
+  sycl::free(cache, q); sycl::free(slot, q); sycl::free(gidx, q); sycl::free(gout, q);
+  const bool ok = (bad == 0);
+  std::cout << "  serving(embed+kvcache) dt=" << dtype_name(dt) << " mism=" << bad
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // Explicit mantissa bits per storage dtype (for the 1-ULP allowance below).
 int mantissa_bits(DType dt) {
   switch (dt) {
@@ -823,6 +859,10 @@ int main() {
   failures += check_rope<bf16_t>(q, DType::bf16, 32, 8, 64) ? 0 : 1;
   failures += check_adamw(q, DType::f32, 4096) ? 0 : 1;
   failures += check_argmax(q, DType::f32, 64, 4000) ? 0 : 1;
+
+  // serving: embedding + kv-cache scatter/gather (exact copy).
+  failures += check_serving<float>(q, DType::f32) ? 0 : 1;
+  failures += check_serving<bf16_t>(q, DType::bf16) ? 0 : 1;
 
   const std::size_t rows = 64, dim = 1024;
   for (const Variant v : variants) {

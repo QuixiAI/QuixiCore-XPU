@@ -448,6 +448,18 @@ strides, unaligned scale reads, scalar per-element decode). Correctness-first;
 the optimization is a one-time repack from GGUF layout to a GPU-friendly
 scale-planar + aligned-quant layout. GGUF k-quants decode natively on Intel.
 
+## 2026-07-07: FULL-MATRIX push begins (breadth-first). serving family opened
+
+Executing the approved full-matrix plan: breadth-first (one op per remaining
+family to `partial`) then depth to full Metal parity (~230 ops). torch-xpu now
+in .venv (torch 2.14 dev, 4 B60s) for the Python parity harness (Track C).
+
+### serving — embedding_lookup + kv_cache_scatter + kv_cache_gather (native)
+Indexed row copies, dtype-agnostic by element width, 2D coalesced launch.
+Correctness: exact match (embedding gather; scatter->gather round-trip),
+f32 + bf16, 0 mismatches. Baseline: embedding bf16 8192x4096 = 258 GB/s
+(scattered table gather, below streaming roofline as expected). Native-only.
+
 ## First Kernel Plan
 
 Status: in progress — 7 families now have implementations: activations (gelu,

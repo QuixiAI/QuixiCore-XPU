@@ -115,6 +115,28 @@ void argmax(sycl::queue& q, const void* logits, int* out, std::size_t rows,
             bool blocking = true);
 
 // ----------------------------------------------------------------------------
+// serving (kv cache, embedding)
+// ----------------------------------------------------------------------------
+
+// Embedding lookup: out[t, :] = table[ids[t], :]. `table` is [vocab, dim] dtype
+// `dt`, `ids` is [n] int32, `out` is [n, dim] dtype `dt`.
+void embedding_lookup(sycl::queue& q, const void* table, const int* ids,
+                      void* out, std::size_t n, std::size_t dim, DType dt,
+                      Variant variant = Variant::sycl, bool blocking = true);
+
+// KV-cache scatter: cache[slots[t], :] = src[t, :]. `cache` is [max_slots, row],
+// `src` is [n, row], `slots` is [n] int32 (a negative slot skips the row).
+// `row` = n_heads * head_dim (or any contiguous row width), dtype `dt`.
+void kv_cache_scatter(sycl::queue& q, void* cache, const void* src,
+                      const int* slots, std::size_t n, std::size_t row, DType dt,
+                      Variant variant = Variant::sycl, bool blocking = true);
+
+// KV-cache gather: out[i, :] = cache[idx[i], :]. Inverse of scatter.
+void kv_cache_gather(sycl::queue& q, const void* cache, const int* idx,
+                     void* out, std::size_t n, std::size_t row, DType dt,
+                     Variant variant = Variant::sycl, bool blocking = true);
+
+// ----------------------------------------------------------------------------
 // matmul
 // ----------------------------------------------------------------------------
 

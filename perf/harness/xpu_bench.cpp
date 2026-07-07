@@ -48,6 +48,7 @@
 #include "quantization/qgemm/qgemm_kernel.hpp"
 #include "quantization/qgemv/qgemv_kernel.hpp"
 #include "sampling/argmax/argmax_kernel.hpp"
+#include "serving/serving_kernel.hpp"
 
 namespace {
 
@@ -310,6 +311,30 @@ int main(int argc, char** argv) {
               << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>()
               << "\"}" << std::endl;
     sycl::free(w, q); sycl::free(bs, q); sycl::free(xx, q); sycl::free(yy, q);
+    return 0;
+  }
+
+  if (kernel == "embedding") {
+    const std::size_t vocab = 128000, ntok = rows;
+    void* table = sycl::malloc_device(vocab * dim * elem, q);
+    int* ids = sycl::malloc_device<int>(ntok, q);
+    void* out = sycl::malloc_device(ntok * dim * elem, q);
+    q.memset(table, 0, vocab * dim * elem).wait();
+    q.memset(ids, 0, ntok * sizeof(int)).wait();
+    auto once = [&] { return kernels::embedding_lookup_sycl(q, table, ids, out, ntok, dim, dt); };
+    for (int i = 0; i < warmup; ++i) once().wait();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) { sycl::event e = once(); e.wait(); s.push_back(event_ms(e)); }
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    const double bytes = 2.0 * static_cast<double>(ntok) * static_cast<double>(dim) * elem;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"embedding\",\"variant\":\"sycl\",\"dtype\":\""
+              << dtype_name(dt) << "\",\"rows\":" << ntok << ",\"dim\":" << dim
+              << ",\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"gbps\":" << (bytes / (med * 1e-3) / 1e9)
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>()
+              << "\"}" << std::endl;
+    sycl::free(table, q); sycl::free(ids, q); sycl::free(out, q);
     return 0;
   }
 

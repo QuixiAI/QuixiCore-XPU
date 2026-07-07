@@ -47,8 +47,9 @@ families:
     paths:
       - kernels/sampling
   serving:
-    status: planned
-    paths: []
+    status: partial
+    paths:
+      - kernels/serving
   optimizers:
     status: partial
     paths:
@@ -193,6 +194,30 @@ operations:
     note: Correct on B60 (e4m3/e5m2) but not hardware-accelerated this generation.
     variants:
       - {name: xpu_onednn, status: experimental, path: kernels/quantization/fp8_gemm/variants/xpu_onednn}
+  embedding_lookup:
+    family: serving
+    status: implemented
+    path: kernels/serving
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/serving/variants/xpu_sycl}
+  kv_cache_scatter:
+    family: serving
+    status: implemented
+    path: kernels/serving
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/serving/variants/xpu_sycl}
+  kv_cache_gather:
+    family: serving
+    status: implemented
+    path: kernels/serving
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/serving/variants/xpu_sycl}
   rope:
     family: attention
     status: implemented
