@@ -126,6 +126,21 @@ void dense_gemm(sycl::queue& q, const void* a, const void* b, void* c,
                 Variant variant = Variant::best, bool blocking = true);
 
 // ----------------------------------------------------------------------------
+// quantization
+// ----------------------------------------------------------------------------
+
+// int4 group-quantized GEMV (batch-1 decode), Marlin/Metal-style dequant on the
+// fly. Weight W is [N, K] symmetric signed int4 packed 2-per-byte along K (low
+// nibble = even k); `scales` is [N, K/group] fp16 (half); activation `x` is [K]
+// and output `y` is [N], both of dtype `act_dt`. Accumulates in fp32:
+//   y[n] = sum_k (int4(W[n,k]) * scales[n, k/group]) * x[k]
+// K must be even and a multiple of `group`.
+void qgemv_int4(sycl::queue& q, const void* w_packed, const void* scales,
+                const void* x, void* y, std::size_t N, std::size_t K,
+                std::size_t group, DType act_dt, Variant variant = Variant::sycl,
+                bool blocking = true);
+
+// ----------------------------------------------------------------------------
 // norms
 // ----------------------------------------------------------------------------
 

@@ -33,6 +33,12 @@ formats:
   awq:
     status: planned
     note: Activation-aware weight quant (int4 weights + scales); a method, fully portable.
+  int4_group:
+    status: experimental
+    note: >-
+      Symmetric signed int4, packed 2/byte, per-group fp16 scales (AWQ/GPTQ-style
+      groupwise). First decode landed as quantization/qgemv (int4 GEMV that beats
+      fp16 GEMV on B60). Proof that groupwise int4 runs natively on Intel GPU.
   int8:
     status: planned
     note: w8a8 / azp zero-point; native Intel XMX/DPAS int8.

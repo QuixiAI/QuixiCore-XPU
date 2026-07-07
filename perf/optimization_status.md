@@ -303,12 +303,43 @@ argmax f32 390 GB/s (near roofline); rope bf16 62 GB/s. rope is
 transcendental-bound (sin/cos/pow per element) — the clear optimization is
 precomputed per-position cos/sin (or a freq table), deferred.
 
+## 2026-07-06: quantization/qgemv int4 — Marlin/Metal-guided dequant GEMV opens the family
+
+Status: landed (native SYCL). Opens the quantization family with the flagship
+batch-1 dequant-on-the-fly GEMV; three-step optimization following the Marlin
+(wide loads + in-register decode + fused scale) and Metal (one-simdgroup-per-row,
+branchless nibble decode) playbooks.
+
+Format: int4 symmetric signed, packed 2/byte along K, per-group fp16 scales
+(group 128). Decode: y[n] = sum_k int4(W[n,k]) * scale[n,k/group] * x[k], fp32
+accum. Correctness (act f32 + bf16, N=128 K=4096) vs an fp64 reference: pass.
+
+The truism under test: "4-bit weights are 4x smaller so a dequant GEMV beats an
+fp16 GEMV." FALSE for a naive decoder, TRUE once optimized. Measured
+(8192x8192, bf16 act, weight-bytes bandwidth; fp16 GEMV = oneDNN M=1 baseline,
+0.303 ms, ~443 GB/s near roofline):
+
+1. naive 1-byte-per-thread, work-group-per-row: 0.549 ms, 61 GB/s -> LOSES to
+   fp16 (narrow 1-byte transactions; not weight-memory-bound).
+2. + 16-byte wide loads (sycl::vec<uint32,4> = 32 int4/thread), decode in
+   registers, one scale per 32-k chunk: 0.314 ms, 107 GB/s -> ties fp16.
+3. + one 32-wide subgroup per row, 8 rows/work-group, subgroup reduce (no SLM
+   barrier): 0.257 ms, 130 GB/s -> BEATS fp16 1.18x. KEPT.
+
+Decision: ship step 3. Honest limit: 130 GB/s is well under the ~456 roofline,
+so this is not yet weight-memory-bound -- remaining headroom is SLM activation
+staging and cutting decode ALU / int->float conversions (Metal reached 2-3x over
+fp16; we are at 1.18x). Flagged as the next qgemv optimization. This is also the
+first proof point for the "all quant formats work on XPU" thesis: int4 group
+decode runs natively and competitively, no NVIDIA hardware required.
+
 ## First Kernel Plan
 
-Status: in progress — 6 families now have implementations: activations (gelu,
+Status: in progress — 7 families now have implementations: activations (gelu,
 gelu_backward, silu, glu, softmax), norms (rms_norm, layernorm), matmul
-(dense_gemm), attention (rope), optimizers (adamw), sampling (argmax). Next
-matrix growth: quantization surface (decode + qgemv/qgemm) on XMX/DPAS.
+(dense_gemm), attention (rope), optimizers (adamw), sampling (argmax),
+quantization (qgemv int4). Next: quant GEMM (int8 w8a8 via oneDNN + native),
+more formats (fp8/mxfp4/GGUF decode), attention depth.
 
 Priority order:
 

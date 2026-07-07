@@ -61,6 +61,7 @@ DEFAULT_KERNEL_BENCH = [
     {"kernel": "rope", "variant": "sycl", "dtype": "bf16", "rows": 65536, "dim": 128},
     {"kernel": "adamw", "variant": "sycl", "dtype": "f32", "n": 16777216},
     {"kernel": "argmax", "variant": "sycl", "dtype": "f32", "rows": 4096, "dim": 131072},
+    {"kernel": "qgemv_int4", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 8192},
 ]
 
 

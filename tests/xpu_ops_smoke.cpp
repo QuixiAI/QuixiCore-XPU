@@ -233,6 +233,55 @@ bool check_softmax(sycl::queue& q, DType dt, Variant variant, std::size_t rows,
 }
 
 template <typename T>
+bool check_qgemv_int4(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K,
+                      std::size_t group) {
+  const std::size_t bpr = K / 2;         // bytes per row
+  const std::size_t gpr = K / group;     // groups per row
+  std::uint8_t* w = sycl::malloc_shared<std::uint8_t>(N * bpr, q);
+  half_t* scales = sycl::malloc_shared<half_t>(N * gpr, q);
+  T* x = sycl::malloc_shared<T>(K, q);
+  T* y = sycl::malloc_shared<T>(N, q);
+
+  // Deterministic int4 weights (signed [-8,7]) packed 2/byte, per-group scales.
+  auto qval = [](std::size_t i) {
+    int v = static_cast<int>(std::floor(sample(i) * 4.0f));  // ~[-8,7]
+    return std::max(-8, std::min(7, v));
+  };
+  std::vector<int> wint(N * K);
+  for (std::size_t n = 0; n < N; ++n)
+    for (std::size_t b = 0; b < bpr; ++b) {
+      const int lo = qval(n * K + 2 * b);
+      const int hi = qval(n * K + 2 * b + 1);
+      wint[n * K + 2 * b] = lo;
+      wint[n * K + 2 * b + 1] = hi;
+      w[n * bpr + b] = static_cast<std::uint8_t>((lo & 0xF) | ((hi & 0xF) << 4));
+    }
+  for (std::size_t i = 0; i < N * gpr; ++i) scales[i] = static_cast<half_t>(0.02f + 0.01f * std::abs(sample(i + 9)));
+  for (std::size_t k = 0; k < K; ++k) x[k] = static_cast<T>(sample(k + 13));
+
+  ops::qgemv_int4(q, w, scales, x, y, N, K, group, act_dt, Variant::sycl, true);
+
+  double worst = 0.0, max_abs = 0.0;
+  const Tol base = tol_for(act_dt);
+  const double rtol = base.rtol * std::sqrt(static_cast<double>(K));
+  for (std::size_t n = 0; n < N; ++n) {
+    double acc = 0.0;
+    for (std::size_t k = 0; k < K; ++k)
+      acc += static_cast<double>(wint[n * K + k]) *
+             static_cast<double>(scales[n * gpr + k / group]) * static_cast<double>(x[k]);
+    const double ref = static_cast<double>(static_cast<T>(acc));
+    const double err = std::abs(static_cast<double>(y[n]) - ref);
+    max_abs = std::max(max_abs, err);
+    worst = std::max(worst, err - (base.atol + rtol * std::abs(ref)));
+  }
+  sycl::free(w, q); sycl::free(scales, q); sycl::free(x, q); sycl::free(y, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  qgemv_int4 act=" << dtype_name(act_dt) << " (N=" << N << " K=" << K
+            << " g=" << group << ") max_abs=" << max_abs << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+template <typename T>
 bool check_rope(sycl::queue& q, DType dt, std::size_t tokens, std::size_t heads,
                 std::size_t hd) {
   const std::size_t n = tokens * heads * hd;
@@ -480,6 +529,10 @@ int main() {
     failures += check_gemm<float>(q, DType::f32, v, 128, 96, 160) ? 0 : 1;
     failures += check_gemm<bf16_t>(q, DType::bf16, v, 128, 96, 160) ? 0 : 1;
   }
+
+  // int4 quantized GEMV (native).
+  failures += check_qgemv_int4<float>(q, DType::f32, 128, 4096, 128) ? 0 : 1;
+  failures += check_qgemv_int4<bf16_t>(q, DType::bf16, 128, 4096, 128) ? 0 : 1;
 
   // rope / adamw / argmax (native only).
   failures += check_rope<float>(q, DType::f32, 32, 8, 64) ? 0 : 1;

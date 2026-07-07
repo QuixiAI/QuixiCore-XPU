@@ -41,6 +41,7 @@
 #include "matmul/dense_gemm/dense_gemm_kernel.hpp"
 #include "norms/norms_kernel.hpp"
 #include "optimizers/adamw/adamw_kernel.hpp"
+#include "quantization/qgemv/qgemv_kernel.hpp"
 #include "sampling/argmax/argmax_kernel.hpp"
 
 namespace {
@@ -216,6 +217,28 @@ int main(int argc, char** argv) {
     const double med = time_median([&] { return kernels::argmax_sycl(q, lg, o, rows, dim, dt); });
     emit(med, static_cast<double>(rows * dim) * elem / (med * 1e-3) / 1e9);
     sycl::free(lg, q); sycl::free(o, q);
+    return 0;
+  }
+  if (kernel == "qgemv_int4") {
+    // N = rows (output dim), K = dim (contraction), group fixed 128.
+    const std::size_t Nn = rows, Kk = dim, group = 128;
+    void* w = sycl::malloc_device(Nn * (Kk / 2), q);        // int4 packed
+    void* sc = sycl::malloc_device(Nn * (Kk / group) * 2, q);  // fp16 scales
+    void* xx = sycl::malloc_device(Kk * elem, q);
+    void* yy = sycl::malloc_device(Nn * elem, q);
+    q.memset(w, 0, Nn * (Kk / 2)).wait();
+    q.memset(sc, 0, Nn * (Kk / group) * 2).wait();
+    q.memset(xx, 0, Kk * elem).wait();
+    const double med = time_median([&] { return kernels::qgemv_int4_sycl(q, w, sc, xx, yy, Nn, Kk, group, dt); });
+    // Weight-bytes bandwidth (the dominant term at batch 1): int4 => N*K/2 bytes.
+    const double wbytes = static_cast<double>(Nn) * static_cast<double>(Kk) / 2.0;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"qgemv_int4\",\"variant\":\"sycl\",\"dtype\":\""
+              << dtype_name(dt) << "\",\"N\":" << Nn << ",\"K\":" << Kk
+              << ",\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"weight_gbps\":" << (wbytes / (med * 1e-3) / 1e9)
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>()
+              << "\"}" << std::endl;
+    sycl::free(w, q); sycl::free(sc, q); sycl::free(xx, q); sycl::free(yy, q);
     return 0;
   }
 

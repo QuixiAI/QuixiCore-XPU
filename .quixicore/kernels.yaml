@@ -36,8 +36,9 @@ families:
     paths:
       - kernels/matmul
   quantization:
-    status: planned
-    paths: []
+    status: partial
+    paths:
+      - kernels/quantization
   moe:
     status: planned
     paths: []
@@ -135,6 +136,15 @@ operations:
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/matmul/dense_gemm/variants/xpu_sycl}
       - {name: xpu_onednn, status: implemented, path: kernels/matmul/dense_gemm/variants/xpu_onednn}
+  qgemv_int4:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/qgemv
+    dtypes: [f32, f16, bf16]
+    quant_format: int4_group
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/quantization/qgemv/variants/xpu_sycl}
   rope:
     family: attention
     status: implemented
