@@ -1,386 +1,227 @@
 # QuixiCore XPU Performance Handbook
 
-This is the operating guide for baselining and optimizing QuixiCore XPU kernels.
-It follows the discipline used in QuixiCore Metal and QuixiCore CUDA, but the
-hardware assumptions are Intel GPU, oneAPI, SYCL, and Level Zero specific.
+The operating guide for baselining and optimizing every kernel under `kernels/`
+on Intel GPUs (oneAPI / SYCL / Level Zero, Arc Pro B60 / Battlemage). It is not a
+bag of tricks. For each kernel we run one disciplined loop: name the bottleneck,
+measure a clean baseline on the real device, run controlled A/Bs, keep only
+verified wins, and record enough that the next pass starts from evidence.
 
-The goal is not to collect tricks. For each kernel, find references, state a
-bottleneck hypothesis, measure a clean baseline, run controlled experiments,
-keep only verified wins, and record enough detail that the next pass starts from
-evidence instead of memory.
+Two companion files:
 
-The running notebook is `perf/optimization_status.md`. Baseline snapshots live
-in `perf/baseline_status.md`. Raw results live under `perf/results/`.
+- `perf/optimization_status.md` — the running log. One dated entry per kernel /
+  pass with baseline → after numbers and an honest keep/reject verdict.
+- `perf/baseline_status.md` — the environment snapshot and the current
+  per-family roofline table.
 
-## Principles
+Raw per-run JSON lands under `perf/results/` (git-ignored; machine-specific).
 
-Correctness comes before performance. A change is not a win until it passes the
-kernel's correctness tests, improves the target metric on realistic shapes, and
-does not regress supported edge shapes or numeric tolerances.
+## The prime directive: smash truisms with evidence
 
-Prefer experiments that attack a named bottleneck:
+This is the rule that overrides habit. **Never accept a hardware or library
+"truism" without an on-B60 A/B.** In this backend the same assumption flips by
+hardware, by dtype, and by shape. Things that turned out false when measured:
 
-- Memory-bound: reduce bytes moved, improve coalescing, improve cache reuse,
-  avoid extra global-memory passes, or use narrower formats.
-- Compute-bound: raise arithmetic intensity, feed XMX/DPAS paths effectively,
-  reduce scalar side work, and fuse epilogues.
-- Latency-bound: grow resident work, reduce serial loops, batch tiny dispatches,
-  and avoid unnecessary host/device synchronization.
-- Occupancy-bound: tune work-group size, subgroup count, register pressure,
-  local-memory use, and grid size so the GPU has enough resident work.
-- Synchronization-bound: reduce barriers, local-memory traffic, and cross-work-
-  group coordination; prefer subgroup reductions when they fit the operation.
-- Launch-bound: fuse small operations or route them through a framework path if
-  dispatch overhead dominates.
+- *"oneDNN scale/shift must be f32."* False — the explicit
+  `scale_shift_data_type` overload accepts bf16/f16.
+- *"the vendor library is always faster."* False per-dtype: native SYCL beats
+  oneDNN 1.58x on f32 layernorm; oneDNN beats native 1.70x on bf16 layernorm.
+  There is no universal winner — so we ship **both** variants and route
+  `Variant::best` per `(op, dtype)` from measured data.
+- *"argmax is reduction-bound."* It was **serial-tail-bound** — the parallel
+  scan was fine; one thread's 256-iteration final reduction dominated (fix: SLM
+  tree reduction, 80 → 447 GB/s).
+- *"rope is transcendental-bound."* Substantially **integer div/mod-bound** from
+  decomposing a flat id; a 3D `nd_range` beat `pow→exp2` + `sincos` combined.
+- *"these quant formats are NVIDIA/CPU-only"* (mxfp4/nvfp4/fp8/GGUF k+i-quants).
+  False — they are data encodings; all decode natively on Intel.
 
-## XPU Baseline Assumptions
+Name the assumed bottleneck, then confirm it with numbers/profiling before
+optimizing — it is often not what you assumed. Fix the ruler first (profiling
+events, warmup, adaptive batching), then re-verify a gap on the corrected
+harness. Copying NVIDIA/Apple machinery blindly is a known trap: there is no
+`cp.async`/TMA analogue on Xe2, but the B60 *has* XMX/DPAS — use `joint_matrix`
+where Metal had to emulate.
 
-Do not blindly port CUDA or Metal machinery.
+## The B60 roofline (what "good" means)
 
-CUDA concepts such as `cp.async`, TMA, WGMMA, warp-specialized producer/consumer
-pipelines, CUDA events, and Nsight counters have no one-to-one meaning in SYCL.
-Metal concepts such as simdgroup matrix operations, threadgroup memory behavior,
-and command-buffer timing are useful comparisons but not XPU design rules.
+Single Arc Pro B60 (Battlemage G21, 160 XVEs, subgroup sizes 16/32):
 
-XPU kernels should be written in terms of Intel-native mechanisms:
+- **~456 GB/s** memory bandwidth — the ceiling for memory-bound kernels
+  (elementwise, norms, softmax, sampling, quant-GEMV weight streaming).
+- **~90 TFLOP/s** bf16 GEMM (via oneDNN XMX).
+- **182 TOPS** int8 XMX (w8a8).
 
-- SYCL queues, events, USM or buffers, subgroups, and local memory.
-- oneAPI DPC++ compiler behavior and generated device code.
-- Level Zero runtime/profiling where direct timing, command-list control, or
-  device inspection is needed.
-- Intel XMX/DPAS or joint-matrix paths where the target hardware and compiler
-  expose them.
-- XeTLA and oneDNN examples as implementation references, not source to vendor.
-- Triton XPU backend as a compiler/runtime reference for mapping high-level
-  tensor kernels to Intel GPUs.
+A memory-bound kernel is "done" near 85–90% of 456 GB/s. Our vectorized
+elementwise/row kernels sit at 82–87%; that is the bar. Report every kernel as a
+percentage of the relevant ceiling, not as a raw number.
 
-When a backend-local layout is needed for performance, preserve QuixiCore
-contract names and byte layouts at public API boundaries.
+## Measurement harness
 
-## Repo Facts To Preserve
+Device timing is done in C++ with **SYCL queue-profiling events** (command
+start→end timestamps), which measure pure device execution and are immune to the
+host submit/sync floor that produced false regressions in the Metal harness's
+early wall-clock timing.
 
-Current scaffold:
-
-- Public headers: `include/quixicore/xpu/`.
-- Native source: `src/`.
-- Examples: `examples/`.
-- Tests: `tests/`.
-- Performance docs and harnesses: `perf/`.
-- Local reference mirrors: `.reference/` (git-ignored).
-- Backend metadata: `.quixicore/backend.yaml`.
-
-Build and smoke-test commands:
+One-off A/B (the common case during an optimization pass):
 
 ```bash
-cmake --preset dev
-cmake --build --preset dev
-ctest --preset dev
+source /opt/intel/oneapi/setvars.sh
+cmake --build --preset sycl --target quixicore_xpu_bench
+./build-sycl/quixicore_xpu_bench --kernel argmax --dtype bf16 \
+    --rows 8192 --dim 8192 --iters 50 --warmup 15
+# -> one JSON line: {"kernel":...,"variant":...,"median_ms":...,"gbps":...,"device":...}
 ```
 
-SYCL/oneAPI probe:
+`--variant {sycl,vendor,best}` selects the implementation; elementwise kernels
+take `--n`, row/quant kernels `--rows/--dim`, GEMM `--M/--N/--K`, GGUF
+`--approx <format>`. Add a new op by extending the early-return block in
+`perf/harness/xpu_bench.cpp` with its buffers + `emit(median, metric)`.
+
+Tracked sweeps (dated, logged) go through the orchestrator, which runs the C++
+bench once per entry in a config and writes `perf/results/<date>/<run-id>/`:
 
 ```bash
-cmake --preset sycl
-cmake --build --preset sycl
-ctest --preset sycl
+python3 perf/bench_kernels.py --phase kernels --preset sycl   # reads perf/configs/*.yaml
 ```
 
-The `sycl` preset expects `icpx` on `PATH`.
-
-## Reference Search Protocol
-
-For each kernel, inspect references before designing the XPU implementation.
-Record exact files in `perf/optimization_status.md`.
-
-Reference roots currently present:
-
-- `.reference/intel-xpu-backend-for-triton`
-- `.reference/xetla`
-- `.reference/oneDNN`
-- `.reference/tiny-dpcpp-nn`
-
-Useful search patterns:
-
-```bash
-rg -n "sub_group|joint_matrix|dpas|local_accessor|nd_range|event" .reference
-rg -n "layernorm|rms_norm|softmax|gemm|attention|quant" .reference
-rg -n "level_zero|zeEvent|profiling|queue" .reference
-```
-
-Classify reference ideas into:
-
-- Portable algorithm idea: worth considering.
-- Intel-specific mechanism: translate if it matches the target XPU generation.
-- Compiler/runtime lesson: useful for build flags, profiling, and scheduling.
-- Benchmark shape or oracle idea: usually worth adopting.
-
-Do not import implementation code from references into this repository unless a
-future license and provenance review explicitly allows it.
-
-## Measurement Harness Requirements
-
-Every benchmark result should include:
-
-- Git commit or working-tree label.
-- QuixiCore contract version.
-- oneAPI compiler version and flags.
-- SYCL backend/runtime and Level Zero driver version where available.
-- Intel GPU model, tile/slice information where available, memory size, and
-  driver/runtime versions.
-- Kernel family, operation, public entry point, dtype, quant format, and shape.
-- Warmup count, measured iteration count, median, p20/p80 or min/max, and
-  coefficient of variation.
-- Correctness tolerance and observed max absolute/relative error.
-- Derived throughput: GB/s, GFLOP/s, TOP/s, tokens/s, or elements/s.
-- Raw output path under `perf/results/`.
-
-The scaffold harness is:
-
-```bash
-python3 perf/bench_kernels.py --phase all --preset dev
-python3 perf/bench_kernels.py --phase all --preset sycl
-```
-
-As kernels are added, extend the harness with a registry of runnable cases. Each
-case should self-skip with a reason when a compiler, device, format, or runtime
-feature is unavailable.
-
-## Timing Rules
-
-Use native device timing for device work.
-
-- For SYCL, enable queue profiling and read event start/end timestamps.
-- For Level Zero, use events or metric tools appropriate to the experiment.
-- Synchronize outside the measured region unless the cost being studied includes
-  host synchronization.
-- Warm up first to avoid JIT, module load, cache, and power-state artifacts.
-- Do not allocate, initialize, or copy inputs in the measured region unless that
-  is the metric under study.
-- For tiny kernels, batch repeated launches per sample and divide, then record
-  the batch size.
-- Re-run surprising results on an idle machine before trusting an A/B.
-
-Derived metrics:
-
-```text
-GEMM FLOPs          = 2 * M * N * K
-attention FLOPs     ~= 4 * B * H * N * N * D   (halve for causal)
-quant decode GB/s   = packed_weight_bytes_read / seconds / 1e9
-row-kernel GB/s     = conservative required reads+writes / seconds / 1e9
-```
-
-State when an estimate ignores cache reuse, repeated passes, metadata reads, or
-write allocation.
-
-## Shape Strategy
-
-Do not optimize only square toy shapes. For each family, cover:
-
-- Small edge shapes and non-power-of-two dimensions.
-- Tile-aligned fast-path shapes.
-- Tile-ragged shapes.
-- Real model shapes from Llama/Qwen/DeepSeek-style projections and attention.
-- Stress shapes: long context, large K/N, batch sweeps, and many experts.
-
-Starter shapes:
-
-- Norm/softmax/GELU: rows in `{4096, 16384, 65536}`, hidden in
-  `{64, 128, 256, 512, 768, 1024, 2048, 4096, 8192}`.
-- GEMM: square `{1024, 2048, 4096, 8192}` and LLM rectangles such as
-  `K=4096`, `N=11008`, `N=14336`.
-- Quant GEMV/GEMM: `M in {1, 2, 4, 8, 16, 32, 64, 128}`,
-  `N/K in {4096, 8192, 16384}`.
-- Attention: `D in {64, 128}`, context in `{512, 2048, 8192}`.
-- MoE: tokens in `{128, 1024, 4096}`, experts in `{8, 16, 64}`,
-  top-k in `{1, 2, 4}`.
-
-Record skipped shapes with the reason.
-
-## Per-Kernel Optimization Loop
-
-1. Inventory the kernel: entry points, dtypes, shape constraints, tests, and
-   benchmark coverage.
-2. Find references in `.reference/` and sibling backend docs.
-3. Establish correctness against a deterministic host reference.
-4. Measure the baseline against framework and naive decomposed baselines where
-   available.
-5. Classify the bottleneck with bytes, FLOPs, achieved throughput, variance, and
-   profiling counters.
-6. Define experiments before editing code. Change one meaningful factor at a
-   time.
-7. Execute focused tests first, then the same benchmark matrix.
-8. Decide with recorded numbers and rejected alternatives.
-9. Update `perf/optimization_status.md`.
-
-## Experiment Catalogue
-
-Use these as templates. Not every kernel needs every experiment.
-
-### Launch Geometry
-
-- Sweep work-group size and subgroup count.
-- Change rows/items per work-group for row kernels.
-- For GEMM/attention, sweep output tile sizes and K/sequence block sizes.
-- Split large reductions across more work-groups only when merge overhead is
-  measured.
-- Watch tail effects when grid size does not fill the device evenly.
-
-### Memory And Layout
-
-- Verify adjacent lanes read adjacent addresses on hot paths.
-- Compare USM and buffer paths only when the API contract allows either.
-- Test local-memory staging against direct global loads.
-- Use vectorized loads/stores where alignment and layout allow.
-- Keep scales, metadata, and lookup tables in layouts that favor subgroup access
-  patterns.
-
-### XMX / Matrix Paths
-
-- Use oneDNN, XeTLA, and Triton XPU as references for matrix instruction use.
-- Compare joint-matrix or XeTLA paths against scalar/vector SYCL kernels.
-- Separate alignment-specialized fast paths from generic edge paths.
-- Record compiler flags and target architecture whenever a matrix path is used.
-
-### Reductions And Numerics
-
-- Prefer subgroup reductions before work-group reductions.
-- Keep fp32 accumulation for norms, softmax, attention, and long K reductions
-  unless a lower-precision variant passes tolerance.
-- Use deterministic reduction orders where the contract needs determinism.
-- For exact integer or packing kernels, exactness is part of the contract.
-
-### Fusion And Routing
-
-- Fuse epilogues such as bias, residual, scale, activation, or normalization
-  when an intermediate would otherwise round-trip through device memory.
-- Fuse dequantization with matmul or attention when the dequantized value is
-  used once.
-- Split a fused kernel when register pressure, branching, or lower occupancy
-  dominates saved memory traffic.
-- Find crossovers between custom kernels, oneDNN calls, Triton-generated code,
-  and framework primitives.
-
-### Branches And Scalar Side Work
-
-- Hoist dtype, causal, format, and dimension decisions out of inner loops through
-  templates, specialization constants, or separate entry points.
-- Precompute base offsets and use simple increments in hot loops.
-- Specialize common dimensions such as `D=64`, `D=128`, aligned K tiles, and
-  supported quant block sizes.
-- Measure decode-only or epilogue-only microkernels when scalar work may hide
-  the true bottleneck.
-
-## Kernel-Specific Starting Hypotheses
-
-Use these as first-pass ideas. Replace them with measured facts as the project
-progresses.
-
-### Row Kernels
-
-`rms_norm`, `layernorm`, `softmax`, `gelu`, and `rotary` should establish the
-first memory-bandwidth and subgroup-reduction baselines.
-
-Experiments: rows per work-group, vectorized loads, subgroup-only reductions for
-small hidden sizes, two-pass versus one-pass variance, reciprocal/sqrt
-placement, hidden-size specialization, and fusion with neighboring ops.
-
-### GEMM And Quant Matmul
-
-Large GEMM shapes should compare custom SYCL, oneDNN, XeTLA, Triton XPU, and
-framework routes. Quant kernels should win only when reduced bytes exceed the
-cost of dequantization and metadata handling.
-
-Experiments: tile size sweep, joint-matrix/XeTLA path selection, local-memory
-staging, dequant-direct-to-matrix versus materialize-then-matmul, split-K,
-library handoff thresholds, and epilogue fusion.
-
-### Attention And Serving
-
-Attention and decode kernels depend on Q/K/V memory traffic, softmax state,
-sequence tiling, routing thresholds, and launch overhead.
-
-Experiments: sequence block size, K/V staging versus direct loads, causal branch
-placement, GQA reuse layout, paged-cache block size, fp8-cache dequant-on-read,
-partition size per context length, and tiny-batch framework routing.
-
-## First Kernel Targets
-
-Start with deterministic row kernels before serving kernels:
-
-- `rms_norm` / `layernorm`: reduction plus pointwise write, good for subgroup
-  and memory-bandwidth calibration.
-- `softmax`: numerically sensitive row reduction, good for profiling
-  synchronization and exponent cost.
-- `gelu` / `glu`: pointwise/fused epilogue calibration.
-
-Only claim a kernel family complete after native implementation, correctness
-coverage, benchmark coverage, and contract status updates.
-
-## Decision Rules
-
-A change is a candidate winner when:
-
-- Focused correctness tests pass.
-- Median performance improves by at least 3% for low-risk local changes, or
-  8-10% for changes that add meaningful complexity.
-- Required correctness shapes do not regress.
-- Secondary performance shapes do not regress beyond an agreed tolerance.
-- There is a plausible explanation backed by bytes, FLOPs, profiling, or a clean
-  A/B.
-
-Reject or defer when:
-
-- The win is inside measurement noise.
-- The win appears only on toy shapes.
-- Complexity rises without a durable real-shape win.
-- The optimization depends on unavailable hardware or driver features.
-- The numeric contract changes.
-
-## Recording Format
-
-Each section in `perf/optimization_status.md` should contain:
-
-- Status: not started, baselining, experimenting, candidate, landed, deferred.
-- Current implementation and public route.
-- References inspected, with exact paths.
-- Correctness command and last result.
-- Baseline table.
-- Experiment table.
-- Decision log.
-- Open questions.
-
-Raw results should be stored in a stable location once a harness exists, for
-example:
-
-```text
-perf/results/YYYY-MM-DD/<kernel>/<run-id>.json
-perf/results/YYYY-MM-DD/<kernel>/<run-id>.txt
-```
-
-Do not commit large profiler traces. Record their local path, device, and summary.
-
-## Final Verification Before Landing A Win
-
-Before applying an optimization permanently:
-
-```bash
-python -m pytest <focused kernel test> -q
-python3 perf/bench_kernels.py --phase all --preset dev
-python3 perf/bench_kernels.py --phase all --preset sycl
-```
-
-For substrate changes under `include/quixicore/xpu/` or shared CMake changes,
-also run the broader CTest presets that the host supports. When publishing a
-verified improvement, include the performance table in the PR or commit notes.
-
-## External References
-
-- Intel oneAPI DPC++ documentation: compiler, SYCL, queues, profiling, USM,
-  subgroups, and matrix extensions.
-- Intel Level Zero documentation: device discovery, command queues/lists,
-  events, metrics, and memory.
-- Intel XeTLA: XMX-oriented tiling and GEMM examples.
-- oneDNN: production Intel GPU primitive implementations and benchmark shapes.
-- Intel XPU backend for Triton: lowering and runtime behavior for Triton kernels
-  on Intel GPUs.
-- tiny-dpcpp-nn: compact DPC++ examples and build conventions.
+The orchestrator sweeps the **full shipped kernel matrix** by default
+(`DEFAULT_KERNEL_BENCH` in `bench_kernels.py`, one broad run per kernel, no
+third-party dep). A `perf/configs/<family>_<op>.yaml` lists a richer `runs:`
+sweep (variant × dtype × shape) and *overrides* the default entry for the kernels
+it covers — so a run always covers everything, with detail where configured. Both
+co-equal variants are benched on the same hardware so the routing data is honest.
+Add a new op's buffers + `emit()` to `perf/harness/xpu_bench.cpp`, then a line to
+the default matrix (and optionally a config for a deeper sweep).
+
+## Correctness gates (a win is not a win until these pass)
+
+- **fp64 host oracle** — `ctest --preset sycl` runs `tests/xpu_ops_smoke.cpp`:
+  each op vs an fp64 reference rounded to storage dtype (+1 storage ULP for
+  transcendentals), across `{f32,f16,bf16}` × `{sycl,vendor}`. Quant/GGUF ops
+  check against an independent host replica of the reference decode.
+- **torch.xpu parity** — `bindings/pytorch/test_parity.py` compares `tk_xpu.<op>`
+  against PyTorch's own XPU kernels (a second, independent oracle).
+
+Exactness is part of the contract for packing/quantization kernels; numeric
+tolerance is per-dtype for the rest. A change that regresses either gate is not a
+candidate, no matter the speedup.
+
+## The optimization loop (per kernel)
+
+1. **Inventory** — entry points, dtypes, shape constraints, existing tests/bench.
+2. **Reference** — read the real sources (below), record exact paths in
+   `optimization_status.md`. Translate ideas; never import source.
+3. **Baseline** — measure on realistic shapes with the profiling-event harness;
+   compute % of the relevant ceiling. Compare native SYCL vs the vendor path.
+4. **Classify the bottleneck** — bytes moved vs FLOPs vs achieved throughput vs
+   variance. State the hypothesis in one sentence.
+5. **One factor at a time** — define the A/B before editing.
+6. **Test then bench** — `ctest --preset sycl` first, then the bench matrix.
+7. **Decide with numbers** — keep, reject, or defer; record the rejected
+   alternative too.
+8. **Log it** — append to `optimization_status.md`.
+
+## Reference sources (read, don't import)
+
+We keep no `.reference/` mirror; the sources live outside the repo and are
+consulted, not vendored:
+
+- **`~/llama.cpp`** (`ggml/src/ggml-common.h`, `ggml-quants.c`) — the
+  authoritative GGUF block layouts and dequant algorithms (q*_K, iq*_ grids,
+  `get_scale_min_k4`, `ksigns_iq2xs`). Ported to SYCL, validated vs an
+  independent host replica.
+- **`~/vllm/csrc/quantization/marlin`** — int4 group-GEMV structure and the
+  reminder that its `cp.async` pipeline has *no* Intel analogue.
+- **`../QuixiCore-Metal`** — the op contract (which ops exist, byte layouts) and
+  its anti-staging reversals. Approach only, never source.
+- **oneDNN / oneMKL examples + docs** — the vendor primitive APIs (matmul with
+  s4/u4/fp8/fp4 weights + grouped scales, `rms_norm` flag, SDPA via Graph API).
+- **Intel oneAPI DPC++ & Level Zero docs** — subgroups, `joint_matrix`, USM,
+  profiling.
+
+Classify each idea as portable-algorithm / Intel-specific-mechanism /
+compiler-runtime-lesson / benchmark-shape.
+
+## The proven technique catalogue (measured on B60)
+
+These are the moves that have actually paid off here. Reach for them by
+bottleneck; each has a live example in `optimization_status.md`.
+
+### Memory-bound (elementwise, norms, sampling, quant streaming)
+
+- **16-byte coalesced `sycl::vec` loads** (`kernels/common/vec_map.hpp`,
+  `vec_width<T>()` = 8 for 2-byte, 4 for 4-byte). This is *the* recurring win —
+  ~2x on bf16/f16 memory-bound kernels. Apply by default; `sycl::vec<bfloat16,8>`
+  works. Verify adjacent lanes hit adjacent addresses.
+- **Subgroup-per-row / work-group-per-row** for reductions (norms, softmax,
+  argmax, cross-entropy, categorical sampling): strided coalesced reads +
+  `reduce_over_group`, `[[sycl::reqd_sub_group_size(32)]]`. Never one work-item
+  per row when rows ≪ device width (categorical sampling: 52x from this alone).
+- **SLM tree reduction** over a serial final loop by one thread (argmax: 4.9x).
+- **`exclusive_scan_over_group`** for ordered prefix/CDF work (inverse-CDF
+  categorical selection over contiguous per-thread chunks).
+
+### Compute / scalar-side-work
+
+- **Kill integer div/mod in hot loops** — use a 2D/3D `nd_range` so indices come
+  from `get_global_id` dimensions instead of decomposing a flat id (rope: the
+  dominant factor).
+- **Cheaper transcendentals** — `pow(base, x)` → `exp2(x·kc)` with `kc` folded
+  host-side (one often-native op vs exp+log); `cos`+`sin` → one `sincos`.
+- **fp32 accumulation** for norms/softmax/attention/long-K reductions; cast once
+  at the end (casting an intermediate scale to bf16 over-quantizes).
+- Hoist dtype/causal/format/dimension branches out of inner loops via templates.
+
+### Matrix / quant
+
+- **XMX `joint_matrix`** for GEMM/attention where the shape and compiler expose
+  it (the native path's current gap vs the 90 TFLOP/s oneDNN route — task #9).
+- **oneDNN SYCL interop** —
+  `dnnl::sycl_interop::make_engine(q.get_device(), q.get_context())`, USM memory,
+  try/catch → native fallback. Ship it as the co-equal `vendor` variant.
+- **Dequant-direct-to-compute** — decode a quant block straight into the dot
+  product / matrix op; don't materialize a dense tensor when the value is used
+  once. All quant formats are in scope (see `CLAUDE.md` corollary).
+
+## Shape strategy
+
+Do not optimize only square toy shapes. Per family, cover small/non-pow-2 edges,
+tile-aligned fast paths, tile-ragged shapes, real LLM projections
+(`K=4096,N=11008/14336`), and stress shapes (long context, large K/N, batch
+sweeps, many experts). Starter sets:
+
+- Row/elementwise: rows `{4096,16384,65536}`, hidden `{64…8192}`.
+- GEMM: square `{1024,2048,4096,8192}` + LLM rectangles.
+- Quant GEMV/GEMM: `M∈{1,2,4,8,16,32,64,128}`, `N/K∈{4096,8192,16384}`.
+- Attention: `D∈{64,128}`, context `{512,2048,8192}`.
+- MoE: tokens `{128,1024,4096}`, experts `{8,16,64}`, top-k `{1,2,4}`.
+
+Record skipped shapes with the reason. Re-run surprising results on an idle
+machine before trusting an A/B.
+
+## Decision rules
+
+A change is a candidate winner when: focused correctness passes; median improves
+≥3% for low-risk local changes or ≥8–10% for changes that add real complexity;
+required shapes don't regress; and there is a bytes/FLOPs/profiling explanation.
+
+Reject or defer when: the win is inside noise; it appears only on toy shapes;
+complexity rises without a durable real-shape win; it depends on unavailable
+hardware/driver features; or it changes the numeric contract.
+
+## Recording format (`optimization_status.md`)
+
+Each entry: status (baselining / experimenting / candidate / **landed** /
+deferred); the current implementation + public route; references inspected (exact
+paths); the correctness command + last result; a baseline→after table with % of
+ceiling; the decision log (including rejected alternatives); open questions. Do
+not commit large profiler traces — record their local path, device, and summary.
+
+## The performance gate (hard rule)
+
+No backend kernel implementation, routing change, benchmark change, or
+performance claim is committed without at least one focused on-B60 optimization
+run recorded in `optimization_status.md`. If the XPU runtime is unavailable, do
+not commit a claimed win — report the blocker, or limit the change to
+docs/scaffolding with no performance claim. (See `AGENTS.md` and both `CLAUDE.md`
+files.)

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""QuixiCore XPU scaffold benchmark and build-health harness.
+"""QuixiCore XPU benchmark + build-health orchestrator.
 
-The sibling backends record build/test/perf output under perf/results/. This
-script starts the same pattern for XPU. Today it records scaffold health:
-configure, build, CTest, backend-info output, and optional SYCL device probe.
+Runs the native C++ bench (quixicore_xpu_bench, SYCL profiling-event timing) once
+per entry in perf/configs/*.yaml -- or the built-in DEFAULT_KERNEL_BENCH matrix
+when no config/PyYAML is present -- and logs a dated run under perf/results/.
+Also captures build-health phases (configure/build/test/info/probe). See
+perf/perf.md for the methodology and perf/optimization_status.md for the log.
 
 Examples:
 
-    python3 perf/bench_kernels.py --phase all --preset dev
-    python3 perf/bench_kernels.py --phase all --preset sycl
+    python3 perf/bench_kernels.py --phase kernels --preset sycl   # kernel sweep
+    python3 perf/bench_kernels.py --phase all     --preset sycl   # + build health
+    python3 perf/bench_kernels.py --phase all     --preset dev    # non-SYCL scaffold
 
 Results land in:
 
@@ -67,6 +70,21 @@ DEFAULT_KERNEL_BENCH = [
     {"kernel": "mxfp4_gemv", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 8192},
     {"kernel": "nvfp4_gemv", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 8192},
     {"kernel": "gguf_gemv", "variant": "sycl", "dtype": "bf16", "approx": "q4_0", "rows": 8192, "dim": 8192},
+    {"kernel": "gguf_gemv", "variant": "sycl", "dtype": "bf16", "approx": "q4_K", "rows": 8192, "dim": 8192},
+    {"kernel": "gguf_gemv", "variant": "sycl", "dtype": "bf16", "approx": "q6_K", "rows": 8192, "dim": 8192},
+    {"kernel": "gguf_gemv", "variant": "sycl", "dtype": "bf16", "approx": "iq4_nl", "rows": 8192, "dim": 8192},
+    {"kernel": "gguf_gemv", "variant": "sycl", "dtype": "bf16", "approx": "iq2_xxs", "rows": 8192, "dim": 8192},
+    {"kernel": "act_quant", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 8192},
+    {"kernel": "quantize_int4", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 8192},
+    {"kernel": "attention", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 8192},
+    {"kernel": "softmax", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 8192},
+    {"kernel": "cross_entropy", "variant": "sycl", "dtype": "bf16", "rows": 8192, "dim": 8192},
+    {"kernel": "hadamard", "variant": "sycl", "dtype": "f32", "rows": 8192, "dim": 4096},
+    {"kernel": "dropout", "variant": "sycl", "dtype": "bf16", "n": 16777216},
+    {"kernel": "sample_categorical", "variant": "sycl", "dtype": "f32", "rows": 64, "dim": 131072},
+    {"kernel": "moe_route", "variant": "sycl", "dtype": "f32", "rows": 8192, "dim": 256},
+    {"kernel": "selective_scan", "variant": "sycl", "dtype": "f32", "rows": 4096, "dim": 4096},
+    {"kernel": "linear_attn", "variant": "sycl", "dtype": "f32", "rows": 4096, "dim": 4096},
 ]
 
 
@@ -182,25 +200,27 @@ def command_plan(phase: str, preset: str, include_probe: bool) -> list[tuple[str
 
 
 def load_kernel_bench_matrix() -> list[dict]:
-    """Kernel bench configs from perf/configs/*.yaml if PyYAML is available,
-    else the built-in default matrix. Configs are optional; the default keeps
-    the harness working with no third-party dependency."""
+    """Full-coverage kernel matrix. DEFAULT_KERNEL_BENCH is the always-present
+    base (one broad run per shipped kernel, no third-party dep). A
+    perf/configs/<op>.yaml, when PyYAML is available, provides a richer sweep and
+    *overrides* the default entry for the kernels it covers. So a run always
+    covers the whole matrix, with detailed sweeps where a config exists."""
     configs_dir = REPO_ROOT / "perf" / "configs"
+    config_runs: list[dict] = []
     try:
         import yaml  # type: ignore
+        if configs_dir.is_dir():
+            for path in sorted(configs_dir.glob("*.yaml")):
+                try:
+                    doc = yaml.safe_load(path.read_text()) or {}
+                except Exception:
+                    continue
+                config_runs.extend(doc.get("runs", []))
     except Exception:
-        return DEFAULT_KERNEL_BENCH
-    if not configs_dir.is_dir():
-        return DEFAULT_KERNEL_BENCH
-    matrix: list[dict] = []
-    for path in sorted(configs_dir.glob("*.yaml")):
-        try:
-            doc = yaml.safe_load(path.read_text()) or {}
-        except Exception:
-            continue
-        for run in doc.get("runs", []):
-            matrix.append(run)
-    return matrix or DEFAULT_KERNEL_BENCH
+        pass  # PyYAML absent -> default matrix only
+    covered = {r["kernel"] for r in config_runs if "kernel" in r}
+    base = [r for r in DEFAULT_KERNEL_BENCH if r["kernel"] not in covered]
+    return config_runs + base
 
 
 def run_kernel_bench(preset: str, out_dir: Path, timeout: int) -> list[dict]:
