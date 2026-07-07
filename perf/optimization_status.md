@@ -460,6 +460,18 @@ Correctness: exact match (embedding gather; scatter->gather round-trip),
 f32 + bf16, 0 mismatches. Baseline: embedding bf16 8192x4096 = 258 GB/s
 (scattered table gather, below streaming roofline as expected). Native-only.
 
+## 2026-07-07: Track B depth begins — attention (flash-style SDPA)
+
+### attention — flash-style scaled dot-product attention (native)
+Online-softmax attention (running max/denom/weighted-acc per query), so the
+seq x seq score matrix is never materialized — the flash property. One work-item
+per (head, query) streams keys; supports MHA + GQA (q head -> kv head), causal
+(end-aligned) and cross-attention (seq_q != seq_k), d<=128. Correctness vs fp64:
+worst_excess 0 across f32 MHA-causal, bf16 GQA d=128, f32 cross-attn. Baseline
+32h x 2048 x 64 causal = 191 GFLOP/s. This is the correctness-first per-query
+shape; the SLM-tiled joint_matrix flash variant (XMX QK/PV, subgroup dot) is the
+throughput optimization, deferred. oneDNN-Graph SDPA is the vendor variant path.
+
 ### collectives — all_reduce_sum (native multi-GPU) — BREADTH PASS COMPLETE
 Real sum all-reduce across all 4 Arc Pro B60s. The B60s appear on 2 backends
 (Level Zero + OpenCL), so a single context can't span platforms — select the

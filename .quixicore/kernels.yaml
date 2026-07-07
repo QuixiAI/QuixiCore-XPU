@@ -272,6 +272,14 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/serving/variants/xpu_sycl}
+  attention:
+    family: attention
+    status: implemented
+    path: kernels/attention/attention
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/attention/attention/variants/xpu_sycl}
   rope:
     family: attention
     status: implemented

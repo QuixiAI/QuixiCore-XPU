@@ -353,6 +353,47 @@ bool check_collectives() {
   return ok;
 }
 
+template <typename T>
+bool check_attention(sycl::queue& q, DType dt, std::size_t nh, std::size_t nkv,
+                     std::size_t sq, std::size_t sk, std::size_t d, bool causal) {
+  T* Q = sycl::malloc_shared<T>(nh * sq * d, q);
+  T* K = sycl::malloc_shared<T>(nkv * sk * d, q);
+  T* V = sycl::malloc_shared<T>(nkv * sk * d, q);
+  T* O = sycl::malloc_shared<T>(nh * sq * d, q);
+  for (std::size_t i = 0; i < nh * sq * d; ++i) Q[i] = static_cast<T>(sample(i) * 0.5f);
+  for (std::size_t i = 0; i < nkv * sk * d; ++i) { K[i] = static_cast<T>(sample(i + 3) * 0.5f); V[i] = static_cast<T>(sample(i + 7)); }
+  ops::attention(q, Q, K, V, O, nh, nkv, sq, sk, d, causal, dt, Variant::sycl, true);
+
+  const double scale = 1.0 / std::sqrt((double)d);
+  const std::size_t gqa = nh / nkv, delta = sk - sq;
+  const Tol tol = tol_for(dt);
+  const double rtol = tol.rtol * 8 + 5e-3;
+  double worst = 0.0;
+  std::vector<double> sc(sk);
+  for (std::size_t h = 0; h < nh; ++h)
+    for (std::size_t qi = 0; qi < sq; ++qi) {
+      const std::size_t kvh = h / gqa;
+      const std::size_t last = causal ? (qi + delta) : (sk - 1);
+      double m = -1e30;
+      for (std::size_t ki = 0; ki <= last && ki < sk; ++ki) {
+        double s = 0; for (std::size_t j = 0; j < d; ++j) s += (double)Q[(h * sq + qi) * d + j] * (double)K[(kvh * sk + ki) * d + j];
+        sc[ki] = s * scale; m = std::max(m, sc[ki]);
+      }
+      double l = 0; for (std::size_t ki = 0; ki <= last && ki < sk; ++ki) { sc[ki] = std::exp(sc[ki] - m); l += sc[ki]; }
+      for (std::size_t j = 0; j < d; ++j) {
+        double acc = 0; for (std::size_t ki = 0; ki <= last && ki < sk; ++ki) acc += sc[ki] * (double)V[(kvh * sk + ki) * d + j];
+        const double ref = (double)static_cast<T>(acc / l);
+        worst = std::max(worst, std::abs((double)O[(h * sq + qi) * d + j] - ref) - (tol.atol + rtol * std::abs(ref)));
+      }
+    }
+  sycl::free(Q, q); sycl::free(K, q); sycl::free(V, q); sycl::free(O, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  attention dt=" << dtype_name(dt) << " (h=" << nh << "/" << nkv << " sq=" << sq
+            << " sk=" << sk << " d=" << d << (causal ? " causal" : "") << ") worst_excess=" << worst
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // Explicit mantissa bits per storage dtype (for the 1-ULP allowance below).
 int mantissa_bits(DType dt) {
   switch (dt) {
@@ -1076,6 +1117,11 @@ int main() {
   // serving: embedding + kv-cache scatter/gather (exact copy).
   failures += check_serving<float>(q, DType::f32) ? 0 : 1;
   failures += check_serving<bf16_t>(q, DType::bf16) ? 0 : 1;
+
+  // attention: flash-style SDPA (MHA + GQA, causal + non-causal).
+  failures += check_attention<float>(q, DType::f32, 8, 8, 128, 128, 64, true) ? 0 : 1;
+  failures += check_attention<bf16_t>(q, DType::bf16, 16, 4, 64, 64, 128, true) ? 0 : 1;   // GQA + d=128
+  failures += check_attention<float>(q, DType::f32, 4, 4, 96, 160, 64, false) ? 0 : 1;      // cross-attn
 
   // linear_attention: non-causal linear attention.
   failures += check_linear_attn<float>(q, DType::f32, 8, 256, 64) ? 0 : 1;

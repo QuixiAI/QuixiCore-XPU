@@ -93,6 +93,16 @@ void rope(sycl::queue& q, const void* x, void* out, std::size_t tokens,
           std::size_t pos0, DType dt, Variant variant = Variant::sycl,
           bool blocking = true);
 
+// Flash-style scaled dot-product attention (online softmax; no materialized
+// score matrix). Q is [n_heads, seq_q, d]; K, V are [n_kv_heads, seq_k, d]
+// (GQA: q head h uses kv head h / (n_heads/n_kv_heads)); O is [n_heads, seq_q,
+// d], dtype dt. scale = 1/sqrt(d). `causal` masks key positions k > q (aligned
+// at the sequence end when seq_q==seq_k). fp32 accumulation. head_dim d <= 128.
+void attention(sycl::queue& q, const void* Q, const void* K, const void* V,
+               void* O, std::size_t n_heads, std::size_t n_kv_heads,
+               std::size_t seq_q, std::size_t seq_k, std::size_t d, bool causal,
+               DType dt, Variant variant = Variant::sycl, bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // optimizers
 // ----------------------------------------------------------------------------

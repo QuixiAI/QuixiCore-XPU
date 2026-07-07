@@ -37,6 +37,7 @@
 #include "activations/glu/glu_kernel.hpp"
 #include "activations/silu/silu_kernel.hpp"
 #include "activations/softmax/softmax_kernel.hpp"
+#include "attention/attention/attention_kernel.hpp"
 #include "attention/rope/rope_kernel.hpp"
 #include "matmul/dense_gemm/dense_gemm_kernel.hpp"
 #include "norms/norms_kernel.hpp"
@@ -358,6 +359,22 @@ int main(int argc, char** argv) {
               << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>()
               << "\"}" << std::endl;
   };
+  if (kernel == "attention") {
+    const std::size_t nh = rows, seq = dim, d = 64;
+    void* Q = sycl::malloc_device(nh * seq * d * elem, q);
+    void* K = sycl::malloc_device(nh * seq * d * elem, q);
+    void* V = sycl::malloc_device(nh * seq * d * elem, q);
+    void* O = sycl::malloc_device(nh * seq * d * elem, q);
+    q.memset(Q, 0, nh * seq * d * elem).wait(); q.memset(K, 0, nh * seq * d * elem).wait(); q.memset(V, 0, nh * seq * d * elem).wait();
+    const double med = time_median([&] { return kernels::attention_sycl(q, Q, K, V, O, nh, nh, seq, seq, d, true, dt); });
+    const double gflop = 2.0 * nh * seq * seq * d /* causal ~half */ / (med * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"attention\",\"variant\":\"sycl\",\"dtype\":\""
+              << dtype_name(dt) << "\",\"heads\":" << nh << ",\"seq\":" << seq << ",\"d\":" << d
+              << ",\"causal\":true,\"iters\":" << iters << ",\"median_ms\":" << med << ",\"gflops\":" << gflop
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(Q, q); sycl::free(K, q); sycl::free(V, q); sycl::free(O, q);
+    return 0;
+  }
   if (kernel == "selective_scan") {
     const std::size_t nc = rows, seq = dim, st = 16;
     void* u = sycl::malloc_device(nc * seq * elem, q);
