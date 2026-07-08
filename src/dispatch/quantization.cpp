@@ -61,7 +61,15 @@ void act_quant_int8(sycl::queue& q, const void* x, signed char* q_out,
 void fp8_gemm(sycl::queue& q, const void* a_fp8, const void* b_fp8, void* c,
               std::size_t M, std::size_t N, std::size_t K, Fp8Kind kind,
               float scale, DType out_dt, Variant variant, bool blocking) {
-  (void)variant;  // vendor-only
+  // best-routing (measured on B60): at M=1 the op is weight-memory-bound and
+  // the native decode GEMV is the fast path by a wide margin; for M>1 the
+  // oneDNN matmul is the only GEMM route.
+  if (M == 1 && variant != Variant::vendor) {
+    sycl::event ev = kernels::fp8_gemv_sycl(q, a_fp8, b_fp8, c, N, K,
+                                            static_cast<int>(kind), scale, out_dt);
+    if (blocking) ev.wait();
+    return;
+  }
   (void)blocking;  // oneDNN path waits internally
 #if defined(QUIXICORE_XPU_HAS_ONEDNN)
   const bool ok = kernels::fp8_gemm_onednn(q, a_fp8, b_fp8, c, M, N, K,

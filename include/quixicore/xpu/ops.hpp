@@ -280,11 +280,12 @@ enum class Fp8Kind {
 
 // fp8 GEMM: C[M,N] = A_fp8[M,K] @ B_fp8[K,N], scaled by a single global `scale`.
 // A, B are opaque fp8 bytes (1 byte/elem) of kind `kind`; C is `out_dt`
-// (f32/f16/bf16). Vendor-only (oneDNN XMX fp8); if fp8 matmul is unsupported on
-// the device the call reports it via the runtime (no silent wrong result).
+// (f32/f16/bf16). best-routing (measured on B60): M=1 -> native SYCL decode
+// GEMV (weight-memory-bound fast path); M>1 -> oneDNN matmul. If the vendor
+// fp8 matmul is unsupported the call reports it (no silent wrong result).
 void fp8_gemm(sycl::queue& q, const void* a_fp8, const void* b_fp8, void* c,
               std::size_t M, std::size_t N, std::size_t K, Fp8Kind kind,
-              float scale, DType out_dt, Variant variant = Variant::vendor,
+              float scale, DType out_dt, Variant variant = Variant::best,
               bool blocking = true);
 
 // fp8 codecs: f32 -> fp8 (out is 1 byte/elem) and fp8 -> f32, both over `n`

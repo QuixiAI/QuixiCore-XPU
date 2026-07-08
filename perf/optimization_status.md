@@ -710,3 +710,52 @@ decode cost. Still ~37% of roofline, so decode ALU (nibble unpack + sign +
 fp-convert) remains the ceiling; further wins would need SIMD unpack or a LUT, or
 a repack to a coalescing-friendly layout. GGUF GEMVs (18-byte block stride fights
 16-byte coalescing) are the remaining decode target.
+
+## 2026-07-08: quantization/fp8_gemm — "fp8 is not accelerated on B60" mostly busted
+
+Status: landed (native SYCL M=1 GEMV, NEW + vendor oneDNN fixed). Supersedes the
+2026-07-06 verdict, which measured only the compute regime and only the shipped
+path (which was paying per-call setup).
+
+Correctness: `ctest --preset sycl` 3/3; fp8_gemm vendor + sycl checks all
+max_abs=0 (the native bit-cast decode is exact — e5m2 IS truncated f16, e4m3
+relocates into the f16 grid with a 2^8 factor, subnormals included) except
+vendor e5m2 at 4.8e-7. Ragged N=101 / K=203 and bf16-out paths exercised.
+
+Three findings, one per bottleneck actually measured:
+
+1. **M=1 (decode) was never memory-bound on the vendor route — it was the wrong
+   tool entirely.** oneDNN fp8 matmul at M=1 8192x8192: 4.09 ms = 15.7 GB/s =
+   3.4% of roofline. New native SYCL GEMV (thread-per-8-columns over B[K,N],
+   32 K-slabs + f32 partials, bit-cast pair-decode): **0.22-0.26 ms, 260-310
+   GB/s, 16-19x faster**. LLM shapes hold up: 14336x4096 224 GB/s, 4096x11008
+   221 GB/s. `Variant::best` now routes M=1 -> native GEMV.
+   - The decode-ALU lesson from pass #2 recurred and was fixed the same day it
+     was reintroduced: a scalar per-byte decode ran 116 GB/s with e5m2 36%
+     faster than e4m3 (= ALU-bound). Pair-decode in u32 registers (two f16
+     patterns per masked-shift pass, one vector convert) + folding the e4m3
+     2^8-per-operand factor into ONE reduce-kernel multiply (exact) closed the
+     kind gap (262 vs 278 GB/s) and got 2.3x over the scalar decoder.
+   - Rejected: kSlabs=64 (211 GB/s vs 262 at 32 — partial traffic + shorter
+     slabs lose to the occupancy gain).
+
+2. **Half the shipped vendor cost was per-call engine/primitive re-creation.**
+   Standalone A/B at 4096^3 e4m3: cached primitive 3.83 ms vs shipped 6.87 ms.
+   Fix: engine cache per sycl::context + primitive cache per (shape, kind,
+   out_dt, scale) in the oneDNN variant.
+
+3. **`fpmath_mode::f16` reroutes fp8 onto the XMX f16 path** (up-convert is
+   lossless for both kinds; accumulation stays f32): 44.8 vs 35.8 TFLOP/s at
+   4096^3 e4m3. bf16/tf32/any modes measured identical to f16.
+
+| shape / route | before | after | speedup |
+|---|---|---|---|
+| M=1 8192x8192 e4m3 (best) | 4.09 ms, 15.7 GB/s | 0.22 ms, 310 GB/s (68% roofline) | **18.9x** |
+| 4096^3 e4m3 (vendor) | 6.87 ms, 20.0 TFLOP/s | 3.10 ms, 44.4 TFLOP/s | **2.2x** |
+| 4096^3 e5m2 (vendor) | 18.9 TFLOP/s | **85.3 TFLOP/s** (95% of bf16 XMX peak) | **4.5x** |
+
+The honest updated claim: e5m2 GEMM now runs at effectively full XMX speed on
+B60; e4m3 GEMM at ~half (oneDNN's e4m3->f16 up-convert is the gap — theirs, not
+ours); fp8 decode-GEMV is a first-class native path at 50-68% of bandwidth
+roofline. Remaining headroom: the e4m3 vendor up-convert, and the GEMV's last
+~30% (per-call scratch malloc/free + partial traffic are candidates).

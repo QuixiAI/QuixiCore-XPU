@@ -8,6 +8,13 @@
 
 namespace quixicore::xpu::kernels {
 
+// fp8 GEMV (M=1 fp8_gemm): y[N] = x_fp8[K] @ B_fp8[K,N] * scale, native SYCL
+// decode (both fp8 kinds are bit-casts away from f16 — no vendor lib needed).
+// kind: 0 = e4m3, 1 = e5m2.
+sycl::event fp8_gemv_sycl(sycl::queue& q, const void* x_fp8, const void* b_fp8,
+                          void* y, std::size_t N, std::size_t K, int kind,
+                          float scale, DType out_dt);
+
 // kind: 0 = e4m3, 1 = e5m2.
 #if defined(QUIXICORE_XPU_HAS_ONEDNN)
 // fp8 GEMM via oneDNN. Returns false (and leaves an unspecified event) if the

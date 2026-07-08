@@ -79,7 +79,7 @@ oneDNN/oneMKL primitive exists), each with fp64-oracle correctness and a bench.
 | linear_attention | implemented | |
 | utils (hadamard/cross_entropy/dropout) | implemented | dropout optimized |
 | collectives (all_reduce) | implemented | native multi-GPU, capability-gated |
-| quantization | implemented | int4/int8(182 TOPS)/fp8/mxfp4/nvfp4 + **16 GGUF formats**; act_quant + quantize_int4 |
+| quantization | implemented | int4/int8(182 TOPS)/fp8(e5m2 85 TFLOP/s + native M=1 GEMV)/mxfp4/nvfp4 + **16 GGUF formats**; act_quant + quantize_int4 |
 | bindings (torch.xpu) | implemented | tk_xpu, parity-validated |
 
 ## Deferred (bigger projects, flagged not faked)

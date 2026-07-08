@@ -556,7 +556,8 @@ bool check_softmax(sycl::queue& q, DType dt, Variant variant, std::size_t rows,
 
 template <typename T>
 bool check_fp8_gemm(sycl::queue& q, DType out_dt, ops::Fp8Kind kind,
-                    const char* kname, std::size_t M, std::size_t N, std::size_t K) {
+                    const char* kname, std::size_t M, std::size_t N, std::size_t K,
+                    Variant variant = Variant::vendor) {
   // Build fp8 inputs from f32 via the public codec; decode them back to get the
   // exact fp8-rounded values the GEMM actually consumes -> fp64 reference.
   float* Af = sycl::malloc_shared<float>(M * K, q);
@@ -576,7 +577,7 @@ bool check_fp8_gemm(sycl::queue& q, DType out_dt, ops::Fp8Kind kind,
     ops::fp8_encode(q, Bf, B8, K * N, kind);
     ops::fp8_decode(q, A8, Art, M * K, kind);
     ops::fp8_decode(q, B8, Brt, K * N, kind);
-    ops::fp8_gemm(q, A8, B8, C, M, N, K, kind, scale, out_dt, Variant::vendor, true);
+    ops::fp8_gemm(q, A8, B8, C, M, N, K, kind, scale, out_dt, variant, true);
 
     const Tol base = tol_for(out_dt);
     const double rtol = base.rtol * std::sqrt(static_cast<double>(K)) + 5e-3;
@@ -593,6 +594,7 @@ bool check_fp8_gemm(sycl::queue& q, DType out_dt, ops::Fp8Kind kind,
       }
     ok = worst <= 0.0;
     std::cout << "  fp8_gemm " << kname << " out=" << dtype_name(out_dt)
+              << " " << variant_name(variant)
               << " (" << M << "x" << N << "x" << K << ") max_abs=" << max_abs
               << (ok ? "  ok" : "  FAIL") << '\n';
   } catch (const std::exception& e) {
@@ -1783,9 +1785,15 @@ int main() {
     failures += check_qgemm_int8<bf16_t>(q, DType::bf16, v, 96, 128, 256) ? 0 : 1;
   }
 
-  // fp8 GEMM (e4m3/e5m2), vendor-only; skips cleanly if the device lacks fp8.
+  // fp8 GEMM (e4m3/e5m2), vendor; skips cleanly if the device lacks fp8.
   failures += check_fp8_gemm<float>(q, DType::f32, ops::Fp8Kind::e4m3, "e4m3", 128, 128, 256) ? 0 : 1;
   failures += check_fp8_gemm<float>(q, DType::f32, ops::Fp8Kind::e5m2, "e5m2", 128, 128, 256) ? 0 : 1;
+  // fp8 GEMV (M=1), native SYCL decode path. Ragged N / K%4 exercise the
+  // guarded scalar paths; bf16 out exercises the reduce-kernel cast.
+  failures += check_fp8_gemm<float>(q, DType::f32, ops::Fp8Kind::e4m3, "e4m3", 1, 128, 256, Variant::sycl) ? 0 : 1;
+  failures += check_fp8_gemm<float>(q, DType::f32, ops::Fp8Kind::e5m2, "e5m2", 1, 128, 256, Variant::sycl) ? 0 : 1;
+  failures += check_fp8_gemm<float>(q, DType::f32, ops::Fp8Kind::e4m3, "e4m3", 1, 101, 203, Variant::sycl) ? 0 : 1;
+  failures += check_fp8_gemm<bf16_t>(q, DType::bf16, ops::Fp8Kind::e4m3, "e4m3", 1, 128, 256, Variant::sycl) ? 0 : 1;
 
   // rope / adamw / argmax (native only).
   failures += check_rope<float>(q, DType::f32, 32, 8, 64) ? 0 : 1;

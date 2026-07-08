@@ -34,6 +34,10 @@ hardware, by dtype, and by shape. Things that turned out false when measured:
   decomposing a flat id; a 3D `nd_range` beat `pow→exp2` + `sincos` combined.
 - *"these quant formats are NVIDIA/CPU-only"* (mxfp4/nvfp4/fp8/GGUF k+i-quants).
   False — they are data encodings; all decode natively on Intel.
+- *"fp8 is not accelerated on B60"* — our own 2026-07-06 verdict, mostly false
+  once each regime was measured with the right tool: e5m2 GEMM hits 85 TFLOP/s
+  (95% of XMX peak) via `fpmath_mode::f16` up-convert + primitive caching, and
+  the M=1 decode GEMV runs 310 GB/s natively (was 15.7 on the vendor route).
 
 Name the assumed bottleneck, then confirm it with numbers/profiling before
 optimizing — it is often not what you assumed. Fix the ruler first (profiling
