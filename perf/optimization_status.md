@@ -759,3 +759,29 @@ B60; e4m3 GEMM at ~half (oneDNN's e4m3->f16 up-convert is the gap — theirs, no
 ours); fp8 decode-GEMV is a first-class native path at 50-68% of bandwidth
 roofline. Remaining headroom: the e4m3 vendor up-convert, and the GEMV's last
 ~30% (per-call scratch malloc/free + partial traffic are candidates).
+
+## 2026-07-08: quantization/nvfp4_gemv pass #3 — bit-relocation decode, 1.92x
+
+Status: landed. The fp8_gemv lesson transferred wholesale: e2m1 ALSO embeds
+exactly in the f16 grid. A nibble s.e1e0.m relocates as (s<<15)|(e<<10)|(m<<9)
+= value * 2^-14 (exact incl. the 0.5 subnormal), and the e4m3 block scale
+relocates as ((b&0x80)<<8)|((b&0x7f)<<7) = value * 2^-8 (replacing a branchy
+ldexp decode). The hot loop now has NO LUT, NO sign select, NO ldexp: per u32
+word, 4 masked-shift pair passes + 4 vec2 converts decode all 8 nibbles, and
+the uniform 2^-22 per product is compensated by one host-side multiply folded
+into the global scale (zero device cost).
+
+Correctness: ctest 3/3; nvfp4 checks identical to the LUT decoder (bf16
+max_abs=0, f32 4.9e-4 vs fp64 reference).
+
+| act dtype (8192x8192) | before | after | speedup |
+|---|---|---|---|
+| bf16 | 0.293 ms, 114.6 GB/s | **0.153 ms, 219.6 GB/s (48% roofline)** | **1.92x** |
+| f16 | 0.302 ms, 111.0 GB/s | 0.161 ms, 207.8 GB/s | 1.87x |
+| f32 | 0.373 ms, 90.0 GB/s | 0.328 ms, 102.3 GB/s | 1.14x (f32 x-loads dominate) |
+
+Truism update: pass #2 said further decode wins "would need SIMD unpack or a
+LUT" — the actual answer was neither: bit-relocation into f16 IS the SIMD
+unpack, and it deletes the LUT. Follow-ups this unlocks: the same trick applies
+verbatim to mxfp4_gemv's e2m1 nibbles (its e8m0 scale already folds via exp2),
+and plausibly to GGUF q4_0-style scale*int decodes via a fixup constant.
