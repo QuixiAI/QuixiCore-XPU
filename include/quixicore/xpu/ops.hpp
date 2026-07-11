@@ -196,6 +196,31 @@ void moe_route_topk(sycl::queue& q, const void* router_logits, int* expert_ids,
                     std::size_t n_experts, int k, DType dt,
                     Variant variant = Variant::sycl, bool blocking = true);
 
+// Decode-oriented routed MoE with ModelOpt NVFP4 weights. `hidden` is [M,K]
+// dtype `act_dt`; ids/weights are [M,top_k] int32/f32. Weight layouts are
+// w13 [E,2I,K/2], w13_scales [E,2I,K/16], w2 [E,K,I/2], and w2_scales
+// [E,K,I/16], with one fp32 global scale per expert/projection. The output is
+// fp32 [M,K]. Invalid expert ids (<0 or >=E) are skipped. The call initializes
+// `out_f32` to zero before accumulating routed outputs.
+void nvfp4_moe_fused(sycl::queue &q, const void *hidden, const int *topk_ids,
+                     const float *topk_weights, const void *w13, const void *w13_scales,
+                     const float *w13_global_scales, const void *w2, const void *w2_scales,
+                     const float *w2_global_scales, float *out_f32, std::size_t M, std::size_t E,
+                     std::size_t top_k, std::size_t K, std::size_t I, DType act_dt,
+                     bool multiply_router_weight = true, Variant variant = Variant::sycl,
+                     bool blocking = true);
+
+// Higher-occupancy two-stage form of `nvfp4_moe_fused`. The caller supplies
+// fp32 scratch [M*top_k,2I]. This is the preferred batch-1 graph-replay path;
+// the fused form can be faster once M*top_k already fills the device.
+void nvfp4_moe_split(sycl::queue &q, const void *hidden, const int *topk_ids,
+                     const float *topk_weights, const void *w13, const void *w13_scales,
+                     const float *w13_global_scales, const void *w2, const void *w2_scales,
+                     const float *w2_global_scales, float *scratch_f32, float *out_f32,
+                     std::size_t M, std::size_t E, std::size_t top_k, std::size_t K, std::size_t I,
+                     DType act_dt, bool multiply_router_weight = true,
+                     Variant variant = Variant::sycl, bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // linear_attention
 // ----------------------------------------------------------------------------
@@ -207,6 +232,22 @@ void moe_route_topk(sycl::queue& q, const void* router_logits, int* expert_ids,
 void linear_attn(sycl::queue& q, const void* Q, const void* K, const void* V,
                  void* O, std::size_t n_heads, std::size_t seq, std::size_t dim,
                  DType dt, Variant variant = Variant::sycl, bool blocking = true);
+
+// Qwen3.5/Qwen3.6 Gated DeltaNet decode core for the non-interleaved layout.
+// Fixed model dimensions are q/k=16x128, v/z=32x128, conv width=4. Inputs are
+// projected_qkvz [B,12288] and projected_ba [B,64]. The call mutates conv_state
+// ([slots,3,8192] or [slots,8192,3]) and ssm_state [slots,32,128,128], writes
+// scratch `mixed_qkv` [B,8192], and returns core/z [B,32,128]. State indices in
+// [0,slots) are valid and must be unique within a decode batch. Negative or
+// out-of-range indices leave state untouched and produce zero core output;
+// `z` always passes through from the projected input.
+void qwen_gdn_decode(sycl::queue &q, const void *projected_qkvz, const void *projected_ba,
+                     void *conv_state, void *ssm_state, const void *conv_weight,
+                     const void *conv_bias, const float *A_log, const void *dt_bias,
+                     const int *state_indices, void *mixed_qkv, void *core_out, void *z_out,
+                     std::size_t batch, std::size_t state_slots, bool conv_dim_first, DType act_dt,
+                     DType state_dt, DType dt_bias_dt, Variant variant = Variant::sycl,
+                     bool blocking = true);
 
 // ----------------------------------------------------------------------------
 // ssm (state-space / Mamba)
@@ -288,6 +329,15 @@ void fp8_gemm(sycl::queue& q, const void* a_fp8, const void* b_fp8, void* c,
               float scale, DType out_dt, Variant variant = Variant::best,
               bool blocking = true);
 
+// FP8 weight-only GEMM: C[M,N] = A[M,K] @ dequant(W[N,K])^T. Activations and
+// output use `act_dt`; W stores raw e4m3/e5m2 bytes in checkpoint-native [N,K]
+// layout. `weight_scale` is an fp32 device pointer to [N] (per-channel) or [1].
+// `best` routes M=1 to native decode GEMV and M>1 to oneDNN when present.
+void fp8_gemm_w8a16(sycl::queue &q, const void *activations, const void *weight_fp8,
+                    const float *weight_scale, void *out, std::size_t M, std::size_t N,
+                    std::size_t K, Fp8Kind kind, bool per_channel, DType act_dt,
+                    Variant variant = Variant::best, bool blocking = true);
+
 // fp8 codecs: f32 -> fp8 (out is 1 byte/elem) and fp8 -> f32, both over `n`
 // contiguous elements. Vendor-backed (oneDNN reorder). Useful for quantizing
 // activations/weights and for exact round-trip references.
@@ -318,6 +368,13 @@ void nvfp4_gemv(sycl::queue& q, const void* w_packed, const void* block_scales,
                 float global_scale, const void* x, void* y, std::size_t N,
                 std::size_t K, DType act_dt, Variant variant = Variant::sycl,
                 bool blocking = true);
+
+// Batched NVFP4 W4A16 GEMM with checkpoint-native packed W [N,K/2]. The
+// decode path submits one optimized GEMV per activation row; this beat the
+// decode-once M-tiled alternative at every measured serving shape M=1,4,8.
+void nvfp4_gemm(sycl::queue &q, const void *w_packed, const void *block_scales, float global_scale,
+                const void *x, void *y, std::size_t M, std::size_t N, std::size_t K, DType act_dt,
+                Variant variant = Variant::sycl, bool blocking = true);
 
 // GGUF (llama.cpp) block-quant GEMV, native decode from the authentic on-disk
 // block layout. `w_blocks` is row-major [N rows], each row = K/32 blocks laid
@@ -375,6 +432,13 @@ void qgemm_int8(sycl::queue& q, const void* a_int8, const void* b_int8,
 void rms_norm(sycl::queue& q, const void* x, const void* weight, void* out,
               std::size_t rows, std::size_t dim, float eps, DType dt,
               Variant variant = Variant::sycl, bool blocking = true);
+
+// Fused residual add + RMSNorm. For each row, normalize the unrounded fp32 sum
+// of x and residual, update residual in place with the storage-dtype sum, and
+// write the normalized/weighted result to out. `out` must not alias `residual`.
+void fused_add_rms_norm(sycl::queue &q, const void *x, void *residual, const void *weight,
+                        void *out, std::size_t rows, std::size_t dim, float eps, DType dt,
+                        Variant variant = Variant::sycl, bool blocking = true);
 
 // LayerNorm over the last axis of a [rows, dim] row-major tensor:
 //   out[r, i] = (x[r, i] - mean) * rsqrt(var + eps) * weight[i] + bias[i]

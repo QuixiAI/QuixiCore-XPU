@@ -81,6 +81,38 @@ sycl::event rms_norm_typed(sycl::queue& q, const T* x, const T* w, T* out,
   });
 }
 
+template <typename T> class FusedAddRmsNormKernel;
+
+template <typename T>
+sycl::event fused_add_rms_norm_typed(sycl::queue &q, const T *x, T *residual, const T *weight,
+                                     T *out, std::size_t rows, std::size_t dim, float eps) {
+  const sycl::nd_range<1> range(sycl::range<1>(rows * kRowThreads), sycl::range<1>(kRowThreads));
+  const float inv_dim = 1.0f / static_cast<float>(dim);
+  return q.parallel_for<FusedAddRmsNormKernel<T>>(range, [=](sycl::nd_item<1> item) {
+    const std::size_t row = item.get_group(0);
+    const std::size_t lane = item.get_local_id(0);
+    const T *x_row = x + row * dim;
+    T *residual_row = residual + row * dim;
+    T *out_row = out + row * dim;
+
+    float partial = 0.0f;
+    for (std::size_t i = lane; i < dim; i += kRowThreads) {
+      const float value = static_cast<float>(x_row[i]) + static_cast<float>(residual_row[i]);
+      partial += value * value;
+    }
+    const float sum_squares =
+        sycl::reduce_over_group(item.get_group(), partial, sycl::plus<float>());
+    const float inverse_rms = sycl::rsqrt(sum_squares * inv_dim + eps);
+
+    for (std::size_t i = lane; i < dim; i += kRowThreads) {
+      const float value = static_cast<float>(x_row[i]) + static_cast<float>(residual_row[i]);
+      residual_row[i] = static_cast<T>(value);
+      const float normalized = static_cast<float>(static_cast<T>(value * inverse_rms));
+      out_row[i] = static_cast<T>(normalized * static_cast<float>(weight[i]));
+    }
+  });
+}
+
 }  // namespace
 
 sycl::event rms_norm_sycl(sycl::queue& q, const void* x, const void* weight,
@@ -99,6 +131,26 @@ sycl::event rms_norm_sycl(sycl::queue& q, const void* x, const void* weight,
       return rms_norm_typed(q, static_cast<const bf16_t*>(x),
                             static_cast<const bf16_t*>(weight),
                             static_cast<bf16_t*>(out), rows, dim, eps);
+  }
+  return {};
+}
+
+sycl::event fused_add_rms_norm_sycl(sycl::queue &q, const void *x, void *residual,
+                                    const void *weight, void *out, std::size_t rows,
+                                    std::size_t dim, float eps, DType dt) {
+  switch (dt) {
+  case DType::f32:
+    return fused_add_rms_norm_typed(
+        q, static_cast<const float *>(x), static_cast<float *>(residual),
+        static_cast<const float *>(weight), static_cast<float *>(out), rows, dim, eps);
+  case DType::f16:
+    return fused_add_rms_norm_typed(
+        q, static_cast<const half_t *>(x), static_cast<half_t *>(residual),
+        static_cast<const half_t *>(weight), static_cast<half_t *>(out), rows, dim, eps);
+  case DType::bf16:
+    return fused_add_rms_norm_typed(
+        q, static_cast<const bf16_t *>(x), static_cast<bf16_t *>(residual),
+        static_cast<const bf16_t *>(weight), static_cast<bf16_t *>(out), rows, dim, eps);
   }
   return {};
 }

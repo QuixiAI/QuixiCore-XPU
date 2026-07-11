@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 
 namespace quixicore::xpu {
 
@@ -32,11 +33,19 @@ const char* dtype_name(const DType dt) noexcept {
 
 std::vector<sycl::device> gpu_devices() {
   std::vector<sycl::device> devices;
+  bool selected_level_zero = false;
   for (const auto& platform : sycl::platform::get_platforms()) {
+    std::vector<sycl::device> platform_devices;
     for (auto& device : platform.get_devices()) {
-      if (device.is_gpu()) {
-        devices.push_back(device);
+      if (device.is_gpu() && device.get_info<sycl::info::device::vendor_id>() == 0x8086u) {
+        platform_devices.push_back(device);
       }
+    }
+    const bool level_zero = platform.get_backend() == sycl::backend::ext_oneapi_level_zero;
+    if (platform_devices.size() > devices.size() ||
+        (platform_devices.size() == devices.size() && level_zero && !selected_level_zero)) {
+      devices = std::move(platform_devices);
+      selected_level_zero = level_zero;
     }
   }
   return devices;

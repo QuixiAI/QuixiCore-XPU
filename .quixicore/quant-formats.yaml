@@ -34,17 +34,16 @@ formats:
     status: experimental
     note: >-
       FP4 e2m1 + e4m3 (fp8) block scale (block 16) + per-tensor fp32 scale. Landed
-      as quantization/nvfp4_gemv with a native decoder (e2m1 LUT + hand-written
-      e4m3 decode matching oneDNN's codec). Correct on B60. NVIDIA FP4 is not
-      NVIDIA-exclusive; it decodes natively on Intel.
+      as quantization/nvfp4_gemv with bit-relocation decode and now includes
+      batched W4A16 GEMM plus fused/split routed MoE in checkpoint-native layouts.
+      Correct on B60. NVIDIA FP4 is not NVIDIA-exclusive; it decodes natively on
+      Intel.
   fp8:
     status: experimental
     note: >-
-      e4m3 + e5m2 GEMM landed (quantization/fp8_gemm) via oneDNN, with
-      fp8_encode/fp8_decode codecs. Numerically correct on B60 (fp8 is NOT
-      NVIDIA-exclusive), but NOT accelerated there: ~16-19 TFLOP/s vs int8 182
-      TOPS / bf16 90 TFLOP/s -- Xe2 has no fast native fp8 XMX this generation.
-      Portability yes; performance pending future Intel GPU.
+      e4m3 + e5m2 W8A8 GEMM and W8A16 weight-only GEMM are available. W8A16
+      keeps checkpoint weights in [N,K], routes M=1 decode to native SYCL, and
+      uses oneDNN for M>1. fp8_encode/fp8_decode codecs are vendor-backed.
   fp4:
     status: planned
     note: generic fp4_e2m1 packing.
@@ -72,6 +71,6 @@ status_values:
   - planned
   - unsupported
 notes: >-
-  Quant format support is planned but not yet claimed. Support is claimed only
-  after a native XPU decode/compute path, correctness vs the shared byte layout,
-  and benchmark coverage land. Nothing here is out of scope on hardware grounds.
+  Format maturity is recorded per entry. Support is claimed only after an XPU
+  decode/compute path, correctness against the shared byte layout, and benchmark
+  coverage land. Nothing here is out of scope on hardware grounds.

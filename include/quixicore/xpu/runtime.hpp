@@ -34,8 +34,9 @@ std::size_t dtype_size(DType dt) noexcept;
 // Human-readable dtype name (matches the contract vocabulary: "f32"/"f16"/"bf16").
 const char* dtype_name(DType dt) noexcept;
 
-// Enumerate all Intel/level-zero GPU devices visible to SYCL. Ordered as the
-// runtime reports them; index maps to the 4x B60 render nodes on this host.
+// Enumerate Intel GPUs from one SYCL platform, preferring Level Zero on ties so
+// OpenCL aliases do not duplicate physical devices. Ordered as the selected
+// platform reports them.
 std::vector<sycl::device> gpu_devices();
 
 // Build a queue on a GPU device. `index` selects among gpu_devices(); it is

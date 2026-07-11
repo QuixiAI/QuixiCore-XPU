@@ -4,7 +4,7 @@ This file tracks the local XPU implementation plan. The canonical contract lives
 in `QuixiAI/QuixiCore`; this repository should only claim support after native
 implementation, correctness coverage, and benchmark coverage exist.
 
-## Phase 0: Scaffold
+## Phase 0: Backend Foundation
 
 - Backend compatibility metadata.
 - CMake project and C++20 smoke tests.
@@ -17,9 +17,8 @@ implementation, correctness coverage, and benchmark coverage exist.
 - Softmax.
 - GELU / GLU.
 
-These are the best first XPU targets because their semantics are simple enough
-to validate locally while still exercising Intel GPU memory bandwidth,
-subgroup reductions, and dtype handling.
+Native RMSNorm, fused residual-add RMSNorm, LayerNorm, softmax, GELU, and GLU
+variants are present. Additional shape and dtype tuning remains ongoing.
 
 ## Phase 2: Quantization Surface
 
@@ -28,8 +27,9 @@ subgroup reductions, and dtype handling.
 - Quant GEMM.
 - Quantized LM head.
 
-Quant formats must match the umbrella format names and byte layouts at API
-boundaries. Backend-local layouts are acceptable only as internal variants.
+INT4, INT8, GGUF, MXFP4, NVFP4, and FP8 paths are present at different maturity
+levels. Quant formats must match the umbrella format names and byte layouts at
+API boundaries. Backend-local layouts are acceptable only as internal variants.
 
 ## Phase 3: Serving Kernels
 
@@ -40,6 +40,11 @@ boundaries. Backend-local layouts are acceptable only as internal variants.
 - MoE routing and grouped MoE GEMM.
 - Mamba / SSD.
 
+Attention, sampling, Mamba/SSD, quantized MoE, Qwen GDN decode, and command
+graph capture now have native implementations. Remaining work is model breadth,
+shape tuning, and framework integration rather than initial bring-up.
+
 ## Current Contract Status
 
-All kernel families are planned for XPU. None are currently claimed complete.
+The backend is active. Family and operation status is authoritative in
+`.quixicore/kernels.yaml`; families remain partial while contract gaps exist.

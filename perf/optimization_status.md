@@ -785,3 +785,635 @@ LUT" — the actual answer was neither: bit-relocation into f16 IS the SIMD
 unpack, and it deletes the LUT. Follow-ups this unlocks: the same trick applies
 verbatim to mxfp4_gemv's e2m1 nibbles (its e8m0 scale already folds via exp2),
 and plausibly to GGUF q4_0-style scale*int decodes via a fixup constant.
+
+## 2026-07-08: vLLM integration — native NVFP4 MoE + fp8 W8A16 GEMV (Qwen3.6-35B-A3B-NVFP4, 1x B60)
+
+Status: landed (serving-level). These are QuixiCore-derived kernels vendored into
+the vLLM tree (`~/vllm/csrc_xpu_quixi/`, self-contained torch SyclExtension, no
+oneDNN link) and wired into vLLM's kernel selection. **Evidence caveat:** numbers
+here are end-to-end serving decode (greedy tok/s) + torch parity, NOT the C++
+profiling-event GB/s harness — the per-kernel `quixicore_xpu_bench` micro-baseline
+for the two NEW kernels (nvfp4 fused MoE, fp8 W8A16 GEMV) is the remaining
+paperwork. Model: 40 layers (30 GDN linear-attn + 10 full-attn), 256-expert NVFP4
+W4A16 MoE (top-8), NVFP4 lm_head/shared, fp8 attn/GDN projections. enforce-eager,
+max-model-len 4096, max-num-seqs 4 (single-GPU; TP disabled — PCIe oneCCL hangs).
+
+Method: profiled a 48-token decode with the torch/XPU profiler (SYCL kernel
+events). Baseline device compute 39 ms/tok, of which the Triton NVFP4 MoE
+emulation was 29.5 ms (75%); pipeline is host-launch-bound (2393 kernel
+launches/tok, 65 ms enqueue) with 81 device->host syncs/tok. Ran one pass per
+bottleneck; A/B via env toggles.
+
+Correctness: greedy "The capital of France is" -> "Paris, a city renowned..."
+unchanged across every kept change. Per-kernel parity vs the path replaced:
+nvfp4 MoE exact vs dequant-ref; fp8 W8A16 rel 2.5-3.2e-3 vs torch dequant.
+
+| pass | change | tok/s | verdict |
+|---|---|---|---|
+| baseline | native NVFP4 linear only (emulation MoE + oneDNN fp8) | 14.1 | — |
+| host-syncs | cache global-scale as host float (kill 81 syncs/tok) | 14.5 | keep (+2.5%) |
+| native MoE | fused NVFP4 MoE SYCL kernel | 17.7 | **keep (+22%)** |
+| native fp8 | bf16 x fp8-weight decode GEMV vs oneDNN fp8_gemm_w8a16 | 18.9 | keep (+7%) |
+| M-tiled nvfp4 | decode-once/reuse-across-M GEMM | 18.9 | **reject** |
+
+Cumulative 14.1 -> 18.9 tok/s (+34%); vs the pre-native Triton-emulation serving
+baseline (6.0 tok/s) this is 3.15x. Findings:
+
+1. **Fused NVFP4 MoE (new kernel, biggest win).** One work-group per routed
+   (token,expert) pair: w13 decode-GEMV -> SwiGLU -> w2 decode-GEMV, atomic
+   weighted sum, reusing the pass-#3 e2m1/e4m3 bit-relocation decode. Replaces
+   the emulation's align + 2 dequant-GEMMs + activation + sum (~5 launches/layer,
+   BLOCK_M-padded to 16-32 rows for 1-8 real tokens). Profiled MoE device time
+   29.5 -> 16.1 ms/tok. Honest limit: at decode M=4 the grid is only M*T=32
+   work-groups -> ~6.5% of the 456 GB/s roofline; occupancy is the next lever
+   (a two-kernel g/a-then-o split, or M*T*rowtiles, to fill 160 XVEs).
+
+2. **fp8 W8A16 as a native decode-GEMV, not oneDNN.** The QuixiCore fp8 result
+   (this file, 2026-07-08) is W8A8 [K,N]; the vLLM path is W8A16 (bf16 act x fp8
+   weight) through oneDNN `fp8_gemm_w8a16` firing ~190 gemm_kernel/tok. Wrote a
+   bf16xfp8 [N,K] subgroup-per-row decode-GEMV (fp8 checkpoint weight is already
+   [out,in]=[N,K] -> zero transpose, memory-neutral) and routed the GDN/attn
+   projections through it. +7% (fewer + leaner launches; device fp8 3.9 -> ~1 ms).
+
+3. **host-syncs were self-inflicted.** The 81 `aten::item`/tok traced (via the
+   profiler's with_stack frames) to a `float(weight_global_scale)` on a 0-dim XPU
+   tensor every forward in the native NVFP4 *linear* kernel. Caching it host-side
+   at load removed all 81. Small (+2.5%) because the pipeline is launch-bound, not
+   sync-bound (wall ~= enqueue, not compute) — matched the prediction.
+
+4. **M-tiled nvfp4 GEMM rejected.** Decoding each weight row once and accumulating
+   M partials (to avoid the row-loop's M-fold weight re-read) is slower than the
+   row-loop for M<=6 — the acc[8]+wv[32] register pressure loses the fused
+   decode-dot; it only wins at M>=8. Decode is M=1 (single stream) / M<=4
+   (max-num-seqs). Reverted; kernel kept unused in `nvfp4_kernel.hpp` for future
+   batched/prefill work. Parity was fine (rel 2.2-2.5e-3, M=1..8).
+
+Remaining levers (measured, not yet done): MoE-kernel occupancy (the 6.5%-roofline
+gap above); the pipeline is host-launch-bound (2273 launches/tok after the MoE
+fusion) so XPU-graph capture is the largest single lever but out of scope for a
+kernels-first pass. All changes are behind env toggles
+(`VLLM_QUIXI_NVFP4_MOE_DISABLE`, `VLLM_QUIXI_FP8_DISABLE`,
+`VLLM_QUIXI_NVFP4_DISABLE`) for clean A/B.
+
+### Follow-up run #2: MoE occupancy 2-kernel split — device win, serving wash (launch-bound wall)
+
+Measured the MoE kernel in isolation (weight-BW GB/s, real decode shape
+E=256/2I=1024/K=2048/I=512, Tk=8): it is occupancy-starved at low batch because
+the fused design uses only M*Tk work-groups.
+
+| M | WGs (M*Tk) | fused GB/s | split GB/s |
+|---|---|---|---|
+| 4 (decode) | 32 | 77 (17% roofline) | **103 (+34%)** |
+| 8 | 64 | 195 | 177 |
+| 16 | 128 | 238 (52%) | 196 |
+| 32-128 | 256-1024 | 219-250 | ~199 |
+
+Split = two kernels (G: g[2I] per (pair,row-tile) -> f32 scratch; O: SwiGLU + o[K]
+per (pair,row-tile), atomic weighted-sum). Parity exact (7e-8 vs fused). It wins at
+M<=8 (decode) by spreading rows over thousands of WGs, and loses at M>=16 (extra
+scratch + atomic traffic once occupancy is already met).
+
+**End-to-end serving A/B was flat: 18.85 vs 19.0 tok/s.** The split adds +1
+launch/MoE-layer (+40/tok); the vLLM decode pipeline is host-launch-bound
+(~2273 launches/tok), so the device speedup is exactly cancelled by the extra
+enqueue. Rejected for serving (kept behind `VLLM_QUIXI_MOE_SPLIT=1`). Lesson,
+consistent with the whole pass: at this operating point end-to-end tok/s tracks
+kernel-launch COUNT, not device time — the wins that landed (fused MoE 5->1
+launches, native fp8 replacing ~190 oneDNN kernels/tok) all reduced launches; the
+ones that didn't (host-sync cache, this occupancy split) did not. Next lever is
+launch reduction (XPU-graph capture / torch.compile / elementwise+norm+rope
+fusion), not faster kernels.
+
+## 2026-07-09: Deep dive — path to 60 tok/s (launch-reduction levers, Qwen3.6-35B-A3B-NVFP4, 1x B60)
+
+Status: analysis + 3 decisive on-box experiments. Question posed: "how do we get
+from ~19 to 60 tok/s — switch to int4, or push the nvfp4 kernels harder?" Answer:
+neither. The wall is host launch count (~2273 launches/tok), not device compute,
+so device-side dtype/kernel work cannot move it. The two levers that DO cut launch
+count are both currently BLOCKED on this torch/driver stack; unblocking them is the
+whole job.
+
+Baseline (this session, clean): **18.75 tok/s** greedy decode, 128 tok, dead-stable
+(6.83 s/128 tok = 53.3 ms/tok). enforce-eager, native kernels engaged.
+
+Device-compute budget (from the 2026-07-08 trace, after the MoE+fp8 fusions):
+~22-25 ms/tok. => a *perfect* launch-elimination ceiling is only ~40-45 tok/s.
+**60 tok/s therefore requires BOTH: (1) remove the host-launch overhead to become
+device-bound (~40-45 tok/s), THEN (2) cut device compute ~25-30% (MoE occupancy +
+GDN fusion) to close 45->60.** No single lever reaches 60.
+
+### Experiment A — Full-graph XPU capture (the 3x lever). BLOCKED (runtime segfault).
+XPU graph capture IS wired in this tree: `torch.xpu.XPUGraph` exists,
+`supports_xpu_graph()`=True, `VLLM_XPU_ENABLE_XPU_GRAPH=1`, runner aliases
+`torch.cuda.graph->torch.xpu.graph` (xpu_model_runner.py:59). Launched with
+`--compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'`, no
+enforce-eager. Result: **SIGSEGV during capture entry** —
+`c10::xpu::device_synchronize -> sycl::device_impl::wait -> queue_impl::~queue_impl
+-> ur_loader::urQueueRelease` (use-after-free in Intel's UR loader). Reproduced
+**identically with all our custom kernels disabled** (VLLM_QUIXI_*_DISABLE=1) => it
+is a torch-2.13.0.dev20260603+xpu / Battlemage(Level-Zero V2) XPUGraph bug, NOT our
+code. This crash is at capture setup (the wrapper's own synchronize), before any
+decode request. Blocks the single largest lever (capture collapses ~2273 launches
+into one replay).
+
+### Experiment B — Inductor compile, cudagraph OFF (fuse elementwise, no capture). BLOCKED (our ops untraceable).
+`--compilation-config '{"cudagraph_mode":"NONE"}'`, compile on. Dynamo errors: it
+cannot trace our pybind kernels (`quixi_nvfp4.fp8_gemm_w8a16`, `nvfp4_moe`, ...)
+because they are raw pybind functions, not registered torch custom ops (gb0007
+graph-break -> hard error). Also flagged the `functools.lru_cache` on
+`quixi_fp8_xpu.py:57` `_load_quixi`. => inductor fusion (which would coalesce the
+norm/rope/residual/cast chains and cut launches WITHOUT needing capture) is blocked
+until we register every quixi kernel via `direct_register_custom_op` with meta/fake
+impls (vllm/utils/torch_utils.py:935). This is fully in our control, no driver dep.
+
+### Confirmed: int4 and "faster nvfp4 kernels" are the wrong axis.
+Device compute is not the wall (proof: 2026-07-08 occupancy split made the MoE
+kernel +34% on-device and moved end-to-end tok/s by ~0). nvfp4 decode already runs
+at 48% of the 456 GB/s roofline (bit-relocation, no LUT). int4 would give a
+marginally cheaper decode, cost accuracy + a requant, and touch launch count by
+zero. Rejected as a direction.
+
+### Roadmap to 60 (ordered by leverage / our-control):
+1. **Register quixi kernels as torch custom ops** (`direct_register_custom_op`,
+   meta impls; drop/relocate the lru_cache off the hot call). Unblocks Experiment B
+   => inductor fuses elementwise and cuts a real fraction of the 2273 launches with
+   no driver dependency. Highest-leverage next step; prerequisite for piecewise
+   cudagraph too.
+2. **Get XPUGraph capture working** — either (a) piecewise (FULL_AND_PIECEWISE) once
+   step 1 lets inductor split the graph (captures only compiled regions, runs
+   attention + our ops eager — may dodge the full-capture-entry segfault), or (b) a
+   torch-xpu / Level-Zero driver build where XPUGraph doesn't UAF. Capture is the
+   only lever that gets the full ~3x (launches -> ~1 replay -> device-bound ~40-45
+   tok/s).
+3. **Device compute, only after 1-2** (once launch-bound is gone the earlier
+   device wins stop being cancelled): land the MoE 2-kernel occupancy split
+   (VLLM_QUIXI_MOE_SPLIT=1, +34% device MoE at decode), then a fused native GDN
+   SYCL kernel (the 30 GDN layers are the biggest remaining launch+compute mass).
+   These carry 45 -> 60.
+
+Raw: baseline bench 18.69/18.74/18.75 tok/s. Crash logs in
+scratchpad/vllm_graph.log, vllm_graph_stock.log, vllm_inductor.log.
+
+## 2026-07-09: Path-to-60-tok/s deep dive — the wall is launch overhead, not kernels
+
+Status: analysis + 3 decisive on-B60 experiments. Target 60 tok/s (from 18.75).
+Model/config identical to the 2026-07-08 entry (Qwen3.6-35B-A3B-NVFP4, 1x B60,
+enforce-eager, max-num-seqs 4).
+
+Question posed: "int4 or better nvfp4 kernels to reach 60 tok/s?" Answer from the
+data: **neither** — both optimize device compute, and device compute is not the
+wall. We are launch-bound (~2273 kernel launches/tok; wall ~= host enqueue).
+
+Numbers that frame it:
+- 18.75 tok/s = 53.3 ms/tok wall (re-measured, 128-tok greedy, +-0.1 tok/s).
+- Device compute ~23 ms/tok (post-fusion: MoE 16.1 + fp8 ~1 + nvfp4 GEMV 1.25 +
+  GDN 0.65 + routing 0.6 + elementwise ~3 + attn/other).
+- => ~30 ms/tok is pure host launch/dispatch overhead. 60 tok/s = 16.7 ms/tok,
+  which is BELOW current device compute. So reaching 60 needs BOTH: kill the
+  launch overhead (graph capture, ~53->~23ms => ~43 tok/s) AND then cut device
+  compute ~23->16ms (kernel work) to close 43->60. Neither lever alone gets there.
+
+Experiment A — full-graph XPU capture (FULL_DECODE_ONLY, VLLM_XPU_ENABLE_XPU_GRAPH=1,
+compilation mode=NONE). This is the ~3x lever (collapses 2273 launches -> 1 replay).
+Result: **SIGSEGV during capture entry**, in Intel's UR loader:
+`c10::xpu::device_synchronize -> sycl queue_impl::~queue_impl -> urQueueRelease`
+(use-after-free on a queue during the capture-entry synchronize). torch
+2.13.0.dev20260603+xpu; torch.xpu.XPUGraph exists, supports_xpu_graph()=True.
+
+Experiment B — same capture with ALL our custom kernels disabled (stock emulation
+MoE + oneDNN fp8 + native-nvfp4 off). Result: **identical segfault**. => the crash
+is a torch-xpu/Level-Zero XPUGraph bug on Battlemage, NOT our kernels. Full-graph
+capture is currently non-viable on this stack.
+
+Experiment C — inductor compile, cudagraph OFF (mode=inductor, cudagraph_mode=NONE)
+to fuse elementwise/norm/rope without capture. Result: **engine-core init fails** —
+`torch._dynamo.exc.Unsupported: Attempted to call function marked as skipped`:
+Dynamo cannot trace our raw-pybind ops (`quixi_nvfp4.fp8_gemm_w8a16`, nvfp4_moe,
+nvfp4_gemm). They must be registered as PyTorch custom operators
+(`direct_register_custom_op` + meta/fake impls, preallocated outputs, no in-op
+device sync) before torch.compile OR capture can handle them.
+
+Conclusions / roadmap to 60:
+1. **int4 does not help.** At decode M<=4 the MoE is a memory-bound GEMV; int4 and
+   nvfp4 both read 4 bits/weight => identical weight-byte traffic => identical
+   bandwidth. int4 would only pay via an INT8-XMX (w4a8) matmul path, which needs
+   compute-bound (large-M) operation — not our decode regime. nvfp4 stays; its
+   bit-relocation decode is already 48% of the 456 GB/s roofline.
+2. **Register the 4 custom kernels as torch custom ops** (we own them; low risk).
+   Unblocks BOTH inductor fusion and graph capture. Do first.
+3. **Graph capture is the only realistic route to ~43 tok/s.** After (2), retry
+   FULL_DECODE_ONLY; the UR-loader segfault (Exp A/B) must be resolved separately
+   — torch-xpu nightly bump, or narrower capture, or upstream/driver fix. This is
+   the make-or-break gate for 60.
+4. **Capture inverts the optimization calculus.** Device-side wins we REJECTED
+   under launch-bound serving (the MoE occupancy 2-kernel split: device +34% at
+   M=4, serving wash because +1 launch/layer) become KEEPS once capture removes
+   per-launch cost. Phase 2 (43->60) = MoE occupancy split + faster fp8, re-run
+   under capture. Only here is an int4 A/B even worth the paperwork (and per (1)
+   it should lose).
+
+Fallback if XPUGraph stays broken: manual launch reduction via native fusion of
+the tiny elementwise (RMSNorm/residual/rope/SwiGLU/cast) and GDN small-op chains.
+Estimated 2273 -> ~1200 launches => ~1.5-1.8x (~30 tok/s). Real but a grind and
+cannot reach 60 alone. Capture remains the primary lever.
+
+### 2026-07-09 Phase 0 de-risk: SYCL graph works AND native submit is ~10x cheaper than torch
+
+Standalone SYCL probes on B60 (Battlemage, LZ V2, oneAPI 2026.0), server stopped,
+QuixiCore::XPUOps shared lib. Two programs: graph_probe (record rms_norm->nvfp4_gemv
+->silu, replay) and graph_probe2 (R tiny silu kernels, eager-submit vs graph-replay).
+
+Gate results:
+- **Gate B (no crash): PASS.** device.has(ext_oneapi_graph)=1, ext_oneapi_limited_graph=1.
+  command_graph record -> finalize -> q.ext_oneapi_graph(exec) replay -> teardown runs
+  clean, NO urQueueRelease UAF. The SYCL graph path DODGES the torch XPUGraph segfault
+  (single persistent in-order queue, no transient-stream churn).
+- **Gate A (correctness): PASS.** replay vs eager max_abs = 0.0 (bitwise).
+- **Gate C (launch overhead), R silu kernels:**
+  | R | eager us/it | graph us/it | graph speedup |
+  |---|---|---|---|
+  | 8 | 21.0 | 30.0 | 0.70x |
+  | 32 | 82.8 | 90.6 | 0.91x |
+  | 128 | 308.5 | 172.9 | 1.78x |
+  | 512 | 1222.9 | 667.9 | 1.83x |
+
+Interpretation — the decisive finding:
+- Native SYCL eager submit is **~2.4 us/kernel, flat in R**. Torch dispatch in vLLM is
+  **~23 us/op** (2273 launches/tok x 23us ~ 52ms host = the 18.75 tok/s wall). So going
+  NATIVE (no Python/aten/dispatcher) is a ~10x host-overhead cut by itself.
+- Graph replay is ~1.3 us/kernel at R>=128 (1.85x over eager) but has fixed per-replay
+  overhead that loses below R~64. It is a SECONDARY optimization.
+- Projection for real decode (~2273 kernels/tok, device ~23ms/tok):
+  - native eager: host ~2273x2.4us = 5.5ms, overlaps device 23ms -> **device-bound ~43 tok/s**.
+  - native + graph: host ~3ms -> still device-bound 23ms -> 43 tok/s (graph moot once device-bound).
+- **Conclusion: the lever is a native SYCL decode engine, NOT graph capture.** Native
+  in-order non-blocking submit alone reaches device-bound ~43 tok/s; the SYCL graph is
+  gravy (and confirmed working as a fallback/refinement). Phase 3 device cuts (MoE
+  occupancy split, fp8, GDN) then take 23->~16ms -> 60 tok/s. The torch-XPUGraph UAF
+  is now irrelevant to the plan. Phase 0 GREEN -> commit to Phase 2 (native engine).
+
+### 2026-07-09 Phase 1: quixi ops registered as torch custom ops (+ inductor negative result)
+
+New module vllm/.../kernels/linear/nvfp4/quixi_ops.py: moved _load_quixi() there;
+registered quixi_nvfp4_gemm / quixi_fp8_gemm_w8a16 / quixi_nvfp4_moe / _split via
+direct_register_custom_op (dispatch_key XPU, fake/meta impls returning correctly-shaped
+empty tensors). Schemas inferred OK. Call sites (quixi_xpu.py, quixi_fp8_xpu.py,
+nvfp4_quixi_moe.py) route through is_compiling() dispatch wrappers: under torch.compile
+-> torch.ops.vllm.quixi_* (Dynamo-traceable); eager -> direct pybind (no op-dispatch tax).
+
+Results (bench.py 8333, greedy 128 tok, enforce-eager):
+- eager, always-through-custom-op: 18.19 tok/s (-3% vs 18.75 baseline: op-dispatch tax in
+  the launch-bound regime).
+- eager, is_compiling() wrappers (direct pybind): **18.56 tok/s** (== baseline within noise).
+  Correctness: "Paris..." (minor wording variance = known atomic-accum nondeterminism in
+  the fused MoE kernel, not a regression; eager path is byte-identical to baseline).
+- **inductor compile, cudagraph OFF: STARTS + serves (previously FATAL Dynamo
+  "Unsupported: call to skipped function")** -> the custom-op registration unblocked
+  tracing. BUT **4.8 tok/s = ~4x SLOWER than eager.** With cudagraph off, compile
+  graph-breaks around every opaque quixi op + GDN splitting_ops and adds Dynamo/guard +
+  Triton-XPU overhead with no offsetting fusion. REJECT inductor-without-cudagraph.
+
+Conclusion: Phase 1 is INFRASTRUCTURE (ops now traceable/compilable, needed for the Phase 2
+native bridge and any future capture path) with NO current serving win — inductor-compile
+is a 4x loss here, confirming that only native execution (Phase 2) or working graph capture
+cuts the launch wall. Serving stays enforce-eager at ~18.6 tok/s. Custom ops kept behind the
+is_compiling() wrappers (zero eager cost). Proceed to Phase 2 (native SYCL decode engine).
+
+### 2026-07-09 Phase 2 vertical slice start: native GDN decode core prototype
+
+Status: first correctness slice landed in `~/vllm/csrc_xpu_quixi/` (prototype,
+not routed into serving yet). Added `gdn_decode_kernel.hpp` plus pybind op
+`quixi_nvfp4.qwen_gdn_decode(projected_qkvz, projected_ba, conv_state, ssm_state,
+conv_weight, conv_bias, A_log, dt_bias, state_indices) -> (core_attn_out, z)`.
+
+Scope intentionally narrow: Qwen3.5/Qwen3.6 non-interleaved decode path only
+(`gqa_interleaved_layout=False`, no prefill/spec decode, TP=1), matching
+`nvidia/Qwen3.6-35B-A3B-NVFP4` through `qwen3_5.py`. The op performs:
+1. depthwise causal conv update over `[q,k,v]` channels (`8192`, kernel width 4),
+   mutating `conv_state` and emitting convolved `mixed_qkv`;
+2. packed recurrent GDN update over `[B,32,128,128]` SSM state:
+   L2-normalize q/k, apply `q *= 128^-0.5`, compute
+   `g=-exp(A_log)*softplus(a+dt_bias)`, `beta=sigmoid(b)`, decay state,
+   delta-correct `v - S @ k`, update `S += beta*delta*k`, emit `S @ q`;
+3. return `z` from the projected `[q,k,v,z]` tail.
+
+Synthetic parity (`csrc_xpu_quixi/gdn_parity.py`, B=4, slots=8, random small
+inputs, server stopped, B60 clean):
+
+| dtype / state | core max_abs | core max_rel | z | conv_state | ssm_state max_abs |
+|---|---:|---:|---:|---:|---:|
+| f32 / f32 | 2.79e-09 | 3.93e-04 | 0 | 0 | 1.49e-08 |
+| bf16 / f32 | 3.81e-06 | 7.09e-03 | 0 | 0 | 1.12e-08 |
+
+Interpretation: numerical spec is correct for the deployed decode math. This is
+not yet a performance kernel: recurrent update currently uses one work-item per
+value lane and redundantly recomputes q/k norms. It is the parity anchor for the
+next optimization step (one work-group per `(token,value-head)` with local/shared
+q/k reductions and state-row vectorization), then layer-level parity against the
+existing `_xpu_C.gdn_attention` wrapper.
+
+Direct production-kernel check also passed. Calling `torch.ops._xpu_C.gdn_attention`
+with synthetic non-spec decode metadata (same random tensors, bf16 activation,
+f32 SSM state) and comparing against `quixi_nvfp4.qwen_gdn_decode`:
+
+| comparison | max_abs | max_rel |
+|---|---:|---:|
+| core_attn_out | 1.53e-05 | 7.75e-03 |
+| z | 0 | 0 |
+
+This validates the new prototype against the actual vLLM XPU GDN kernel, not just
+the Python reference.
+
+Follow-up optimization in the same vertical slice:
+
+1. Shared q/k norm per `(token,value-head)` work-group instead of recomputing q/k
+   L2 norms independently for all 128 value lanes.
+2. Removed the intermediate decayed-state store/reload; only final updated SSM
+   state is written.
+3. Cached normalized q/k in local memory once per work-group.
+
+Synthetic parity remains inside tolerance:
+- f32/f32: core max_abs 2.56e-09, z exact, conv_state exact, ssm_state max_abs
+  1.49e-08.
+- bf16/f32: core max_abs 3.81e-06, z exact, conv_state exact, ssm_state max_abs
+  1.49e-08.
+- Direct `_xpu_C.gdn_attention` comparison remains: core max_abs 1.53e-05,
+  max_rel 7.75e-03, z exact.
+
+Microbench (`csrc_xpu_quixi/gdn_bench.py`, 200 iters, B60 clean, bf16 activation,
+f32 SSM state):
+
+| B | quixi prototype before opt | after norm+state opt | `_xpu_C.gdn_attention` |
+|---|---:|---:|---:|
+| 1 | 0.115 ms | **0.019 ms** | 0.031 ms |
+| 4 | 0.205 ms | **0.045 ms** | 0.037 ms |
+
+Verdict: keep. The GDN core prototype is now faster than production for the B=1
+single-stream decode case and close for B=4. This is still two launches (conv +
+recurrent) and not wired into serving; next step is layer-level integration/parity
+and then folding into the native decode engine so launch overhead is paid by the
+engine, not torch.
+
+Serving A/B of the layer hook confirms the launch-bound rule again:
+- `VLLM_QUIXI_GDN_ENABLE=1` (quixi GDN through torch forward): best 18.71 tok/s.
+- default production `_xpu_C.gdn_attention`: best 18.83 tok/s.
+
+Verdict for serving hook: reject by default. The quixi core is faster in isolation
+for B=1, but routing it through torch uses two native launches plus Python/op
+dispatch allocation, replacing one production custom op. It belongs inside the
+native decode engine where the launches are submitted directly/recorded, not as a
+standalone torch-layer replacement. The hook is left opt-in only via
+`VLLM_QUIXI_GDN_ENABLE=1` for future A/B.
+
+### 2026-07-09 Phase 2 vertical slice: native SYCL GDN decode core (decode-only)
+
+Status: landed as opt-in vertical slice behind `VLLM_QUIXI_GDN_ENABLE=1`.
+Implementation already present in the local tree and validated this pass:
+`csrc_xpu_quixi/gdn_decode_kernel.hpp` + `qwen_gdn_decode` binding in
+`quixi_nvfp4_ext.sycl`; vLLM hook in `qwen_gdn_linear_attn.py::_try_quixi_gdn_decode`.
+Scope is intentionally narrow: non-interleaved qkvz layout, TP=1, no prefill, no
+spec decode, real Qwen3.6 GDN shapes `[q,k,v,z]=[2048,2048,4096,4096]`, BA `[64]`,
+conv state `[slots,3,8192]` or `[slots,8192,3]`, SSM state `[slots,32,128,128]`.
+
+Correctness:
+- Rebuilt `quixi_nvfp4` extension cleanly (`icpx -fsycl`, torch SyclExtension).
+- `csrc_xpu_quixi/gdn_parity.py` vs a PyTorch reference of the exact FLA decode math:
+  - fp32/state fp32: core max_abs 2.56e-09, z exact, conv_state exact, ssm_state max_abs 1.49e-08.
+  - bf16/state fp32: core max_abs 3.81e-06, z exact, conv_state exact, ssm_state max_abs 1.49e-08.
+
+Microbench (`csrc_xpu_quixi/gdn_bench.py`, wall timing, 200 iters):
+| B | quixi qwen_gdn_decode | production `_xpu_C.gdn_attention` | verdict |
+|---|---:|---:|---|
+| 1 | 0.024 ms | 0.031 ms | quixi +29% |
+| 4 | 0.046 ms | 0.037 ms | quixi -24% |
+
+Serving A/B, enforce-eager, port 8333, greedy 128-token single request:
+- baseline after custom-op wrappers: ~18.56 tok/s (previous stable baseline 18.75 tok/s)
+- `VLLM_QUIXI_GDN_ENABLE=1`: **19.19 tok/s best**
+
+Decision: KEEP as opt-in for the single-request decode path. It is a modest but real
+serving win (+2-3%) and proves the native-GDN vertical slice. Do not enable by default
+yet because the B=4 microbench regresses vs `_xpu_C.gdn_attention`; the next GDN pass
+should target either (a) a one-launch fused conv+recurrent kernel, or (b) a batch-aware
+path that preserves the B=1 win while falling back to `_xpu_C` for B>1.
+
+Correction / repeat on the same Phase 2 GDN slice:
+- A later serving repeat with the same direct-pybind GDN path was 18.56 tok/s best,
+  i.e. serving-neutral vs baseline. The earlier 19.19 sample should be treated as noise.
+- Attempting to route GDN through a `torch.ops.vllm.quixi_qwen_gdn_decode` wrapper in eager
+  also measured ~18.36 tok/s, so the GDN call site remains direct-pybind in eager. The custom
+  op registration is kept for future compile/capture infrastructure only.
+- Updated verdict: the native GDN decode core is CORRECT and useful as the Phase-2 vertical
+  slice, but not a standalone serving win under torch eager. It reinforces the main plan:
+  native per-op kernels are insufficient; the win comes from moving the full decode loop into
+  native SYCL submit/engine so the ~10x host-dispatch reduction applies globally.
+## 2026-07-09: vLLM full XPU graph + split NVFP4 MoE reaches 68 tok/s
+
+Status: keep in the vLLM integration worktree. Hardware: one Intel Arc Pro B60;
+model: `nvidia/Qwen3.6-35B-A3B-NVFP4`; bf16 activations, NVFP4 W4A16 routed MoE;
+single-request greedy decode; 8 warmup tokens followed by 128 measured tokens.
+
+The torch 2.13.0.dev20260603+xpu Python graph lifecycle crashed in device-wide
+synchronization (`device_impl::wait -> queue_impl::~queue_impl ->
+urQueueRelease`). Direct `at::xpu::XPUGraph` recording on torch's current
+in-order queue succeeded, including the full 40-layer model, mutable GDN/KV
+state, routing, attention, and PyTorch graph allocator pool. A native
+current-queue wait replaced the broken all-queue synchronization; the
+post-capture cache purge was skipped to retain graph-pool allocations.
+
+Command: vLLM serve with `VLLM_XPU_ENABLE_XPU_GRAPH=1`,
+`VLLM_QUIXI_MOE_SPLIT=1`, `FULL_DECODE_ONLY`, capture size 1, TP=1,
+max-num-seqs=4. Benchmark: `csrc_xpu_quixi/perf_analysis/bench.py 8333 128`.
+
+| mode | 128-token runs | decision |
+|---|---|---|
+| eager, fused MoE | 18.41, 18.44, 18.50 tok/s | baseline |
+| full graph, fused MoE | 36.84, 36.88, 36.94 tok/s | keep graph |
+| full graph, split MoE | 67.30, 68.07, 68.07 tok/s | keep split under graph |
+
+Correctness: graph-split and eager-split produced byte-identical full 128-token
+greedy output. The split kernel changes one token versus fused MoE in this sample
+because atomic accumulation order changes floating-point rounding; graph replay
+adds no further difference. Graph capture took 0.02 GiB and completed in under
+one second for batch size 1.
+
+## 2026-07-09: dual-B60 TP2, FP8 KV cache, 128k context
+
+Status: working eager long-context configuration. Model:
+`nvidia/Qwen3.6-35B-A3B-NVFP4`; two Arc Pro B60 devices; TP=2; FP8 E4M3 KV;
+XPU FlashAttention; 8,192-token chunked prefill; exact 128,000-token synthetic
+prompt followed by 128 greedy output tokens.
+
+Result: 217.94 s TTFT (587 average prompt tok/s), then 14.29 decode tok/s at
+128k context. The allocated KV cache capacity was 2,007,784 tokens, or 15.32
+concurrent 131,072-token sequences by vLLM's accounting.
+
+Two integration issues were isolated:
+
+- Attention `_q/_k/_v/_prob_scale` buffers were explicitly created on CPU. FP8
+  XPU FlashAttention lost the Level Zero device, while Triton's cache-write
+  kernel rejected `k_scale` as an inaccessible pointer. Moving these registered
+  scalar buffers to the query device on first forward fixed both backends.
+- The native Quixi FP8 decode GEMV is unsuitable for large-M prefill because
+  every M row rereads the weights. `VLLM_QUIXI_FP8_DISABLE=1` selects oneDNN's
+  W8A16 FP8 GEMM for this configuration and materially improves prefill.
+
+## 2026-07-09: segmented XPU Graph enables TP2 decode
+
+Status: working. The monolithic TP2 graph hung because XCCL collectives cannot
+execute while their submission queue is being recorded. PIECEWISE capture that
+also broke attention replayed incorrect state. The kept design uses full decode
+capture and breaks only tensor-returning collectives into eager segments.
+
+Implementation:
+
+- Breakable graph capture now supports out-of-place tensor results. Capture-time
+  output addresses remain static; replay copies each fresh collective result into
+  the original output before launching the next graph segment.
+- XPU graph segments retain their capture stream and perform explicit queue
+  handoffs around eager XCCL work.
+- `all_reduce`, `reduce_scatter`, and `all_gather` use lazy breakable wrappers to
+  avoid an import cycle in distributed initialization.
+- FP8 linear dispatches M > 4 to oneDNN GEMM and M <= 4 to Quixi GEMV, preserving
+  practical prefill and fast decode without duplicate weight storage.
+
+Results, TP2, batch 1, 128 greedy output tokens:
+
+| configuration | decode tok/s |
+|---|---:|
+| eager, split MoE, short prompt | 14.16 |
+| segmented full graph, fused MoE, short prompt | 40.85 |
+| segmented full graph, split MoE, short prompt | 64.81-65.22 |
+| eager, FP8 KV, 128k prompt | 14.29 |
+| segmented full graph, FP8 KV, 128k prompt | 57.67-58.53 |
+
+Correctness: the 128-token TP2 graph-split completion was byte-identical to the
+TP2 eager-split completion. The exact 128k synthetic request also completed
+without XCCL, graph, or device errors. Only capture size 1 is validated.
+
+## 2026-07-10: Port Qwen serving kernels back into QuixiCore-XPU
+
+Status: ported and correctness-gated in the working tree. Source provenance was
+reviewed before the port: the integration prototypes in
+`~/vllm/csrc_xpu_quixi/` originated from this repository's NVFP4/FP8 kernels
+and were developed locally for the Qwen optimization work. The backend port was
+adapted to QuixiCore's MIT-licensed raw-pointer ABI; no external reference
+implementation source was imported.
+
+Scope:
+
+- batched NVFP4 W4A16 row-loop plus the measured/rejected M-tiled research path;
+- native and oneDNN FP8 W8A16 in checkpoint-native `[N,K]` layout;
+- fused and high-occupancy split NVFP4 routed MoE;
+- Qwen3.5/Qwen3.6 non-interleaved GDN decode state update;
+- fused residual-add RMSNorm;
+- framework-neutral oneAPI command graphs and a current-stream-only PyTorch
+  `XPUGraph` wrapper.
+
+Correctness:
+
+- Pre-port baseline: `ctest --preset sycl --output-on-failure` passed 3/3.
+- Post-port C++ oracle: `tests/xpu_ops_smoke.cpp` passes FP32/FP16/BF16 NVFP4
+  GEMM, fused/split MoE, FP8 W8A16, GDN state transitions, and fused
+  add-RMSNorm. The complete op gate reports `PASS`.
+- Native graph replay: `tests/xpu_graph_smoke.cpp`, two replays with mutated
+  input, max abs `4.77603e-08`.
+- PyTorch parity: `bindings/pytorch/test_parity.py` reports `PASS`, including
+  W8A16 BF16 parity within tolerance (max abs `7.812e-03`), exact fused
+  residual mutation, fused/split NVFP4 MoE equality, split-MoE graph replay
+  with persistent scratch, and two mutated-input XPUGraph replays. Torch and
+  `tk_xpu` both enumerate the two physical B60 devices after filtering duplicate
+  OpenCL aliases in favor of the Level Zero platform.
+- Final repository gate after the port: `ctest --preset sycl
+  --output-on-failure` passes 4/4 (backend, device, full ops, command graph).
+
+Focused performance run: one Arc Pro B60, driver 1.14.37020, Unified Runtime
+over Level-Zero V2, oneAPI DPC++ 2026.1.0. Each table entry is the median of
+three independent process runs; min/max are across those runs. Each process
+used the listed command with 8-15 warmups and 20-50 timed iterations. Raw data:
+`perf/results/2026-07-10/qwen-serving-port/`.
+
+```bash
+./build-sycl/quixicore_xpu_bench --kernel <kernel> --variant <variant> \
+  --dtype bf16 <shape arguments> --iters <20|30|50> --warmup <8|10|15>
+```
+
+| kernel / shape | baseline median (min-max) | candidate median (min-max) | decision |
+|---|---:|---:|---|
+| FP8 W8A16 M1 N4096 K4096 | oneDNN 0.05066 ms (0.04418-0.05284) | SYCL 0.04565 ms (0.04515-0.04864) | keep native at M=1 (9.9%) |
+| NVFP4 GEMM M4 N4096 K4096 | row loop 0.17097 ms (0.17092-0.17133) | M-tiled 0.29380 ms (0.27223-0.29543) | reject M-tiled (1.72x slower) |
+| NVFP4 MoE M1 E256 top8 K2048 I512 | fused 0.62034 ms (0.53299-0.62918) | split 0.15930 ms (0.15910-0.15935) | keep split (3.89x) |
+| NVFP4 MoE M4 E256 top8 K2048 I512 | fused 0.69596 ms (0.69189-0.69874) | split 0.56130 ms (0.51841-0.56152) | keep split (19.4%) |
+| Qwen GDN B1 | production `_xpu_C` 0.031 ms (prior same-host run) | SYCL 0.02467 ms (0.02458-0.02483) | keep experimental (20.4%) |
+| fused add-RMSNorm rows1 dim4096 | exact Torch composite 85.801 us (81.492-89.537) | `tk_xpu` 7.847 us (7.739-7.953) | keep (10.93x API wall time) |
+
+The W8A16 crossover was re-measured rather than copied from the older vLLM
+threshold: oneDNN is already faster at M=2 (0.05186 vs 0.08639 ms) and M=4
+(0.04931 vs 0.16433 ms). `Variant::best` therefore selects native only for M=1
+and oneDNN for M>1. The final single-sequence graph configuration still takes
+the native path.
+
+Final harness validation corrected the multi-launch JSON statistics from one
+batch average to the median/min/max of five profiled batches. Three independent
+processes per route, 15 warmups and 50 calls per batch, preserved the crossover:
+
+| shape | oneDNN median (process range) | native median (process range) |
+|---|---:|---:|
+| M1 N4096 K4096 | 0.05118 ms (0.04623-0.05217) | 0.03090 ms (0.02869-0.04803) |
+| M2 N4096 K4096 | 0.05200 ms (0.05096-0.05228) | 0.07822 ms (0.07543-0.08505) |
+| M4 N4096 K4096 | 0.04336 ms (0.03416-0.05000) | 0.14316 ms (0.13176-0.14482) |
+
+The M1 native result is clock-state sensitive, which is reflected in the wider
+range, but its process median and the earlier three-process run both beat
+oneDNN. Raw output is in
+`perf/results/2026-07-10/qwen-serving-port-harness-v2/`.
+
+Graph decision: keep the reusable wrappers. Both native oneAPI command-graph
+replay and direct `at::xpu::XPUGraph` replay are stable. Collectives remain
+outside capture; TP2's eager-XCCL segment orchestration and stable-address copy
+are vLLM integration policy, not duplicated in the framework-neutral kernel
+library.
+
+## 2026-07-10: Qwen GDN state-slot contract synchronization
+
+Status: candidate correctness fix in the working tree; no speedup claim.
+
+Contract change: state slot 0 is now a valid active slot. Negative and
+out-of-range indices leave convolution and recurrent state untouched, return a
+zero recurrent core, and still pass through the projected `z`. This matches the
+vLLM scheduler-facing contract and removes the former first-slot correctness
+hole. The benchmark now includes slot 0 instead of reserving it.
+
+Environment: one Intel Arc Pro B60, oneAPI DPC++/C++ 2026.1.0 (20260617),
+Unified Runtime over Level-Zero V2, driver 1.14.37020. Commands used bf16,
+8 state slots, 25 warmups, and 100 timed calls; each process result is the
+median of five profiled batches with batch-level min/max.
+
+Correctness:
+
+- `ctest --preset sycl --output-on-failure`: 4/4 passed. The C++ oracle covers
+  slot 0 plus negative and upper-bound-invalid indices across f32/f16/bf16.
+- `bindings/pytorch/test_parity.py`: PASS, including slot-zero mutation,
+  invalid-index state preservation, exact `z` passthrough, manual GELU
+  backward, and graph lifecycle checks.
+
+| shape | pre-change process median (range) | post-change process median (range) | decision |
+|---|---:|---:|---|
+| GDN B1, slots8 | 0.02137 ms (0.02047-0.02382) | 0.02363 ms (0.02351-0.02370; 6 runs) | keep correctness fix; no performance claim |
+| GDN B4, slots8 | 0.06800 ms (0.06622-0.06832) | 0.06580 ms (0.06573-0.06807) | keep correctness fix |
+
+The B1 measurements remain clock-state sensitive: one pre-change process ran
+at 0.02382 ms and overlaps the post-change process range. The valid path still
+performs the same state update and `z` store; the change only broadens the
+index predicate and moves the existing `z` store before it. No speedup or
+regression claim is made from this run.
+
+The corresponding `vllm-xpu-kernels` wrapper routing was checked on the same
+device. At M1, automatic MoE selection matched explicit split (0.07806 vs
+0.07817 ms wall median) and beat fused (0.37646 ms); at M4, automatic matched
+split (0.28060 vs 0.28083 ms) and beat fused (0.35924 ms). Eager FP8 W8A16 M1
+selected the native-eligible checkpoint view at 0.01418 ms versus 0.01628 ms
+for a forced oneDNN layout at N=4096, K=2048. These are integration-level wall
+timings, not QuixiCore device-event speedup claims.
+
+Raw results: `perf/results/2026-07-10/gdn-contract-sync/raw.md`.

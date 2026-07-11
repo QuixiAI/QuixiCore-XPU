@@ -12,6 +12,13 @@ layout: canonical_variants
 # (oneDNN) path are co-equal, selectable at the ABI (quixicore::xpu::Variant),
 # analogous to the Metal backend's co-equal PyTorch and MLX bindings.
 variant_path_rule: kernels/<family>/<operation>/variants/xpu_<target>
+differentiation:
+  automatic_autograd: false
+  explicit_backward_operations: [gelu_backward]
+  scope: inference_first
+  note: >-
+    Forward operators require caller-managed gradients; training-complete
+    coverage is not claimed.
 families:
   norms:
     status: partial
@@ -108,9 +115,11 @@ operations:
   gelu_backward:
     family: activations
     status: implemented
+    direction: backward
     path: kernels/activations/gelu_backward
     dtypes: [f32, f16, bf16]
     tests: {correctness: tests/xpu_ops_smoke.cpp}
+    bindings: {pytorch: bindings/pytorch/tk_xpu_ext.sycl}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/activations/gelu_backward/variants/xpu_sycl}
   glu:
@@ -134,6 +143,15 @@ operations:
         status: implemented
         path: kernels/norms/rms_norm/variants/xpu_sycl
       # No oneDNN RMSNorm primitive; vendor/best resolve to xpu_sycl.
+  fused_add_rms_norm:
+    family: norms
+    status: experimental
+    path: kernels/norms/rms_norm
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {default: perf/configs/serving_qwen_decode.yaml}
+    variants:
+      - {name: xpu_sycl, status: experimental, path: kernels/norms/rms_norm/variants/xpu_sycl}
   dense_gemm:
     family: matmul
     status: implemented
@@ -223,6 +241,18 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/quantization/nvfp4_gemv/variants/xpu_sycl}
+  nvfp4_gemm:
+    family: quantization
+    status: experimental
+    path: kernels/quantization/nvfp4_gemv
+    dtypes: [f32, f16, bf16]
+    quant_format: nvfp4
+    layouts: {activation: "[M,K]", weight: "[N,K/2]", output: "[M,N]"}
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {default: perf/configs/serving_qwen_decode.yaml}
+    variants:
+      - {name: xpu_sycl_row_loop, status: experimental, path: kernels/quantization/nvfp4_gemv/variants/xpu_sycl}
+      - {name: xpu_sycl_mtiled, status: experimental, path: kernels/quantization/nvfp4_gemv/variants/xpu_sycl, note: "Measured research path; not selected at M=1,4,8"}
   fp8_gemm:
     family: quantization
     status: experimental
@@ -232,6 +262,18 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     note: Correct on B60 (e4m3/e5m2) but not hardware-accelerated this generation.
     variants:
+      - {name: xpu_onednn, status: experimental, path: kernels/quantization/fp8_gemm/variants/xpu_onednn}
+  fp8_gemm_w8a16:
+    family: quantization
+    status: experimental
+    path: kernels/quantization/fp8_gemm
+    quant_format: fp8
+    dtypes: [f32, f16, bf16]
+    layouts: {activation: "[M,K]", weight: "[N,K]", output: "[M,N]"}
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {default: perf/configs/serving_qwen_decode.yaml}
+    variants:
+      - {name: xpu_sycl, status: experimental, path: kernels/quantization/fp8_gemm/variants/xpu_sycl}
       - {name: xpu_onednn, status: experimental, path: kernels/quantization/fp8_gemm/variants/xpu_onednn}
   selective_scan:
     family: ssm
@@ -249,6 +291,19 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/linear_attention/linear_attn/variants/xpu_sycl}
+  qwen_gdn_decode:
+    family: linear_attention
+    status: experimental
+    path: kernels/linear_attention/qwen_gdn_decode
+    dtypes: [f32, f16, bf16]
+    scope: qwen3_5_qwen3_6_non_interleaved_decode
+    note: >-
+      State slots in [0,slots) are valid; invalid slots preserve z and skip
+      state mutation.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {default: perf/configs/serving_qwen_decode.yaml}
+    variants:
+      - {name: xpu_sycl, status: experimental, path: kernels/linear_attention/qwen_gdn_decode/variants/xpu_sycl}
   moe_route_topk:
     family: moe
     status: implemented
@@ -257,6 +312,17 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/moe/moe_route/variants/xpu_sycl}
+  nvfp4_moe:
+    family: moe
+    status: experimental
+    path: kernels/moe/nvfp4_moe
+    dtypes: [f32, f16, bf16]
+    quant_format: nvfp4
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {default: perf/configs/serving_qwen_decode.yaml}
+    variants:
+      - {name: xpu_sycl_fused, status: experimental, path: kernels/moe/nvfp4_moe/variants/xpu_sycl}
+      - {name: xpu_sycl_split, status: experimental, path: kernels/moe/nvfp4_moe/variants/xpu_sycl}
   dropout:
     family: utils
     status: implemented
@@ -354,10 +420,11 @@ operations:
 notes: >-
   GELU is the reference operation and landed with both a native SYCL variant and
   a co-equal oneDNN vendor variant, correctness-checked on Arc Pro B60 across
-  f32/f16/bf16 and benchmarked (see perf/optimization_status.md 2026-07-06). No
-  other family is claimed implemented until native XPU code, correctness tests,
-  and benchmark coverage land. GLU and GELU-backward remain planned, so the
-  activations family is `partial`.
+  f32/f16/bf16 and benchmarked (see perf/optimization_status.md 2026-07-06).
+  Operation status is authoritative per entry; family status remains `partial`
+  until the full shared-contract family is covered. The backend is
+  inference-first and does not claim complete backward or PyTorch-autograd
+  coverage.
 
 bindings:
   pytorch:
@@ -366,4 +433,6 @@ bindings:
     note: >-
       torch.xpu zero-copy binding (tk_xpu); queue off the tensor XPU stream ->
       ops ABI on data_ptr. Validated vs torch.xpu eager kernels (f32/bf16/f16).
+      Manual gelu_backward is exposed, but forward ops do not register autograd
+      formulas and training-complete backward coverage is not claimed.
       Requires a shared ops lib (icpx -fsycl) + a .sycl binding source.

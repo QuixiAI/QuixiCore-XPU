@@ -34,9 +34,23 @@ oneAPI/SYCL, Level Zero probes, and benchmark tooling.
 
 ## Status
 
-QuixiCore XPU is planned. The repository currently contains the initial backend
-scaffold: compatibility metadata, CMake build files, a small C++ status library,
-smoke tests, and a gated SYCL device probe.
+QuixiCore XPU is an active native backend. It includes correctness-tested SYCL
+and oneDNN implementations across activations, norms, attention, matrix
+multiplication, quantization, MoE, sampling, state-space models, and serving
+utilities. Operation-level maturity and supported variants are tracked in
+[`.quixicore/kernels.yaml`](.quixicore/kernels.yaml).
+
+The Qwen serving surface includes NVFP4 GEMM and MoE, FP8 W8A16 GEMM,
+Qwen GDN decode, fused residual-add RMSNorm, and current-stream SYCL command
+graph capture. These additions remain experimental while their ABI and
+cross-model coverage settle; see
+[`docs/qwen-serving-port.md`](docs/qwen-serving-port.md).
+
+The current public surface is inference- and serving-first. The native C++ API
+contains an explicit GELU backward kernel and AdamW consumes caller-provided
+gradients, but the PyTorch binding does not register autograd formulas for its
+forward operators. It exposes `gelu_backward` as a manual operation; it does
+not claim training-complete backward coverage.
 
 This repository is reserved for the native Intel GPU backend. Implementation work should live here, not in the QuixiCore umbrella repository and not in another backend repository.
 
@@ -70,12 +84,13 @@ cmake --build --preset dev
 ctest --preset dev
 ```
 
-On a machine with oneAPI DPC++ installed, enable the SYCL probe:
+On a machine with oneAPI DPC++ installed, enable the native kernels and tests:
 
 ```bash
+source /opt/intel/oneapi/setvars.sh
 cmake --preset sycl
 cmake --build --preset sycl
-ctest --preset sycl
+ctest --preset sycl --output-on-failure
 ```
 
 The SYCL preset expects `icpx` on `PATH`.
@@ -103,17 +118,22 @@ The XPU performance workflow follows the sibling backend pattern:
   snapshots.
 - `perf/results/` stores raw local runs and is ignored by git.
 
-The current scaffold harness records configure/build/test/probe health:
+Run the benchmark harness directly or use a focused configuration:
 
 ```bash
-python3 perf/bench_kernels.py --phase all --preset dev
+.venv/bin/python perf/bench_kernels.py --phase all --preset sycl
+.venv/bin/python perf/bench_kernels.py --phase kernels --preset sycl
 ```
+
+The kernel phase discovers the YAML sweeps in `perf/configs/`, including
+`serving_qwen_decode.yaml`.
 
 ## Current Kernel Coverage
 
-All QuixiCore kernel families are currently planned for XPU. No kernel family is
-claimed complete until native implementation, correctness tests, and benchmark
-coverage are present in this repository.
+Implemented and experimental operations are listed in
+[`.quixicore/kernels.yaml`](.quixicore/kernels.yaml). A family remains `partial`
+until every operation required by the shared QuixiCore contract has native
+correctness and benchmark coverage.
 
 ## License
 

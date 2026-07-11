@@ -1375,15 +1375,15 @@ bool check_mxfp4_gemv(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K
 }
 
 template <typename T>
-bool check_nvfp4_gemv(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K) {
+bool check_nvfp4_gemm(sycl::queue &q, DType act_dt, std::size_t M, std::size_t N, std::size_t K) {
   const float e2m1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
   const std::size_t bpr = K / 2, blkpr = K / 16;  // block 16
   std::uint8_t* w = sycl::malloc_shared<std::uint8_t>(N * bpr, q);
   std::uint8_t* bs = sycl::malloc_shared<std::uint8_t>(N * blkpr, q);  // e4m3 bytes
   float* bs_f = sycl::malloc_shared<float>(N * blkpr, q);   // desired scale floats
   float* bs_rt = sycl::malloc_shared<float>(N * blkpr, q);  // round-tripped exact
-  T* x = sycl::malloc_shared<T>(K, q);
-  T* y = sycl::malloc_shared<T>(N, q);
+  T *x = sycl::malloc_shared<T>(M * K, q);
+  T *y = sycl::malloc_shared<T>(M * N, q);
   const float gscale = 0.75f;
 
   auto nib = [&](std::size_t i) {
@@ -1395,7 +1395,8 @@ bool check_nvfp4_gemv(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K
     for (std::size_t b = 0; b < bpr; ++b)
       w[n * bpr + b] = static_cast<std::uint8_t>(nib(n * K + 2 * b) | (nib(n * K + 2 * b + 1) << 4));
   for (std::size_t i = 0; i < N * blkpr; ++i) bs_f[i] = 0.5f + 0.5f * std::abs(sample(i + 31));
-  for (std::size_t k = 0; k < K; ++k) x[k] = static_cast<T>(sample(k + 41));
+  for (std::size_t i = 0; i < M * K; ++i)
+    x[i] = static_cast<T>(sample(i + 41));
 
   bool ok = true;
   try {
@@ -1403,30 +1404,33 @@ bool check_nvfp4_gemv(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K
     // scale values the kernel consumes (its e4m3 decode must match).
     ops::fp8_encode(q, bs_f, bs, N * blkpr, ops::Fp8Kind::e4m3);
     ops::fp8_decode(q, bs, bs_rt, N * blkpr, ops::Fp8Kind::e4m3);
-    ops::nvfp4_gemv(q, w, bs, gscale, x, y, N, K, act_dt, Variant::sycl, true);
+    ops::nvfp4_gemm(q, w, bs, gscale, x, y, M, N, K, act_dt, Variant::sycl, true);
 
     const Tol base = tol_for(act_dt);
     const double rtol = base.rtol * std::sqrt(static_cast<double>(K)) + 3e-3;
     double worst = 0.0, max_abs = 0.0;
-    for (std::size_t n = 0; n < N; ++n) {
-      double acc = 0.0;
-      for (std::size_t k = 0; k < K; ++k) {
-        const std::uint8_t byte = w[n * bpr + k / 2];
-        const int n4 = (k & 1) ? (byte >> 4) : (byte & 0xF);
-        double val = e2m1[n4 & 7];
-        if (n4 & 8) val = -val;
-        acc += val * (double)bs_rt[n * blkpr + k / 16] * (double)gscale * (double)x[k];
+    for (std::size_t m = 0; m < M; ++m) {
+      for (std::size_t n = 0; n < N; ++n) {
+        double acc = 0.0;
+        for (std::size_t k = 0; k < K; ++k) {
+          const std::uint8_t byte = w[n * bpr + k / 2];
+          const int n4 = (k & 1) ? (byte >> 4) : (byte & 0xF);
+          double val = e2m1[n4 & 7];
+          if (n4 & 8)
+            val = -val;
+          acc += val * (double)bs_rt[n * blkpr + k / 16] * (double)gscale * (double)x[m * K + k];
+        }
+        const double ref = static_cast<double>(static_cast<T>(acc));
+        const double err = std::abs(static_cast<double>(y[m * N + n]) - ref);
+        max_abs = std::max(max_abs, err);
+        worst = std::max(worst, err - (base.atol + rtol * std::abs(ref)));
       }
-      const double ref = static_cast<double>(static_cast<T>(acc));
-      const double err = std::abs(static_cast<double>(y[n]) - ref);
-      max_abs = std::max(max_abs, err);
-      worst = std::max(worst, err - (base.atol + rtol * std::abs(ref)));
     }
     ok = worst <= 0.0;
-    std::cout << "  nvfp4_gemv act=" << dtype_name(act_dt) << " (N=" << N << " K=" << K
-              << ") max_abs=" << max_abs << (ok ? "  ok" : "  FAIL") << '\n';
+    std::cout << "  nvfp4_gemm act=" << dtype_name(act_dt) << " (M=" << M << " N=" << N
+              << " K=" << K << ") max_abs=" << max_abs << (ok ? "  ok" : "  FAIL") << '\n';
   } catch (const std::exception& e) {
-    std::cout << "  nvfp4_gemv: skipped (" << e.what() << ")\n";
+    std::cout << "  nvfp4_gemm: skipped (" << e.what() << ")\n";
   }
   sycl::free(w, q); sycl::free(bs, q); sycl::free(bs_f, q); sycl::free(bs_rt, q);
   sycl::free(x, q); sycl::free(y, q);
@@ -1679,6 +1683,463 @@ bool check_layernorm(sycl::queue& q, DType dt, Variant variant, std::size_t rows
   return ok;
 }
 
+template <typename T>
+bool check_fp8_w8a16(sycl::queue &q, DType act_dt, ops::Fp8Kind kind, std::size_t M, std::size_t N,
+                     std::size_t K, bool per_channel, Variant variant) {
+  T *activations = sycl::malloc_shared<T>(M * K, q);
+  float *weight_f32 = sycl::malloc_shared<float>(N * K, q);
+  std::uint8_t *weight = sycl::malloc_shared<std::uint8_t>(N * K, q);
+  float *weight_roundtrip = sycl::malloc_shared<float>(N * K, q);
+  float *scales = sycl::malloc_shared<float>(per_channel ? N : 1, q);
+  T *output = sycl::malloc_shared<T>(M * N, q);
+  for (std::size_t i = 0; i < M * K; ++i)
+    activations[i] = static_cast<T>(sample(i + 101) * 0.25f);
+  for (std::size_t i = 0; i < N * K; ++i)
+    weight_f32[i] = sample(i + 211) * 0.25f;
+  for (std::size_t i = 0; i < (per_channel ? N : 1); ++i)
+    scales[i] = 0.5f + 0.01f * static_cast<float>(i % 11);
+
+  bool ok = true;
+  try {
+    ops::fp8_encode(q, weight_f32, weight, N * K, kind);
+    ops::fp8_decode(q, weight, weight_roundtrip, N * K, kind);
+    ops::fp8_gemm_w8a16(q, activations, weight, scales, output, M, N, K, kind, per_channel, act_dt,
+                        variant, true);
+
+    const Tol base = tol_for(act_dt);
+    const double rtol = base.rtol * std::sqrt(static_cast<double>(K)) + 8e-3;
+    double max_abs = 0.0;
+    double worst = 0.0;
+    for (std::size_t m = 0; m < M; ++m) {
+      for (std::size_t n = 0; n < N; ++n) {
+        double accumulator = 0.0;
+        for (std::size_t k = 0; k < K; ++k) {
+          accumulator += static_cast<double>(activations[m * K + k]) *
+                         static_cast<double>(weight_roundtrip[n * K + k]);
+        }
+        const double reference =
+            static_cast<double>(static_cast<T>(accumulator * scales[per_channel ? n : 0]));
+        const double error = std::abs(static_cast<double>(output[m * N + n]) - reference);
+        max_abs = std::max(max_abs, error);
+        worst = std::max(worst, error - (base.atol + rtol * std::abs(reference)));
+      }
+    }
+    ok = worst <= 0.0;
+    std::cout << "  fp8_w8a16 act=" << dtype_name(act_dt) << " variant=" << variant_name(variant)
+              << " (M=" << M << " N=" << N << " K=" << K << ") max_abs=" << max_abs
+              << (ok ? "  ok" : "  FAIL") << '\n';
+  } catch (const std::exception &error) {
+    std::cout << "  fp8_w8a16: skipped (" << error.what() << ")\n";
+  }
+  sycl::free(activations, q);
+  sycl::free(weight_f32, q);
+  sycl::free(weight, q);
+  sycl::free(weight_roundtrip, q);
+  sycl::free(scales, q);
+  sycl::free(output, q);
+  return ok;
+}
+
+template <typename T>
+bool check_fused_add_rms_norm(sycl::queue &q, DType dt, std::size_t rows, std::size_t dim) {
+  const std::size_t count = rows * dim;
+  T *x = sycl::malloc_shared<T>(count, q);
+  T *residual = sycl::malloc_shared<T>(count, q);
+  T *weight = sycl::malloc_shared<T>(dim, q);
+  T *output = sycl::malloc_shared<T>(count, q);
+  std::vector<T> residual_before(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    x[i] = static_cast<T>(sample(i + 17));
+    residual[i] = static_cast<T>(sample(i + 29) * 0.5f);
+    residual_before[i] = residual[i];
+  }
+  for (std::size_t i = 0; i < dim; ++i)
+    weight[i] = static_cast<T>(0.75f + sample(i + 43) * 0.1f);
+  constexpr float eps = 1e-6f;
+
+  ops::fused_add_rms_norm(q, x, residual, weight, output, rows, dim, eps, dt, Variant::sycl, true);
+
+  const Tol tol = tol_for(dt);
+  double max_output_error = 0.0;
+  std::size_t residual_mismatches = 0;
+  for (std::size_t row = 0; row < rows; ++row) {
+    double sum_squares = 0.0;
+    for (std::size_t i = 0; i < dim; ++i) {
+      const double value = static_cast<double>(x[row * dim + i]) +
+                           static_cast<double>(residual_before[row * dim + i]);
+      sum_squares += value * value;
+    }
+    const double inverse_rms = 1.0 / std::sqrt(sum_squares / static_cast<double>(dim) + eps);
+    for (std::size_t i = 0; i < dim; ++i) {
+      const double value = static_cast<double>(x[row * dim + i]) +
+                           static_cast<double>(residual_before[row * dim + i]);
+      const T residual_reference = static_cast<T>(value);
+      if (residual[row * dim + i] != residual_reference)
+        ++residual_mismatches;
+      const double normalized = static_cast<double>(static_cast<T>(value * inverse_rms));
+      const double reference =
+          static_cast<double>(static_cast<T>(normalized * static_cast<double>(weight[i])));
+      max_output_error = std::max(max_output_error,
+                                  std::abs(static_cast<double>(output[row * dim + i]) - reference));
+    }
+  }
+  const bool ok = residual_mismatches == 0 && max_output_error <= tol.atol + 2.0 * tol.rtol;
+  std::cout << "  fused_add_rms_norm dt=" << dtype_name(dt)
+            << " residual_mismatches=" << residual_mismatches << " max_abs=" << max_output_error
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  sycl::free(x, q);
+  sycl::free(residual, q);
+  sycl::free(weight, q);
+  sycl::free(output, q);
+  return ok;
+}
+
+float decode_e4m3(std::uint8_t bits) {
+  const float sign = (bits & 0x80u) ? -1.0f : 1.0f;
+  const int exponent = (bits >> 3) & 0x0f;
+  const int mantissa = bits & 0x07;
+  if (exponent == 0) {
+    return sign * std::ldexp(static_cast<float>(mantissa) / 8.0f, -6);
+  }
+  return sign * std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f, exponent - 7);
+}
+
+float decode_e2m1(std::uint8_t nibble) {
+  constexpr float values[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+  const float magnitude = values[nibble & 0x07u];
+  return (nibble & 0x08u) ? -magnitude : magnitude;
+}
+
+std::uint8_t deterministic_fp4(std::size_t index) {
+  const std::uint8_t magnitude = static_cast<std::uint8_t>((index * 5 + 1) & 0x07u);
+  const std::uint8_t sign = (index % 5 == 0) ? 0x08u : 0u;
+  return sign | magnitude;
+}
+
+void fill_packed_fp4(std::uint8_t *packed, std::size_t elements) {
+  for (std::size_t i = 0; i < elements / 2; ++i) {
+    packed[i] =
+        deterministic_fp4(2 * i) | static_cast<std::uint8_t>(deterministic_fp4(2 * i + 1) << 4);
+  }
+}
+
+float nvfp4_value(const std::uint8_t *packed, const std::uint8_t *scales, std::size_t row,
+                  std::size_t column, std::size_t width, float global_scale) {
+  const std::uint8_t byte = packed[row * (width / 2) + column / 2];
+  const std::uint8_t nibble =
+      column & 1 ? static_cast<std::uint8_t>(byte >> 4) : static_cast<std::uint8_t>(byte & 0x0fu);
+  return decode_e2m1(nibble) * decode_e4m3(scales[row * (width / 16) + column / 16]) * global_scale;
+}
+
+template <typename T> bool check_nvfp4_moe(sycl::queue &q, DType act_dt) {
+  constexpr std::size_t M = 2;
+  constexpr std::size_t E = 4;
+  constexpr std::size_t top_k = 2;
+  constexpr std::size_t K = 64;
+  constexpr std::size_t I = 32;
+  constexpr std::size_t two_i = 2 * I;
+
+  T *hidden = sycl::malloc_shared<T>(M * K, q);
+  int *expert_ids = sycl::malloc_shared<int>(M * top_k, q);
+  float *router_weights = sycl::malloc_shared<float>(M * top_k, q);
+  std::uint8_t *w13 = sycl::malloc_shared<std::uint8_t>(E * two_i * K / 2, q);
+  std::uint8_t *w13_scales = sycl::malloc_shared<std::uint8_t>(E * two_i * K / 16, q);
+  float *w13_global = sycl::malloc_shared<float>(E, q);
+  std::uint8_t *w2 = sycl::malloc_shared<std::uint8_t>(E * K * I / 2, q);
+  std::uint8_t *w2_scales = sycl::malloc_shared<std::uint8_t>(E * K * I / 16, q);
+  float *w2_global = sycl::malloc_shared<float>(E, q);
+  float *scratch = sycl::malloc_shared<float>(M * top_k * two_i, q);
+  float *fused = sycl::malloc_shared<float>(M * K, q);
+  float *split = sycl::malloc_shared<float>(M * K, q);
+
+  for (std::size_t i = 0; i < M * K; ++i)
+    hidden[i] = static_cast<T>(sample(i + 307) * 0.1f);
+  expert_ids[0] = 0;
+  expert_ids[1] = 2;
+  expert_ids[2] = 1;
+  expert_ids[3] = -1;
+  router_weights[0] = 0.6f;
+  router_weights[1] = 0.4f;
+  router_weights[2] = 0.7f;
+  router_weights[3] = 0.3f;
+  fill_packed_fp4(w13, E * two_i * K);
+  fill_packed_fp4(w2, E * K * I);
+  for (std::size_t i = 0; i < E * two_i * K / 16; ++i)
+    w13_scales[i] = (i & 1) ? 0x38u : 0x30u;
+  for (std::size_t i = 0; i < E * K * I / 16; ++i)
+    w2_scales[i] = (i & 1) ? 0x30u : 0x38u;
+  for (std::size_t e = 0; e < E; ++e) {
+    w13_global[e] = 0.02f + 0.002f * static_cast<float>(e);
+    w2_global[e] = 0.03f + 0.002f * static_cast<float>(e);
+  }
+
+  ops::nvfp4_moe_fused(q, hidden, expert_ids, router_weights, w13, w13_scales, w13_global, w2,
+                       w2_scales, w2_global, fused, M, E, top_k, K, I, act_dt, true, Variant::sycl,
+                       true);
+  ops::nvfp4_moe_split(q, hidden, expert_ids, router_weights, w13, w13_scales, w13_global, w2,
+                       w2_scales, w2_global, scratch, split, M, E, top_k, K, I, act_dt, true,
+                       Variant::sycl, true);
+
+  std::vector<float> reference(M * K, 0.0f);
+  std::vector<float> gate_up(two_i);
+  std::vector<float> activated(I);
+  for (std::size_t m = 0; m < M; ++m) {
+    for (std::size_t route = 0; route < top_k; ++route) {
+      const std::size_t pair = m * top_k + route;
+      const int expert_id = expert_ids[pair];
+      if (expert_id < 0 || static_cast<std::size_t>(expert_id) >= E)
+        continue;
+      const std::size_t expert = static_cast<std::size_t>(expert_id);
+      const std::size_t w13_row0 = expert * two_i;
+      const std::size_t w2_row0 = expert * K;
+      for (std::size_t row = 0; row < two_i; ++row) {
+        float accumulator = 0.0f;
+        for (std::size_t k = 0; k < K; ++k) {
+          accumulator += nvfp4_value(w13, w13_scales, w13_row0 + row, k, K, w13_global[expert]) *
+                         static_cast<float>(hidden[m * K + k]);
+        }
+        gate_up[row] = accumulator;
+      }
+      for (std::size_t i = 0; i < I; ++i) {
+        activated[i] = static_cast<float>(silu_ref(gate_up[i])) * gate_up[i + I];
+      }
+      for (std::size_t row = 0; row < K; ++row) {
+        float accumulator = 0.0f;
+        for (std::size_t i = 0; i < I; ++i) {
+          accumulator +=
+              nvfp4_value(w2, w2_scales, w2_row0 + row, i, I, w2_global[expert]) * activated[i];
+        }
+        reference[m * K + row] += router_weights[pair] * accumulator;
+      }
+    }
+  }
+
+  double fused_error = 0.0;
+  double split_error = 0.0;
+  double variants_error = 0.0;
+  for (std::size_t i = 0; i < M * K; ++i) {
+    fused_error = std::max(fused_error, std::abs(static_cast<double>(fused[i] - reference[i])));
+    split_error = std::max(split_error, std::abs(static_cast<double>(split[i] - reference[i])));
+    variants_error = std::max(variants_error, std::abs(static_cast<double>(split[i] - fused[i])));
+  }
+  const double tolerance = act_dt == DType::f32 ? 8e-4 : 3e-3;
+  const bool ok =
+      fused_error <= tolerance && split_error <= tolerance && variants_error <= tolerance;
+  std::cout << "  nvfp4_moe act=" << dtype_name(act_dt) << " fused_max_abs=" << fused_error
+            << " split_max_abs=" << split_error << " variants_max_abs=" << variants_error
+            << (ok ? "  ok" : "  FAIL") << '\n';
+
+  sycl::free(hidden, q);
+  sycl::free(expert_ids, q);
+  sycl::free(router_weights, q);
+  sycl::free(w13, q);
+  sycl::free(w13_scales, q);
+  sycl::free(w13_global, q);
+  sycl::free(w2, q);
+  sycl::free(w2_scales, q);
+  sycl::free(w2_global, q);
+  sycl::free(scratch, q);
+  sycl::free(fused, q);
+  sycl::free(split, q);
+  return ok;
+}
+
+template <typename T> bool check_qwen_gdn_decode(sycl::queue &q, DType act_dt) {
+  constexpr std::size_t batch = 1;
+  constexpr std::size_t slots = 2;
+  constexpr std::size_t query_heads = 16;
+  constexpr std::size_t value_heads = 32;
+  constexpr std::size_t head_dim = 128;
+  constexpr std::size_t query_dim = query_heads * head_dim;
+  constexpr std::size_t key_dim = query_heads * head_dim;
+  constexpr std::size_t value_dim = value_heads * head_dim;
+  constexpr std::size_t conv_dim = query_dim + key_dim + value_dim;
+  constexpr std::size_t qkvz_dim = conv_dim + value_dim;
+
+  T *projected_qkvz = sycl::malloc_shared<T>(batch * qkvz_dim, q);
+  T *projected_ba = sycl::malloc_shared<T>(batch * 2 * value_heads, q);
+  T *conv_state = sycl::malloc_shared<T>(slots * 3 * conv_dim, q);
+  float *ssm_state = sycl::malloc_shared<float>(slots * value_heads * head_dim * head_dim, q);
+  T *conv_weight = sycl::malloc_shared<T>(conv_dim * 4, q);
+  T *conv_bias = sycl::malloc_shared<T>(conv_dim, q);
+  float *A_log = sycl::malloc_shared<float>(value_heads, q);
+  T *dt_bias = sycl::malloc_shared<T>(value_heads, q);
+  int *state_indices = sycl::malloc_shared<int>(batch, q);
+  T *mixed_qkv = sycl::malloc_shared<T>(batch * conv_dim, q);
+  T *core = sycl::malloc_shared<T>(batch * value_dim, q);
+  T *z = sycl::malloc_shared<T>(batch * value_dim, q);
+
+  for (std::size_t i = 0; i < batch * qkvz_dim; ++i)
+    projected_qkvz[i] = static_cast<T>(sample(i + 401) * 0.02f);
+  for (std::size_t i = 0; i < batch * 2 * value_heads; ++i)
+    projected_ba[i] = static_cast<T>(sample(i + 503) * 0.1f);
+  for (std::size_t i = 0; i < slots * 3 * conv_dim; ++i)
+    conv_state[i] = static_cast<T>(sample(i + 607) * 0.01f);
+  for (std::size_t i = 0; i < slots * value_heads * head_dim * head_dim; ++i)
+    ssm_state[i] = sample(i + 701) * 0.001f;
+  for (std::size_t i = 0; i < conv_dim * 4; ++i)
+    conv_weight[i] = static_cast<T>(sample(i + 809) * 0.01f);
+  for (std::size_t i = 0; i < conv_dim; ++i)
+    conv_bias[i] = static_cast<T>(sample(i + 907) * 0.001f);
+  for (std::size_t i = 0; i < value_heads; ++i) {
+    A_log[i] = -1.5f + 0.01f * static_cast<float>(i);
+    dt_bias[i] = static_cast<T>(0.1f + 0.002f * static_cast<float>(i));
+  }
+  state_indices[0] = 0;
+
+  std::vector<T> conv_reference(conv_state, conv_state + slots * 3 * conv_dim);
+  std::vector<float> state_reference(ssm_state,
+                                     ssm_state + slots * value_heads * head_dim * head_dim);
+  std::vector<T> mixed_reference(batch * conv_dim);
+  std::vector<T> core_reference(batch * value_dim);
+  std::vector<T> z_reference(batch * value_dim);
+
+  for (std::size_t channel = 0; channel < conv_dim; ++channel) {
+    const std::size_t state0 = channel;
+    const float history0 = static_cast<float>(conv_reference[state0]);
+    const float history1 = static_cast<float>(conv_reference[state0 + conv_dim]);
+    const float history2 = static_cast<float>(conv_reference[state0 + 2 * conv_dim]);
+    const T input = projected_qkvz[channel];
+    conv_reference[state0] = static_cast<T>(history1);
+    conv_reference[state0 + conv_dim] = static_cast<T>(history2);
+    conv_reference[state0 + 2 * conv_dim] = input;
+    float value = static_cast<float>(conv_bias[channel]);
+    value += history0 * static_cast<float>(conv_weight[channel * 4]);
+    value += history1 * static_cast<float>(conv_weight[channel * 4 + 1]);
+    value += history2 * static_cast<float>(conv_weight[channel * 4 + 2]);
+    value += static_cast<float>(input) * static_cast<float>(conv_weight[channel * 4 + 3]);
+    mixed_reference[channel] = static_cast<T>(value / (1.0f + std::exp(-value)));
+    if (channel >= conv_dim - value_dim) {
+      const std::size_t v = channel - (conv_dim - value_dim);
+      z_reference[v] = projected_qkvz[conv_dim + v];
+    }
+  }
+
+  std::vector<float> query(head_dim);
+  std::vector<float> key(head_dim);
+  for (std::size_t value_head = 0; value_head < value_heads; ++value_head) {
+    const std::size_t query_head = value_head / 2;
+    float query_norm = 1e-6f;
+    float key_norm = 1e-6f;
+    for (std::size_t i = 0; i < head_dim; ++i) {
+      const float q_value = static_cast<float>(mixed_reference[query_head * head_dim + i]);
+      const float k_value =
+          static_cast<float>(mixed_reference[query_dim + query_head * head_dim + i]);
+      query_norm += q_value * q_value;
+      key_norm += k_value * k_value;
+    }
+    const float query_scale = 0.08838834764831845f / std::sqrt(query_norm);
+    const float key_scale = 1.0f / std::sqrt(key_norm);
+    for (std::size_t i = 0; i < head_dim; ++i) {
+      query[i] = static_cast<float>(mixed_reference[query_head * head_dim + i]) * query_scale;
+      key[i] =
+          static_cast<float>(mixed_reference[query_dim + query_head * head_dim + i]) * key_scale;
+    }
+    const float a = static_cast<float>(projected_ba[value_heads + value_head]);
+    const float b = static_cast<float>(projected_ba[value_head]);
+    const float softplus =
+        a + static_cast<float>(dt_bias[value_head]) <= 20.0f
+            ? std::log(1.0f + std::exp(a + static_cast<float>(dt_bias[value_head])))
+            : a + static_cast<float>(dt_bias[value_head]);
+    const float decay = std::exp(-std::exp(A_log[value_head]) * softplus);
+    const float beta = 1.0f / (1.0f + std::exp(-b));
+    for (std::size_t value_lane = 0; value_lane < head_dim; ++value_lane) {
+      const std::size_t state_base =
+          ((value_head * head_dim + value_lane) * head_dim);
+      float prediction = 0.0f;
+      for (std::size_t k = 0; k < head_dim; ++k)
+        prediction += state_reference[state_base + k] * decay * key[k];
+      const float value = static_cast<float>(
+          mixed_reference[query_dim + key_dim + value_head * head_dim + value_lane]);
+      const float delta = (value - prediction) * beta;
+      float output = 0.0f;
+      for (std::size_t k = 0; k < head_dim; ++k) {
+        const float updated = state_reference[state_base + k] * decay + delta * key[k];
+        state_reference[state_base + k] = updated;
+        output += updated * query[k];
+      }
+      core_reference[value_head * head_dim + value_lane] = static_cast<T>(output);
+    }
+  }
+
+  ops::qwen_gdn_decode(q, projected_qkvz, projected_ba, conv_state, ssm_state, conv_weight,
+                       conv_bias, A_log, dt_bias, state_indices, mixed_qkv, core, z, batch, slots,
+                       false, act_dt, DType::f32, act_dt, Variant::sycl, true);
+
+  std::size_t conv_mismatches = 0;
+  std::size_t z_mismatches = 0;
+  double core_error = 0.0;
+  double state_error = 0.0;
+  for (std::size_t i = 0; i < slots * 3 * conv_dim; ++i)
+    if (conv_state[i] != conv_reference[i])
+      ++conv_mismatches;
+  for (std::size_t i = 0; i < value_dim; ++i) {
+    if (z[i] != z_reference[i])
+      ++z_mismatches;
+    core_error = std::max(core_error, std::abs(static_cast<double>(core[i]) -
+                                               static_cast<double>(core_reference[i])));
+  }
+  for (std::size_t i = 0; i < slots * value_heads * head_dim * head_dim; ++i) {
+    state_error =
+        std::max(state_error, std::abs(static_cast<double>(ssm_state[i] - state_reference[i])));
+  }
+  const double core_tolerance = act_dt == DType::f32 ? 2e-5 : 4e-3;
+  std::size_t invalid_core_mismatches = 0;
+  std::size_t invalid_z_mismatches = 0;
+  std::size_t invalid_state_mismatches = 0;
+  const std::vector<T> conv_after_valid(conv_state,
+                                        conv_state + slots * 3 * conv_dim);
+  const std::vector<float> state_after_valid(
+      ssm_state, ssm_state + slots * value_heads * head_dim * head_dim);
+  for (const int invalid_index : {-1, static_cast<int>(slots)}) {
+    state_indices[0] = invalid_index;
+    ops::qwen_gdn_decode(q, projected_qkvz, projected_ba, conv_state,
+                         ssm_state, conv_weight, conv_bias, A_log, dt_bias,
+                         state_indices, mixed_qkv, core, z, batch, slots,
+                         false, act_dt, DType::f32, act_dt, Variant::sycl,
+                         true);
+    for (std::size_t i = 0; i < value_dim; ++i) {
+      if (core[i] != T(0))
+        ++invalid_core_mismatches;
+      if (z[i] != projected_qkvz[conv_dim + i])
+        ++invalid_z_mismatches;
+    }
+    for (std::size_t i = 0; i < slots * 3 * conv_dim; ++i)
+      if (conv_state[i] != conv_after_valid[i])
+        ++invalid_state_mismatches;
+    for (std::size_t i = 0;
+         i < slots * value_heads * head_dim * head_dim; ++i)
+      if (ssm_state[i] != state_after_valid[i])
+        ++invalid_state_mismatches;
+  }
+  const bool ok = conv_mismatches == 0 && z_mismatches == 0 &&
+                  core_error <= core_tolerance && state_error <= 2e-5 &&
+                  invalid_core_mismatches == 0 &&
+                  invalid_z_mismatches == 0 &&
+                  invalid_state_mismatches == 0;
+  std::cout << "  qwen_gdn_decode act=" << dtype_name(act_dt)
+            << " conv_mismatches=" << conv_mismatches << " z_mismatches=" << z_mismatches
+            << " core_max_abs=" << core_error << " state_max_abs=" << state_error
+            << " invalid_core_mismatches=" << invalid_core_mismatches
+            << " invalid_z_mismatches=" << invalid_z_mismatches
+            << " invalid_state_mismatches=" << invalid_state_mismatches
+            << (ok ? "  ok" : "  FAIL") << '\n';
+
+  sycl::free(projected_qkvz, q);
+  sycl::free(projected_ba, q);
+  sycl::free(conv_state, q);
+  sycl::free(ssm_state, q);
+  sycl::free(conv_weight, q);
+  sycl::free(conv_bias, q);
+  sycl::free(A_log, q);
+  sycl::free(dt_bias, q);
+  sycl::free(state_indices, q);
+  sycl::free(mixed_qkv, q);
+  sycl::free(core, q);
+  sycl::free(z, q);
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -1740,8 +2201,12 @@ int main() {
   failures += check_mxfp4_gemv<bf16_t>(q, DType::bf16, 128, 4096) ? 0 : 1;
 
   // nvfp4 GEMV (native e2m1 + e4m3 block scale + per-tensor scale).
-  failures += check_nvfp4_gemv<float>(q, DType::f32, 128, 4096) ? 0 : 1;
-  failures += check_nvfp4_gemv<bf16_t>(q, DType::bf16, 128, 4096) ? 0 : 1;
+  failures += check_nvfp4_gemm<float>(q, DType::f32, 1, 128, 4096) ? 0 : 1;
+  failures += check_nvfp4_gemm<half_t>(q, DType::f16, 2, 128, 4096) ? 0 : 1;
+  failures += check_nvfp4_gemm<bf16_t>(q, DType::bf16, 3, 128, 4096) ? 0 : 1;
+  failures += check_nvfp4_moe<float>(q, DType::f32) ? 0 : 1;
+  failures += check_nvfp4_moe<half_t>(q, DType::f16) ? 0 : 1;
+  failures += check_nvfp4_moe<bf16_t>(q, DType::bf16) ? 0 : 1;
 
   // GGUF q8_0 / q4_0 GEMV (native block-layout decode).
   failures += check_gguf_gemv<float>(q, DType::f32, ops::GgufType::q8_0, "q8_0", 128, 4096) ? 0 : 1;
@@ -1794,6 +2259,22 @@ int main() {
   failures += check_fp8_gemm<float>(q, DType::f32, ops::Fp8Kind::e5m2, "e5m2", 1, 128, 256, Variant::sycl) ? 0 : 1;
   failures += check_fp8_gemm<float>(q, DType::f32, ops::Fp8Kind::e4m3, "e4m3", 1, 101, 203, Variant::sycl) ? 0 : 1;
   failures += check_fp8_gemm<bf16_t>(q, DType::bf16, ops::Fp8Kind::e4m3, "e4m3", 1, 128, 256, Variant::sycl) ? 0 : 1;
+  failures +=
+      check_fp8_w8a16<float>(q, DType::f32, ops::Fp8Kind::e4m3, 1, 128, 256, true, Variant::sycl)
+          ? 0
+          : 1;
+  failures +=
+      check_fp8_w8a16<bf16_t>(q, DType::bf16, ops::Fp8Kind::e5m2, 4, 128, 256, false, Variant::sycl)
+          ? 0
+          : 1;
+  failures +=
+      check_fp8_w8a16<half_t>(q, DType::f16, ops::Fp8Kind::e4m3, 4, 128, 256, true, Variant::best)
+          ? 0
+          : 1;
+  failures +=
+      check_fp8_w8a16<bf16_t>(q, DType::bf16, ops::Fp8Kind::e4m3, 8, 128, 256, true, Variant::best)
+          ? 0
+          : 1;
 
   // rope / adamw / argmax (native only).
   failures += check_rope<float>(q, DType::f32, 32, 8, 64) ? 0 : 1;
@@ -1813,6 +2294,9 @@ int main() {
   // linear_attention: non-causal linear attention.
   failures += check_linear_attn<float>(q, DType::f32, 8, 256, 64) ? 0 : 1;
   failures += check_linear_attn<bf16_t>(q, DType::bf16, 8, 128, 64) ? 0 : 1;
+  failures += check_qwen_gdn_decode<float>(q, DType::f32) ? 0 : 1;
+  failures += check_qwen_gdn_decode<half_t>(q, DType::f16) ? 0 : 1;
+  failures += check_qwen_gdn_decode<bf16_t>(q, DType::bf16) ? 0 : 1;
 
   // ssm: Mamba selective scan.
   failures += check_selective_scan<float>(q, DType::f32, 1024, 512, 16) ? 0 : 1;
@@ -1848,6 +2332,9 @@ int main() {
     failures += check_layernorm<half_t>(q, DType::f16, v, rows, dim) ? 0 : 1;
     failures += check_layernorm<bf16_t>(q, DType::bf16, v, rows, dim) ? 0 : 1;
   }
+  failures += check_fused_add_rms_norm<float>(q, DType::f32, rows, dim) ? 0 : 1;
+  failures += check_fused_add_rms_norm<half_t>(q, DType::f16, rows, dim) ? 0 : 1;
+  failures += check_fused_add_rms_norm<bf16_t>(q, DType::bf16, rows, dim) ? 0 : 1;
 
   if (failures) {
     std::cerr << "FAIL: " << failures << " case(s) exceeded tolerance\n";

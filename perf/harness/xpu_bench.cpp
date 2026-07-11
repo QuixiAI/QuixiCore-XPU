@@ -10,7 +10,8 @@
 //
 // Methodology:
 //   * warm up (JIT + caches) for `--warmup` launches,
-//   * time `--iters` launches, each measured by its own profiling event,
+//   * time single-launch kernels by event and multi-launch ops in five
+//     profiled batches of `--iters` calls,
 //   * report median / min / max device time and effective bandwidth.
 //
 // Output is one JSON object per line on stdout (schema_version 2), suitable for
@@ -53,7 +54,9 @@
 #include "sampling/argmax/argmax_kernel.hpp"
 #include "sampling/sample/sample_kernel.hpp"
 #include "linear_attention/linear_attn/linear_attn_kernel.hpp"
+#include "linear_attention/qwen_gdn_decode/qwen_gdn_kernel.hpp"
 #include "moe/moe_route/moe_route_kernel.hpp"
+#include "moe/nvfp4_moe/nvfp4_moe_kernel.hpp"
 #include "ssm/selective_scan/selective_scan_kernel.hpp"
 #include "serving/serving_kernel.hpp"
 #include "utils/utils_kernel.hpp"
@@ -84,6 +87,12 @@ double event_ms(const sycl::event& ev) {
       ev.get_profiling_info<sycl::info::event_profiling::command_end>();
   return static_cast<double>(end - start) * 1e-6;  // ns -> ms
 }
+
+struct DeviceTiming {
+  double median_ms;
+  double min_ms;
+  double max_ms;
+};
 
 }  // namespace
 
@@ -135,6 +144,31 @@ int main(int argc, char** argv) {
     return 0;  // skip, not fail
   }
   sycl::queue q = make_gpu_queue(device_index, /*enable_profiling=*/true);
+
+  if (iters <= 0 || warmup < 0) {
+    throw std::invalid_argument("iters must be positive and warmup nonnegative");
+  }
+
+  auto time_device_batches = [&](auto &&submit_once) {
+    for (int i = 0; i < warmup; ++i)
+      submit_once();
+    q.wait();
+    std::vector<double> samples;
+    constexpr int kSamples = 5;
+    samples.reserve(kSamples);
+    for (int sample = 0; sample < kSamples; ++sample) {
+      sycl::event begin = q.single_task([] {});
+      for (int i = 0; i < iters; ++i)
+        submit_once();
+      sycl::event end = q.single_task([] {});
+      end.wait();
+      const auto start = begin.get_profiling_info<sycl::info::event_profiling::command_end>();
+      const auto stop = end.get_profiling_info<sycl::info::event_profiling::command_start>();
+      samples.push_back(static_cast<double>(stop - start) * 1e-6 / static_cast<double>(iters));
+    }
+    std::sort(samples.begin(), samples.end());
+    return DeviceTiming{samples[samples.size() / 2], samples.front(), samples.back()};
+  };
 
   const std::size_t elem = dtype_size(dt);
   const bool is_gemm = (kernel == "dense_gemm");
@@ -220,6 +254,229 @@ int main(int argc, char** argv) {
               << ",\"gflops\":" << gflops << ",\"gbps\":" << gbps << ",\"device\":\""
               << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
     sycl::free(A, q); sycl::free(B, q); sycl::free(C, q);
+    return 0;
+  }
+  if (kernel == "fp8_w8a16") {
+    void *activations = sycl::malloc_device(M * K * elem, q);
+    void *weight = sycl::malloc_device(N * K, q);
+    float *scales = sycl::malloc_device<float>(N, q);
+    void *output = sycl::malloc_device(M * N * elem, q);
+    q.memset(activations, 0, M * K * elem).wait();
+    q.memset(weight, 0, N * K).wait();
+    q.fill(scales, 1.0f, N).wait();
+    const int fp8_kind = approx_s == "e5m2" ? 1 : 0;
+    bool vendor_supported = true;
+    auto once = [&] {
+      if (variant == Variant::vendor) {
+#if defined(QUIXICORE_XPU_HAS_ONEDNN)
+        vendor_supported = kernels::fp8_gemm_w8a16_onednn(q, activations, weight, scales, true,
+                                                          output, M, N, K, fp8_kind, dt);
+        return;
+#endif
+      }
+      kernels::fp8_gemm_w8a16_sycl(q, activations, weight, scales, true, output, M, N, K, fp8_kind,
+                                   dt);
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    const double median = timing.median_ms;
+    if (!vendor_supported) {
+      throw std::runtime_error("oneDNN does not support the requested W8A16 shape");
+    }
+    const double weight_gbps = static_cast<double>(M) * N * K / (median * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"fp8_w8a16\","
+              << "\"variant\":\"" << variant_name(variant) << "\",\"fp8\":\""
+              << (fp8_kind ? "e5m2" : "e4m3") << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"M\":" << M << ",\"N\":" << N << ",\"K\":" << K << ",\"iters\":" << iters
+              << ",\"median_ms\":" << median << ",\"min_ms\":" << timing.min_ms
+              << ",\"max_ms\":" << timing.max_ms << ",\"weight_gbps\":" << weight_gbps
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}"
+              << std::endl;
+    sycl::free(activations, q);
+    sycl::free(weight, q);
+    sycl::free(scales, q);
+    sycl::free(output, q);
+    return 0;
+  }
+  if (kernel == "nvfp4_gemm") {
+    void *weight = sycl::malloc_device(N * K / 2, q);
+    void *scales = sycl::malloc_device(N * K / 16, q);
+    void *activations = sycl::malloc_device(M * K * elem, q);
+    void *output = sycl::malloc_device(M * N * elem, q);
+    q.memset(weight, 0, N * K / 2).wait();
+    q.memset(scales, 0x38, N * K / 16).wait();
+    q.memset(activations, 0, M * K * elem).wait();
+    const bool mtiled = approx_s == "mtiled";
+    auto once = [&] {
+      if (mtiled) {
+        kernels::nvfp4_gemm_mtiled_sycl(q, weight, scales, 1.0f, activations, output, M, N, K, dt);
+      } else {
+        kernels::nvfp4_gemm_sycl(q, weight, scales, 1.0f, activations, output, M, N, K, dt);
+      }
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    const double median = timing.median_ms;
+    const double weight_gbps = static_cast<double>(M) * N * K / 2.0 / (median * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"nvfp4_gemm\","
+              << "\"variant\":\"" << (mtiled ? "mtiled" : "row_loop") << "\",\"dtype\":\""
+              << dtype_name(dt) << "\",\"M\":" << M << ",\"N\":" << N << ",\"K\":" << K
+              << ",\"iters\":" << iters << ",\"median_ms\":" << median
+              << ",\"min_ms\":" << timing.min_ms << ",\"max_ms\":" << timing.max_ms
+              << ",\"weight_gbps\":" << weight_gbps << ",\"device\":\""
+              << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(weight, q);
+    sycl::free(scales, q);
+    sycl::free(activations, q);
+    sycl::free(output, q);
+    return 0;
+  }
+  if (kernel == "nvfp4_moe") {
+    const std::size_t experts = N;
+    const std::size_t top_k = rows;
+    const std::size_t intermediate = dim;
+    const std::size_t pairs = M * top_k;
+    void *hidden = sycl::malloc_device(M * K * elem, q);
+    int *expert_ids = sycl::malloc_device<int>(pairs, q);
+    float *router_weights = sycl::malloc_device<float>(pairs, q);
+    void *w13 = sycl::malloc_device(experts * 2 * intermediate * K / 2, q);
+    void *w13_scales = sycl::malloc_device(experts * 2 * intermediate * K / 16, q);
+    float *w13_global = sycl::malloc_device<float>(experts, q);
+    void *w2 = sycl::malloc_device(experts * K * intermediate / 2, q);
+    void *w2_scales = sycl::malloc_device(experts * K * intermediate / 16, q);
+    float *w2_global = sycl::malloc_device<float>(experts, q);
+    float *scratch = sycl::malloc_device<float>(pairs * 2 * intermediate, q);
+    float *output = sycl::malloc_device<float>(M * K, q);
+    q.memset(hidden, 0, M * K * elem).wait();
+    q.memset(expert_ids, 0, pairs * sizeof(int)).wait();
+    q.fill(router_weights, 1.0f / static_cast<float>(top_k), pairs).wait();
+    q.memset(w13, 0, experts * 2 * intermediate * K / 2).wait();
+    q.memset(w13_scales, 0x38, experts * 2 * intermediate * K / 16).wait();
+    q.fill(w13_global, 1.0f, experts).wait();
+    q.memset(w2, 0, experts * K * intermediate / 2).wait();
+    q.memset(w2_scales, 0x38, experts * K * intermediate / 16).wait();
+    q.fill(w2_global, 1.0f, experts).wait();
+    const bool split = approx_s == "split";
+    auto once = [&] {
+      const sycl::event zeroed = q.memset(output, 0, M * K * sizeof(float));
+      if (split) {
+        kernels::nvfp4_moe_split_sycl(q, hidden, expert_ids, router_weights, w13, w13_scales,
+                                      w13_global, w2, w2_scales, w2_global, scratch, output, M,
+                                      experts, top_k, K, intermediate, true, dt, zeroed);
+      } else {
+        kernels::nvfp4_moe_fused_sycl(q, hidden, expert_ids, router_weights, w13, w13_scales,
+                                      w13_global, w2, w2_scales, w2_global, output, M, experts,
+                                      top_k, K, intermediate, true, dt, zeroed);
+      }
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    const double median = timing.median_ms;
+    const double fp4_weight_bytes =
+        static_cast<double>(pairs) * (2.0 * intermediate * K / 2.0 + K * intermediate / 2.0);
+    const double weight_gbps = fp4_weight_bytes / (median * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"nvfp4_moe\","
+              << "\"variant\":\"" << (split ? "split" : "fused") << "\",\"dtype\":\""
+              << dtype_name(dt) << "\",\"M\":" << M << ",\"experts\":" << experts
+              << ",\"top_k\":" << top_k << ",\"K\":" << K << ",\"I\":" << intermediate
+              << ",\"iters\":" << iters << ",\"median_ms\":" << median
+              << ",\"min_ms\":" << timing.min_ms << ",\"max_ms\":" << timing.max_ms
+              << ",\"weight_gbps\":" << weight_gbps << ",\"device\":\""
+              << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(hidden, q);
+    sycl::free(expert_ids, q);
+    sycl::free(router_weights, q);
+    sycl::free(w13, q);
+    sycl::free(w13_scales, q);
+    sycl::free(w13_global, q);
+    sycl::free(w2, q);
+    sycl::free(w2_scales, q);
+    sycl::free(w2_global, q);
+    sycl::free(scratch, q);
+    sycl::free(output, q);
+    return 0;
+  }
+  if (kernel == "qwen_gdn_decode") {
+    if (M == 0 || N < 2) {
+      throw std::invalid_argument("qwen_gdn_decode requires M > 0 and at least two state slots");
+    }
+    constexpr std::size_t conv_dim = 8192;
+    constexpr std::size_t qkvz_dim = 12288;
+    constexpr std::size_t value_dim = 4096;
+    const std::size_t batch = M;
+    const std::size_t slots = N;
+    void *projected_qkvz = sycl::malloc_device(batch * qkvz_dim * elem, q);
+    void *projected_ba = sycl::malloc_device(batch * 64 * elem, q);
+    void *conv_state = sycl::malloc_device(slots * 3 * conv_dim * elem, q);
+    float *ssm_state = sycl::malloc_device<float>(slots * 32 * 128 * 128, q);
+    void *conv_weight = sycl::malloc_device(conv_dim * 4 * elem, q);
+    void *conv_bias = sycl::malloc_device(conv_dim * elem, q);
+    float *A_log = sycl::malloc_device<float>(32, q);
+    void *dt_bias = sycl::malloc_device(32 * elem, q);
+    int *state_indices = sycl::malloc_shared<int>(batch, q);
+    void *mixed_qkv = sycl::malloc_device(batch * conv_dim * elem, q);
+    void *core = sycl::malloc_device(batch * value_dim * elem, q);
+    void *z = sycl::malloc_device(batch * value_dim * elem, q);
+    q.memset(projected_qkvz, 0, batch * qkvz_dim * elem).wait();
+    q.memset(projected_ba, 0, batch * 64 * elem).wait();
+    q.memset(conv_state, 0, slots * 3 * conv_dim * elem).wait();
+    q.memset(ssm_state, 0, slots * 32 * 128 * 128 * sizeof(float)).wait();
+    q.memset(conv_weight, 0, conv_dim * 4 * elem).wait();
+    q.memset(conv_bias, 0, conv_dim * elem).wait();
+    q.memset(A_log, 0, 32 * sizeof(float)).wait();
+    q.memset(dt_bias, 0, 32 * elem).wait();
+    for (std::size_t i = 0; i < batch; ++i)
+      state_indices[i] = static_cast<int>(i % slots);
+    auto once = [&] {
+      kernels::qwen_gdn_decode_sycl(q, projected_qkvz, projected_ba, conv_state, ssm_state,
+                                    conv_weight, conv_bias, A_log, dt_bias, state_indices,
+                                    mixed_qkv, core, z, batch, slots, false, dt, DType::f32, dt);
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    const double median = timing.median_ms;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"qwen_gdn_decode\","
+              << "\"variant\":\"sycl\",\"dtype\":\"" << dtype_name(dt) << "\",\"batch\":" << batch
+              << ",\"slots\":" << slots << ",\"iters\":" << iters << ",\"median_ms\":" << median
+              << ",\"min_ms\":" << timing.min_ms << ",\"max_ms\":" << timing.max_ms
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}"
+              << std::endl;
+    sycl::free(projected_qkvz, q);
+    sycl::free(projected_ba, q);
+    sycl::free(conv_state, q);
+    sycl::free(ssm_state, q);
+    sycl::free(conv_weight, q);
+    sycl::free(conv_bias, q);
+    sycl::free(A_log, q);
+    sycl::free(dt_bias, q);
+    sycl::free(state_indices, q);
+    sycl::free(mixed_qkv, q);
+    sycl::free(core, q);
+    sycl::free(z, q);
+    return 0;
+  }
+  if (kernel == "fused_add_rms_norm") {
+    void *input = sycl::malloc_device(rows * dim * elem, q);
+    void *residual = sycl::malloc_device(rows * dim * elem, q);
+    void *weight = sycl::malloc_device(dim * elem, q);
+    void *output = sycl::malloc_device(rows * dim * elem, q);
+    q.memset(input, 0, rows * dim * elem).wait();
+    q.memset(residual, 0, rows * dim * elem).wait();
+    q.memset(weight, 0, dim * elem).wait();
+    auto once = [&] {
+      kernels::fused_add_rms_norm_sycl(q, input, residual, weight, output, rows, dim, 1e-6f, dt);
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    const double median = timing.median_ms;
+    const double bytes = (4.0 * static_cast<double>(rows * dim) + dim) * elem;
+    const double gbps = bytes / (median * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,"
+              << "\"kernel\":\"fused_add_rms_norm\","
+              << "\"variant\":\"sycl\",\"dtype\":\"" << dtype_name(dt) << "\",\"rows\":" << rows
+              << ",\"dim\":" << dim << ",\"iters\":" << iters << ",\"median_ms\":" << median
+              << ",\"min_ms\":" << timing.min_ms << ",\"max_ms\":" << timing.max_ms
+              << ",\"gbps\":" << gbps << ",\"device\":\""
+              << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(input, q);
+    sycl::free(residual, q);
+    sycl::free(weight, q);
+    sycl::free(output, q);
     return 0;
   }
   if (kernel == "qgemm_int8") {

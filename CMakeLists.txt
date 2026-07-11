@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 project(
   QuixiCoreXPU
   VERSION 0.1.0
-  DESCRIPTION "Native Intel GPU backend scaffold for QuixiCore"
+  DESCRIPTION "Native Intel GPU backend for QuixiCore"
   LANGUAGES CXX)
 
 include(CMakePackageConfigHelpers)
@@ -16,7 +16,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(QUIXICORE_XPU_BUILD_TESTS "Build QuixiCore XPU tests" ON)
 option(QUIXICORE_XPU_BUILD_EXAMPLES "Build QuixiCore XPU examples" ON)
-option(QUIXICORE_XPU_ENABLE_SYCL "Build SYCL/oneAPI device-probe targets" OFF)
+option(QUIXICORE_XPU_ENABLE_SYCL "Build SYCL/oneAPI kernels and tests" OFF)
 
 add_library(quixicore_xpu src/backend.cpp)
 add_library(QuixiCore::XPU ALIAS quixicore_xpu)
@@ -129,6 +129,10 @@ if(QUIXICORE_XPU_ENABLE_SYCL)
     target_link_libraries(quixicore_xpu_ops_smoke PRIVATE QuixiCore::XPUOps)
     target_include_directories(quixicore_xpu_ops_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/kernels)
     add_test(NAME quixicore_xpu_ops_smoke COMMAND quixicore_xpu_ops_smoke)
+
+    add_executable(quixicore_xpu_graph_smoke tests/xpu_graph_smoke.cpp)
+    target_link_libraries(quixicore_xpu_graph_smoke PRIVATE QuixiCore::XPUOps)
+    add_test(NAME quixicore_xpu_graph_smoke COMMAND quixicore_xpu_graph_smoke)
   endif()
 
   # On-device benchmark harness (not a CTest test; driven by perf/bench_kernels.py).

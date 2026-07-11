@@ -15,6 +15,11 @@ sycl::event fp8_gemv_sycl(sycl::queue& q, const void* x_fp8, const void* b_fp8,
                           void* y, std::size_t N, std::size_t K, int kind,
                           float scale, DType out_dt);
 
+sycl::event fp8_gemm_w8a16_sycl(sycl::queue &q, const void *activations, const void *weight_fp8,
+                                const float *weight_scale, bool per_channel, void *out,
+                                std::size_t M, std::size_t N, std::size_t K, int kind,
+                                DType act_dt);
+
 // kind: 0 = e4m3, 1 = e5m2.
 #if defined(QUIXICORE_XPU_HAS_ONEDNN)
 // fp8 GEMM via oneDNN. Returns false (and leaves an unspecified event) if the
@@ -22,6 +27,10 @@ sycl::event fp8_gemv_sycl(sycl::queue& q, const void* x_fp8, const void* b_fp8,
 bool fp8_gemm_onednn(sycl::queue& q, const void* a, const void* b, void* c,
                      std::size_t M, std::size_t N, std::size_t K, int kind,
                      float scale, DType out_dt);
+
+bool fp8_gemm_w8a16_onednn(sycl::queue &q, const void *activations, const void *weight_fp8,
+                           const float *weight_scale, bool per_channel, void *out, std::size_t M,
+                           std::size_t N, std::size_t K, int kind, DType act_dt);
 
 // Codec helpers (oneDNN reorder) so tests need no hand-written fp8 encoder:
 // f32 -> fp8 (out is 1 byte/elem) and fp8 -> f32.

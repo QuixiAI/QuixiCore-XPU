@@ -104,6 +104,84 @@ bool fp8_gemm_onednn(sycl::queue& q, const void* a, const void* b, void* c,
   }
 }
 
+bool fp8_gemm_w8a16_onednn(sycl::queue &q, const void *activations, const void *weight_fp8,
+                           const float *weight_scale, bool per_channel, void *out, std::size_t M,
+                           std::size_t N, std::size_t K, int kind, DType act_dt) {
+  try {
+    using dim = dnnl::memory::dim;
+    using tag = dnnl::memory::format_tag;
+    const auto storage_dt = out_dt_of(act_dt);
+    const dnnl::memory::desc a_md({static_cast<dim>(M), static_cast<dim>(K)}, storage_dt, tag::ab);
+    const dnnl::memory::desc w_md({static_cast<dim>(K), static_cast<dim>(N)}, fp8_dt(kind),
+                                  dnnl::memory::dims{1, static_cast<dim>(K)});
+    const dnnl::memory::desc c_md({static_cast<dim>(M), static_cast<dim>(N)}, storage_dt, tag::ab);
+
+    dnnl::engine engine;
+    dnnl::matmul primitive;
+    {
+      std::lock_guard<std::mutex> lock(g_mu);
+      auto &cache = g_cache[q.get_context()];
+      if (!cache.eng)
+        cache.eng = make_engine(q);
+      engine = cache.eng;
+      std::ostringstream key;
+      key << "w8a16/" << M << 'x' << N << 'x' << K << '/' << kind << '/'
+          << static_cast<int>(act_dt);
+      auto entry = cache.prims.find(key.str());
+      if (entry == cache.prims.end()) {
+        dnnl::primitive_attr attr;
+        attr.set_fpmath_mode(dnnl::fpmath_mode::f16);
+        const dnnl::matmul::primitive_desc descriptor(engine, a_md, w_md, c_md, attr);
+        entry = cache.prims.emplace(key.str(), dnnl::matmul(descriptor)).first;
+      }
+      primitive = entry->second;
+    }
+
+    dnnl::stream stream = dnnl::sycl_interop::make_stream(engine, q);
+    auto usm = [&](const dnnl::memory::desc &desc, void *ptr) {
+      return dnnl::sycl_interop::make_memory(desc, engine, dnnl::sycl_interop::memory_kind::usm,
+                                             ptr);
+    };
+    std::unordered_map<int, dnnl::memory> args = {
+        {DNNL_ARG_SRC, usm(a_md, const_cast<void *>(activations))},
+        {DNNL_ARG_WEIGHTS, usm(w_md, const_cast<void *>(weight_fp8))},
+        {DNNL_ARG_DST, usm(c_md, out)},
+    };
+    dnnl::sycl_interop::execute(primitive, stream, args).wait();
+
+    const std::size_t count = M * N;
+    sycl::event scale_event;
+    switch (act_dt) {
+    case DType::f32:
+      scale_event = q.parallel_for(sycl::range<1>(count), [=](sycl::id<1> i) {
+        const std::size_t n = i[0] % N;
+        static_cast<float *>(out)[i] *= weight_scale[per_channel ? n : 0];
+      });
+      break;
+    case DType::f16:
+      scale_event = q.parallel_for(sycl::range<1>(count), [=](sycl::id<1> i) {
+        const std::size_t n = i[0] % N;
+        auto *values = static_cast<half_t *>(out);
+        values[i] =
+            static_cast<half_t>(static_cast<float>(values[i]) * weight_scale[per_channel ? n : 0]);
+      });
+      break;
+    case DType::bf16:
+      scale_event = q.parallel_for(sycl::range<1>(count), [=](sycl::id<1> i) {
+        const std::size_t n = i[0] % N;
+        auto *values = static_cast<bf16_t *>(out);
+        values[i] =
+            static_cast<bf16_t>(static_cast<float>(values[i]) * weight_scale[per_channel ? n : 0]);
+      });
+      break;
+    }
+    scale_event.wait();
+    return true;
+  } catch (const dnnl::error &) {
+    return false;
+  }
+}
+
 static void reorder_1d(sycl::queue& q, const void* in, dnnl::memory::data_type it,
                        void* out, dnnl::memory::data_type ot, std::size_t n) {
   dnnl::engine eng = make_engine(q);

@@ -3,7 +3,7 @@
 Requires: `source /opt/intel/oneapi/setvars.sh` (icpx on PATH), the `sycl` CMake
 preset already built (provides libquixicore_xpu_ops.a), and torch+xpu installed.
 
-    cd bindings/pytorch && python setup.py build_ext --inplace
+    cd bindings/pytorch && ../../.venv/bin/python setup.py build_ext --inplace
 """
 
 import os

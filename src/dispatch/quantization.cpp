@@ -42,6 +42,16 @@ void nvfp4_gemv(sycl::queue& q, const void* w_packed, const void* block_scales,
   if (blocking) ev.wait();
 }
 
+void nvfp4_gemm(sycl::queue &q, const void *w_packed, const void *block_scales, float global_scale,
+                const void *x, void *y, std::size_t M, std::size_t N, std::size_t K, DType act_dt,
+                Variant variant, bool blocking) {
+  (void)variant;
+  sycl::event ev =
+      kernels::nvfp4_gemm_sycl(q, w_packed, block_scales, global_scale, x, y, M, N, K, act_dt);
+  if (blocking)
+    ev.wait();
+}
+
 void quantize_int4_group(sycl::queue& q, const void* w, void* w_packed,
                          void* scales, std::size_t N, std::size_t K,
                          std::size_t group, DType dt, Variant variant, bool blocking) {
@@ -82,6 +92,25 @@ void fp8_gemm(sycl::queue& q, const void* a_fp8, const void* b_fp8, void* c,
   (void)scale; (void)out_dt;
   throw std::runtime_error("QuixiCore XPU: fp8_gemm requires the oneDNN vendor build.");
 #endif
+}
+
+void fp8_gemm_w8a16(sycl::queue &q, const void *activations, const void *weight_fp8,
+                    const float *weight_scale, void *out, std::size_t M, std::size_t N,
+                    std::size_t K, Fp8Kind kind, bool per_channel, DType act_dt, Variant variant,
+                    bool blocking) {
+  const int fp8_kind = static_cast<int>(kind);
+  if (variant == Variant::vendor || (variant == Variant::best && M > 1)) {
+#if defined(QUIXICORE_XPU_HAS_ONEDNN)
+    if (kernels::fp8_gemm_w8a16_onednn(q, activations, weight_fp8, weight_scale, per_channel, out,
+                                       M, N, K, fp8_kind, act_dt)) {
+      return;
+    }
+#endif
+  }
+  sycl::event ev = kernels::fp8_gemm_w8a16_sycl(q, activations, weight_fp8, weight_scale,
+                                                per_channel, out, M, N, K, fp8_kind, act_dt);
+  if (blocking)
+    ev.wait();
 }
 
 void fp8_encode(sycl::queue& q, const float* in, void* out_fp8, std::size_t n,

@@ -18,6 +18,10 @@ sycl::event rms_norm_sycl(sycl::queue& q, const void* x, const void* weight,
                           void* out, std::size_t rows, std::size_t dim,
                           float eps, DType dt);
 
+sycl::event fused_add_rms_norm_sycl(sycl::queue &q, const void *x, void *residual,
+                                    const void *weight, void *out, std::size_t rows,
+                                    std::size_t dim, float eps, DType dt);
+
 sycl::event layernorm_sycl(sycl::queue& q, const void* x, const void* weight,
                            const void* bias, void* out, std::size_t rows,
                            std::size_t dim, float eps, DType dt);

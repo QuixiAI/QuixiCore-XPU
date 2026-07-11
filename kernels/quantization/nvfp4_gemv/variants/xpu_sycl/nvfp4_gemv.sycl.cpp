@@ -6,6 +6,8 @@
 
 #include "quantization/nvfp4_gemv/nvfp4_kernel.hpp"
 
+#include <stdexcept>
+
 namespace quixicore::xpu::kernels {
 namespace {
 
@@ -89,6 +91,66 @@ sycl::event nvfp4_typed(sycl::queue& q, const std::uint8_t* w,
   });
 }
 
+constexpr std::size_t kMaxM = 8;
+
+template <typename T> class Nvfp4GemmMKernel;
+
+template <typename T>
+sycl::event nvfp4_mtiled_typed(sycl::queue &q, const std::uint8_t *w, const std::uint8_t *bscale,
+                               float gscale, const T *x, T *y, std::size_t M, std::size_t N,
+                               std::size_t K) {
+  const std::size_t bytes_per_row = K / 2;
+  const std::size_t blocks_per_row = K / 16;
+  const std::size_t nchunks = bytes_per_row / 16;
+  const std::size_t nwg = (N + kRowsPerWG - 1) / kRowsPerWG;
+  const sycl::nd_range<1> ndr(sycl::range<1>(nwg * kWG), sycl::range<1>(kWG));
+  return q.parallel_for<Nvfp4GemmMKernel<T>>(
+      ndr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSG)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int sgid = static_cast<int>(sg.get_group_linear_id());
+        const int lane = static_cast<int>(sg.get_local_linear_id());
+        const std::size_t n = it.get_group(0) * kRowsPerWG + sgid;
+        if (n >= N)
+          return;
+
+        const WVec *wvrow = reinterpret_cast<const WVec *>(w + n * bytes_per_row);
+        const std::uint8_t *srow = bscale + n * blocks_per_row;
+        float acc[kMaxM] = {};
+        for (std::size_t c = lane; c < nchunks; c += kSG) {
+          const WVec chunk = wvrow[c];
+          const float s0 = e4m3_dec_raw(srow[2 * c]) * gscale;
+          const float s1 = e4m3_dec_raw(srow[2 * c + 1]) * gscale;
+          float decoded[32];
+#pragma unroll
+          for (int wi = 0; wi < 4; ++wi) {
+            const std::uint32_t word = chunk[wi];
+            const float scale = wi < 2 ? s0 : s1;
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+              const sycl::vec<float, 2> value = e2m1_dec2(word >> (4 * p));
+              decoded[wi * 8 + p] = value[0] * scale;
+              decoded[wi * 8 + p + 4] = value[1] * scale;
+            }
+          }
+          const std::size_t base = c * 32;
+          for (std::size_t m = 0; m < M; ++m) {
+            const T *xrow = x + m * K + base;
+            float dot = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 32; ++i) {
+              dot += decoded[i] * static_cast<float>(xrow[i]);
+            }
+            acc[m] += dot;
+          }
+        }
+        for (std::size_t m = 0; m < M; ++m) {
+          const float sum = sycl::reduce_over_group(sg, acc[m], sycl::plus<float>());
+          if (lane == 0)
+            y[m * N + n] = static_cast<T>(sum);
+        }
+      });
+}
+
 }  // namespace
 
 sycl::event nvfp4_gemv_sycl(sycl::queue& q, const void* w_packed,
@@ -107,6 +169,59 @@ sycl::event nvfp4_gemv_sycl(sycl::queue& q, const void* w_packed,
       return nvfp4_typed(q, w, s, global_scale, static_cast<const half_t*>(x), static_cast<half_t*>(y), N, K);
     case DType::bf16:
       return nvfp4_typed(q, w, s, global_scale, static_cast<const bf16_t*>(x), static_cast<bf16_t*>(y), N, K);
+  }
+  return {};
+}
+
+sycl::event nvfp4_gemm_sycl(sycl::queue &q, const void *w_packed, const void *block_scales,
+                            float global_scale, const void *x, void *y, std::size_t M,
+                            std::size_t N, std::size_t K, DType act_dt) {
+  const auto *w = static_cast<const std::uint8_t *>(w_packed);
+  const auto *s = static_cast<const std::uint8_t *>(block_scales);
+  global_scale *= 4194304.0f;
+  sycl::event last;
+  switch (act_dt) {
+  case DType::f32:
+    for (std::size_t m = 0; m < M; ++m) {
+      last = nvfp4_typed(q, w, s, global_scale, static_cast<const float *>(x) + m * K,
+                         static_cast<float *>(y) + m * N, N, K);
+    }
+    break;
+  case DType::f16:
+    for (std::size_t m = 0; m < M; ++m) {
+      last = nvfp4_typed(q, w, s, global_scale, static_cast<const half_t *>(x) + m * K,
+                         static_cast<half_t *>(y) + m * N, N, K);
+    }
+    break;
+  case DType::bf16:
+    for (std::size_t m = 0; m < M; ++m) {
+      last = nvfp4_typed(q, w, s, global_scale, static_cast<const bf16_t *>(x) + m * K,
+                         static_cast<bf16_t *>(y) + m * N, N, K);
+    }
+    break;
+  }
+  return last;
+}
+
+sycl::event nvfp4_gemm_mtiled_sycl(sycl::queue &q, const void *w_packed, const void *block_scales,
+                                   float global_scale, const void *x, void *y, std::size_t M,
+                                   std::size_t N, std::size_t K, DType act_dt) {
+  if (M == 0 || M > kMaxM) {
+    throw std::invalid_argument("nvfp4 M-tiled kernel requires 1 <= M <= 8");
+  }
+  const auto *w = static_cast<const std::uint8_t *>(w_packed);
+  const auto *s = static_cast<const std::uint8_t *>(block_scales);
+  global_scale *= 4194304.0f;
+  switch (act_dt) {
+  case DType::f32:
+    return nvfp4_mtiled_typed(q, w, s, global_scale, static_cast<const float *>(x),
+                              static_cast<float *>(y), M, N, K);
+  case DType::f16:
+    return nvfp4_mtiled_typed(q, w, s, global_scale, static_cast<const half_t *>(x),
+                              static_cast<half_t *>(y), M, N, K);
+  case DType::bf16:
+    return nvfp4_mtiled_typed(q, w, s, global_scale, static_cast<const bf16_t *>(x),
+                              static_cast<bf16_t *>(y), M, N, K);
   }
   return {};
 }
