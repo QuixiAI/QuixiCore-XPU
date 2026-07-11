@@ -1832,10 +1832,10 @@ float nvfp4_value(const std::uint8_t *packed, const std::uint8_t *scales, std::s
 }
 
 template <typename T> bool check_nvfp4_moe(sycl::queue &q, DType act_dt) {
-  constexpr std::size_t M = 2;
-  constexpr std::size_t E = 4;
-  constexpr std::size_t top_k = 2;
-  constexpr std::size_t K = 64;
+  constexpr std::size_t M = 8;
+  constexpr std::size_t E = 8;
+  constexpr std::size_t top_k = 8;
+  constexpr std::size_t K = 256;
   constexpr std::size_t I = 32;
   constexpr std::size_t two_i = 2 * I;
 
@@ -1854,14 +1854,14 @@ template <typename T> bool check_nvfp4_moe(sycl::queue &q, DType act_dt) {
 
   for (std::size_t i = 0; i < M * K; ++i)
     hidden[i] = static_cast<T>(sample(i + 307) * 0.1f);
-  expert_ids[0] = 0;
-  expert_ids[1] = 2;
-  expert_ids[2] = 1;
-  expert_ids[3] = -1;
-  router_weights[0] = 0.6f;
-  router_weights[1] = 0.4f;
-  router_weights[2] = 0.7f;
-  router_weights[3] = 0.3f;
+  for (std::size_t m = 0; m < M; ++m) {
+    for (std::size_t route = 0; route < top_k; ++route) {
+      const std::size_t pair = m * top_k + route;
+      expert_ids[pair] = static_cast<int>((m + route) % E);
+      router_weights[pair] = 1.0f / static_cast<float>(top_k);
+    }
+  }
+  expert_ids[M * top_k - 1] = -1;
   fill_packed_fp4(w13, E * two_i * K);
   fill_packed_fp4(w2, E * K * I);
   for (std::size_t i = 0; i < E * two_i * K / 16; ++i)

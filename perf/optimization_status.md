@@ -1417,3 +1417,298 @@ for a forced oneDNN layout at N=4096, K=2048. These are integration-level wall
 timings, not QuixiCore device-event speedup claims.
 
 Raw results: `perf/results/2026-07-10/gdn-contract-sync/raw.md`.
+
+## 2026-07-10: NVFP4 split-MoE output-row tiling
+
+Status: **candidate — KEEP** in the working tree. Public route:
+`ops::nvfp4_moe_split` / `kernels::nvfp4_moe_split_sycl`, also exercised through
+`tk_xpu.nvfp4_moe(..., split=True)`. Format is ModelOpt NVFP4 (e2m1 packed
+weights, e4m3 block scales), bf16 activations, and f32 accumulation/output.
+
+Environment: one Intel Arc Pro B60 (`0000:6c:00.0`, VTune target
+`0:108:0.0`), 160 XVEs, oneAPI DPC++/C++ 2026.1.0
+(`2026.1.0.20260617`), Unified Runtime over Level-Zero V2, driver
+`1.14.37020`, VTune 2026.3, Ubuntu 26.04 / kernel 7.0.0-27. Two idle vLLM
+workers remained resident across the A/B, so every final comparison alternated
+preserved baseline and candidate executables after a long on-device warmup. The
+reported runs held the GPU at 2.35-2.40 GHz and about 45-46 C.
+
+### Bottleneck evidence
+
+The untouched split route was profiled at the production decode shape
+`M=1,E=256,top_k=8,K=2048,I=512`. VTune XPU Offload reported no spills and
+split the device time almost evenly:
+
+| task | baseline average per invocation | work size |
+|---|---:|---:|
+| `Nvfp4MoeGateUpKernel<bf16>` | 78 us | `32768 x 8` |
+| `Nvfp4MoeOutputKernel` | 75 us | `65536 x 8` |
+
+The output grid had 256 work-groups per routed `(token,expert)` pair. Every
+work-group rebuilt the same 512-element SwiGLU activation in local memory and
+paid a group barrier before its eight subgroups computed only one output row
+each. Hypothesis: let every subgroup consume several output rows so activation
+construction and the barrier are amortized, while retaining enough independent
+work-groups to occupy the B60.
+
+GPU hardware-counter collection was attempted but is unavailable on this host:
+VTune reports that neither `libigdmd.so` nor `libmd.so` (Intel Metrics Discovery)
+is installed. The optimization decision therefore uses SYCL profiling-event
+timing plus the successful XPU Offload task timeline; no unsupported hardware
+counter claim is made.
+
+### Controlled row-tile sweep
+
+Only output rows processed per subgroup changed. `M=1,top_k=8` bf16 results
+used 500 warmups and 200 calls in each of five profiling-event batches:
+
+| rows per subgroup | median ms | weight GB/s | decision |
+|---:|---:|---:|---|
+| 1 (baseline) | 0.07982 | 157.6 | reference |
+| 2 | 0.07257 | 173.4 | better, continue |
+| 4 | 0.06950 | 181.0 | better, continue |
+| 8 | 0.06672 | 188.6 | better, continue |
+| 16 | **0.06485** | **194.0** | best priority shape |
+| 32 | 0.07698 | 163.5 | reject: only 64 output WGs, under-occupied |
+
+The kept dispatch specializes `{1,2,4,8,16}` rows at compile time and chooses
+the largest tile that leaves at least 128 output work-groups. This preserves the
+original one-row mapping for small `K`/pair counts and selects 2/4/8/16 rows as
+routing density rises. It changes neither launch count nor scratch/output
+layout.
+
+### Final A/B
+
+Exact command shape (with `M` varied):
+
+```bash
+./build-sycl/quixicore_xpu_bench --kernel nvfp4_moe --variant sycl \
+  --dtype bf16 --approx split --M <1|4|8|16> --N 256 --K 2048 \
+  --rows 8 --dim 512 --iters 200 --warmup 500 --device 0
+```
+
+Each process result is the median of five device-event batches. M=1 and M=4
+are medians of three independent, alternating baseline/candidate processes;
+the parenthesized range is the range of those process medians. M=8/M=16 are
+focused regression-shape repeats with the batch-level min/max shown.
+
+| shape | baseline ms | candidate ms | weight GB/s before -> after | decision |
+|---|---:|---:|---:|---|
+| M1, top8 | 0.079858 (0.079841-0.079965) | **0.064962** (0.064932-0.065021) | 157.6 -> **193.7** | keep, **18.65%** lower latency |
+| M4, top8 | 0.281078 (0.281006-0.293872) | **0.233018** (0.232967-0.233157) | 179.1 -> **216.0** | keep, **17.10%** lower latency |
+| M8, top8 | 0.549860 (0.549707-0.550076) | **0.449256** (0.448996-0.475012) | 183.1 -> **224.1** | keep, **18.30%** lower latency |
+| M16, top8 | 1.087130 (1.087040-1.087150) | **0.868502** (0.868380-0.868682) | 185.2 -> **231.8** | keep, **20.11%** lower latency |
+
+Low-routing-density checks did not regress: M1/top-k 1 improved from 0.02820
+to 0.02250 ms with the 2-row specialization, top-k 2 from 0.02817 to
+0.02676 ms, and top-k 4 from 0.04587 to 0.03770 ms. The untouched fused route
+was neutral: M1 0.31627 -> 0.31657 ms and M4 0.35020 -> 0.35033 ms.
+
+Post-change XPU Offload kept gate/up at 77 us and reduced the output task from
+75 to **46 us** (38.7%), shrinking its work size from `65536 x 8` to
+`4096 x 8` at M1/top-k 8. Instrumented whole-op time moved from 0.1736 to
+0.1406 ms; the uninstrumented event results above are the source of the speedup
+claim.
+
+Correctness:
+
+- `ctest --preset sycl --output-on-failure`: **4/4 passed**. The independent
+  C++ oracle now uses `M=8,top_k=8,K=256,I=32`, which selects the 16-row
+  specialization; fused/split max abs is `2.33e-10` across f32/f16/bf16.
+- Rebuilt the shared SYCL ops library and PyTorch extension with
+  `bindings/pytorch/build.sh`; `bindings/pytorch/test_parity.py`: **PASS**.
+  Direct split MoE and persistent-scratch XPU Graph replay both have max abs 0.
+
+Rejected GDN experiments from the same pass:
+
+1. Broadcasting uniform recurrence scalars (`decay`, `beta`) from one lane was
+   neutral at B1 and up to ~2% slower at B4; the compiler already handles the
+   uniform work well enough and the added SLM traffic did not pay back. Reverted.
+2. A one-launch 256-lane fused convolution/recurrent kernel passed all dtype and
+   invalid-state correctness checks, but improved sustained B1 only 1.8% and B4
+   0.25%. Rejected and reverted because the complexity exceeded the measured win.
+
+Raw benchmark record:
+`perf/results/2026-07-10/nvfp4-moe-output-row-tiling/raw.md`. VTune results:
+`perf/results/2026-07-10/nvfp4-moe-split-baseline-offload/` and
+`perf/results/2026-07-10/nvfp4-moe-split-row-tile-offload/`.
+
+## 2026-07-11: NVFP4 MoE paired gate/up decode
+
+Status: **candidate — KEEP** in the working tree. This pass starts from the
+kept pair-aware output-row tiling above and optimizes the remaining gate/up
+bottleneck in both `nvfp4_moe_split_sycl` and the co-equal
+`nvfp4_moe_fused_sycl` route. Format and public contract are unchanged:
+ModelOpt NVFP4 e2m1 packed weights, e4m3 block scales, f32 accumulation/output,
+and f32/f16/bf16 activations.
+
+Environment: one Intel Arc Pro B60 (`0000:6c:00.0`, VTune
+`0:108:0.0`), 160 XVEs, oneAPI DPC++/C++ 2026.1.0
+(`2026.1.0.20260617`), Unified Runtime over Level-Zero V2, driver
+`1.14.37020`, VTune 2026.3, Ubuntu 26.04 / kernel 7.0.0-27. The same idle vLLM
+workers remained resident for baseline and candidate; final runs alternated a
+preserved baseline executable with the candidate after 500 warmups. Longer
+low-top-k runs used 2500-5000 warmups to hold the GPU at 2.35 GHz.
+
+### Bottleneck and change
+
+After output-row tiling, XPU Offload showed gate/up at 77 us and output at
+46 us for `M=1,E=256,top_k=8,K=2048,I=512`. Gate row `i` and up row `i`
+consume the same hidden vector but were evaluated by separate subgroups, so
+each loaded and converted the same 2048 activation elements independently.
+
+The kept `nvfp4_row_dot_pair` decodes the gate and up weight rows together. A
+lane loads each hidden value once, applies it to both decoded weights, retains
+two accumulators, and performs two subgroup reductions. Split gate/up now uses
+one subgroup per logical gate/up pair; the fused route uses the same primitive
+while filling its local gate/up buffer. The layout, accumulation precision,
+scratch contents, output atomics, and launch count are unchanged.
+
+Post-change XPU Offload reports SIMD32, zero spill bytes, gate/up **49 us** and
+output 46 us. Gate/up work size falls from `32768 x 8` to `16384 x 8`, and its
+time falls 36.4%. Instrumented whole-op time moves from the prior 0.1406 ms to
+0.1144 ms. GPU hardware counters remain unavailable because Metrics Discovery
+(`libigdmd.so`/`libmd.so`) is not installed; speedup claims use uninstrumented
+SYCL profiling events.
+
+### Final split-route A/B
+
+```bash
+./build-sycl/quixicore_xpu_bench --kernel nvfp4_moe --variant sycl \
+  --dtype bf16 --approx split --M <1|4|8|16> --N 256 --K 2048 \
+  --rows 8 --dim 512 --iters 200 --warmup 500 --device 0
+```
+
+M1/M4 are medians of three alternating independent processes; parentheses are
+the process-median range. Each process result is itself the median of five
+200-call event batches. M8/M16 are focused repeats with batch min/max.
+
+| shape | output-tiled baseline ms | paired gate/up ms | weight GB/s before -> after | decision |
+|---|---:|---:|---:|---|
+| M1, top8 | 0.064926 (0.064888-0.065002) | **0.050748** (0.050686-0.050879) | 193.8 -> **247.9** | keep, **21.84%** lower latency |
+| M4, top8 | 0.233093 (0.233074-0.233102) | **0.178114** (0.178043-0.178205) | 215.9 -> **282.6** | keep, **23.59%** lower latency |
+| M8, top8 | 0.449206 (0.449035-0.449274) | **0.339395** (0.339355-0.339650) | 224.1 -> **296.6** | keep, **24.45%** lower latency |
+| M16, top8 | 0.868634 (0.868274-0.868773) | **0.649967** (0.649870-0.668995) | 231.8 -> **309.7** | keep, **25.17%** lower latency |
+
+The improvement is not bf16-specific at M1/top-k 8: f16 moves 0.06514 ->
+0.05114 ms (21.49%) and f32 moves 0.07008 -> 0.05502 ms (21.49%). Sustained
+M1 routing-density checks also improve: top-k 1 by 11.73%, top-k 2 by 20.26%,
+top-k 4 by 20.72%, and top-k 8 by 21.78%.
+
+The same factor improves the fused route without changing its occupancy model:
+
+| shape | fused baseline ms | paired fused ms | decision |
+|---|---:|---:|---|
+| M1, top8 | 0.310482 | **0.280802** | keep, 9.56% |
+| M4, top8 | 0.348085 | **0.296017** | keep, 14.96% |
+| M8, top8 | 0.542395 | **0.406080** | keep, 25.13% |
+| M16, top8 | 0.916574 | **0.644884** | keep, 29.64% |
+
+Cumulatively versus the pre-output-tiling split kernel, M1 moves 0.07986 ->
+0.05075 ms and M4 moves 0.28108 -> 0.17811 ms: about 36% lower latency in
+two independently measured passes.
+
+### Rejected factors
+
+1. **SLM hidden staging:** copying the hidden vector once per gate/up
+   work-group plus a barrier regressed M1 by 4.46% (0.06496 -> 0.06785 ms) and
+   M4 by 6.93% (0.23301 -> 0.24916 ms). The existing cache path is already
+   effective. Reverted.
+2. **Generic two-row gate tiling:** processing two unrelated rows per subgroup
+   regressed M1 by 1.52% (0.06487 -> 0.06585 ms) and was neutral at M4
+   (0.23306 -> 0.23303 ms). Scheduling was not the bottleneck. Reverted.
+
+### Correctness
+
+- `ctest --preset sycl --output-on-failure`: **4/4 passed**. The independent
+  host oracle exercises `M=8,top_k=8,K=256,I=32`; fused/split disagreement is
+  at most `4.66e-10` across f32/f16/bf16.
+- Rebuilt `build-sycl-shared` and the PyTorch extension with
+  `bindings/pytorch/build.sh`; `bindings/pytorch/test_parity.py`: **PASS**.
+  Direct split MoE and persistent-scratch XPU Graph replay both have max abs 0.
+
+Raw benchmark record:
+`perf/results/2026-07-11/nvfp4-moe-paired-gate-up/raw.md`. VTune result:
+`perf/results/2026-07-11/nvfp4-moe-paired-gate-up-offload/`.
+
+## 2026-07-11: NVFP4 MoE packed-dot vector loads
+
+Status: **candidate — KEEP** in the working tree. This pass starts from the
+paired gate/up and pair-aware output-row tiling above. It changes the shared
+packed-dot implementation used by both `ops::nvfp4_moe_split` and
+`ops::nvfp4_moe_fused`; format, public routing, launch shapes, fp32 accumulation
+order, scratch layout, and output layout are unchanged.
+
+Environment: one Intel Arc Pro B60 (`0000:6c:00.0`, VTune target
+`0:108:0.0`), 160 XVEs, oneAPI DPC++/C++ 2026.1.0
+(`2026.1.0.20260617`), Unified Runtime over Level-Zero V2, driver
+`1.14.37020`, VTune 2026.3, Ubuntu 26.04 / kernel 7.0.0-27. The same two idle
+vLLM workers remained resident throughout the alternating baseline/candidate
+runs.
+
+### Hypothesis and change
+
+Both `nvfp4_row_dot` and `nvfp4_row_dot_pair` consumed each adjacent group of
+eight activations through scalar indexed expressions. The standalone NVFP4 and
+INT4 GEMV implementations already expose this access as `sycl::vec<T,8>`.
+Hypothesis: an explicit vector load will reduce load/address work in the gate/up
+global-hidden path and the output local-activation path without increasing
+register pressure.
+
+The kept factor loads one `sycl::vec<T,8>` per packed 32-bit weight word and
+feeds its low/high halves to the existing decode and fp32 accumulators. XPU
+Offload confirms unchanged SIMD32 code, zero spill bytes, and unchanged work
+sizes. The instrumented gate/up average moves 48.98 -> 48.11 us; the output
+average is profiler-noise neutral at 45.89 -> 46.47 us. Hardware counters remain
+blocked by missing Metrics Discovery (`libigdmd.so`/`libmd.so`), so all speedup
+claims below use uninstrumented SYCL profiling events.
+
+### Final split-route A/B
+
+```bash
+./build-sycl/quixicore_xpu_bench --kernel nvfp4_moe --variant sycl \
+  --dtype bf16 --approx split --M <1|4|8|16> --N 256 --K 2048 \
+  --rows 8 --dim 512 --iters 200 --warmup 500 --device 0
+```
+
+M1/M4 are medians of three alternating independent processes; parentheses are
+the process-median range. Each process is the median of five 200-call batches.
+M8/M16 are focused repeats with the batch min/max.
+
+| shape | paired-dot baseline ms | vector-load candidate ms | weight GB/s before -> after | decision |
+|---|---:|---:|---:|---|
+| M1, top8 | 0.050753 (0.050733-0.050834) | **0.049084** (0.049030-0.049216) | 247.9 -> **256.4** | keep, **3.29%** lower latency |
+| M4, top8 | 0.178185 (0.177999-0.178189) | **0.174661** (0.174503-0.174690) | 282.5 -> **288.2** | keep, **1.98%** lower latency |
+| M8, top8 | 0.339487 (0.339439-0.339680) | **0.335119** (0.335048-0.335284) | 296.5 -> **300.4** | keep, **1.29%** lower latency |
+| M16, top8 | 0.649958 (0.649933-0.649988) | **0.642690** (0.642528-0.714032) | 309.8 -> **313.3** | keep, **1.12%** lower latency |
+
+At M1/top-k 8, f16 improves 3.71% (0.051073 -> 0.049177 ms) and f32 is
+neutral at 0.34% (0.055008 -> 0.054821 ms). Sustained bf16 routing checks do
+not regress: top-k 1 improves 4.77%, top-k 2 by 3.64%, and top-k 4 by 4.66%.
+
+The co-equal fused route also remains safe: M1 improves 5.84%, M8 by 1.27%,
+and M16 by 4.02%. The noisier M4 result used three independent processes and
+improves 1.99% by process median (0.296146 -> 0.290252 ms).
+
+### Rejected factors
+
+1. **Global activated scratch:** computing SwiGLU once in gate/up and removing
+   output SLM staging/barriers regressed M1 by 11.8% and M4 by 11.9%. Reverted.
+2. **Precomputed activation plus SLM staging:** retaining local output staging
+   after writing activated values to scratch was neutral at both M1 and M4.
+   Reverted because the extra contract/traffic had no measured payoff.
+3. **Forced two-way chunk unroll:** `#pragma unroll 2` regressed M1 by 3.6% and
+   M4 by 1.1%, consistent with extra live state. Reverted.
+
+### Correctness
+
+- Focused f32/f16/bf16 C++ oracle: fused and split pass with max abs
+  `8.15e-10`.
+- `ctest --preset sycl --output-on-failure`: **4/4 passed**.
+- Rebuilt the shared SYCL ops library and PyTorch extension;
+  `bindings/pytorch/test_parity.py`: **PASS**. Direct split MoE and
+  persistent-scratch XPU Graph replay both have max abs 0.
+
+Raw benchmark record:
+`perf/results/2026-07-11/nvfp4-moe-packed-dot-vector-load/raw.md`. VTune result:
+`perf/results/2026-07-11/nvfp4-moe-vector-load-offload/`.

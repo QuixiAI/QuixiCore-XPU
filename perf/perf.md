@@ -62,9 +62,12 @@ percentage of the relevant ceiling, not as a raw number.
 ## Measurement harness
 
 Device timing is done in C++ with **SYCL queue-profiling events** (command
-start→end timestamps), which measure pure device execution and are immune to the
-host submit/sync floor that produced false regressions in the Metal harness's
-early wall-clock timing.
+start→end timestamps), which measure device-side execution spans and exclude the
+host wall-clock submit/sync floor that produced false regressions in the Metal
+harness's early timing. A single-launch event isolates that kernel. A batched
+multi-launch span can also contain device idle gaps between its boundary events;
+use the timeline workflow below to determine whether those gaps come from host
+submission, synchronization, or the kernels themselves.
 
 One-off A/B (the common case during an optimization pass):
 
@@ -96,6 +99,176 @@ it covers — so a run always covers everything, with detail where configured. B
 co-equal variants are benched on the same hardware so the routing data is honest.
 Add a new op's buffers + `emit()` to `perf/harness/xpu_bench.cpp`, then a line to
 the default matrix (and optionally a config for a deeper sweep).
+
+## Bottleneck profiling workflow
+
+Profiling is a funnel, not a substitute for the benchmark. First establish an
+uninstrumented event-timed baseline, then use an execution timeline to isolate
+the expensive kernel or launch pattern, and only then collect focused hardware
+counters. Profiler instrumentation perturbs execution, so never use a VTune
+duration as the baseline or as evidence for a performance claim. Validate every
+candidate with the normal event-timed harness.
+
+### Tooling on the B60 host
+
+As checked on 2026-07-10, the host has VTune 2026.3 and `xpu-smi`. VTune exposes
+`xpu-offload` and `gpu-hotspots`; the older `gpu-offload` collection is
+deprecated. `unitrace` is not currently installed, so profiling instructions
+must not depend on it. Re-check the environment before a run:
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+vtune -collect-list
+vtune -help collect xpu-offload
+vtune -help collect gpu-hotspots
+sycl-ls
+xpu-smi discovery -j
+```
+
+This machine currently exposes two Arc Pro B60 GPUs. The benchmark selects one
+with `--device`; VTune selects it with `-knob target-gpu=<domain:bus:device.function>`.
+For example, benchmark device 0 was PCI BDF `0000:6c:00.0`, represented by VTune
+as `0:108:0.0`. Always verify that mapping rather than assuming PCI enumeration
+is stable.
+
+### Stage 1: uninstrumented baseline and roofline classification
+
+Run the exact public route, dtype/format, and priority shapes with the normal
+benchmark. Record median and min/max, effective bandwidth or FLOP/s, and the
+percentage of the appropriate B60 ceiling. Compare all relevant native, vendor,
+fused, and split variants before selecting a profile target.
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+cmake --build --preset sycl --target quixicore_xpu_bench
+
+./build-sycl/quixicore_xpu_bench \
+    --kernel nvfp4_moe --variant sycl --dtype bf16 --approx split \
+    --M 4 --N 256 --K 2048 --rows 8 --dim 512 \
+    --device 0 --warmup 15 --iters 50
+```
+
+Use bytes moved, FLOPs, achieved throughput, and variance to form a one-sentence
+bottleneck hypothesis. A memory-bound kernel near 388–410 GB/s is already at
+85–90% of the measured 456 GB/s B60 ceiling; further gains require removing
+traffic rather than rearranging arithmetic.
+
+### Stage 2: XPU Offload timeline
+
+Use `xpu-offload` to correlate host work, SYCL/Level Zero submissions, GPU
+queues, transfers, synchronization, and device execution. This answers whether
+the workload is host/launch-bound or device-bound and identifies the computing
+task to inspect next. Intel's current description and knobs are in the
+[VTune XPU Offload documentation](https://www.intel.com/content/www/us/en/docs/vtune-profiler/user-guide/2026-1/xpu-offload-analysis.html).
+
+Use fewer iterations than the baseline to control trace size, but retain enough
+repetition to distinguish steady state from initialization:
+
+```bash
+TRACE="perf/results/$(date +%F_%H%M%S)-nvfp4-moe-offload"
+
+vtune -collect xpu-offload \
+    -knob target-gpu=0:108:0.0 \
+    -knob collect-programming-api=true \
+    -knob enable-tasks-stack-collection=true \
+    -result-dir "$TRACE" -- \
+    ./build-sycl/quixicore_xpu_bench \
+        --kernel nvfp4_moe --variant sycl --dtype bf16 --approx split \
+        --M 4 --N 256 --K 2048 --rows 8 --dim 512 \
+        --device 0 --warmup 3 --iters 10
+
+vtune-gui "$TRACE"
+```
+
+Inspect the timeline for:
+
+- an empty GPU queue or gaps between small kernels, indicating host submission
+  or launch overhead;
+- repeated allocation, primitive construction, queue waits, or synchronization;
+- unexpected host/device copies or materialized intermediate tensors;
+- serialized work that could overlap; and
+- one subkernel dominating a fused or multi-launch operation.
+
+### Stage 3: focused GPU hardware counters
+
+After the timeline names the expensive task, use `gpu-hotspots` to inspect that
+kernel's occupancy, XVE active/stalled/idle behavior, memory and cache activity,
+SIMD utilization, and instruction mix. Intel recommends this as the focused
+follow-up to offload analysis; see the
+[GPU Compute/Media Hotspots documentation](https://www.intel.com/content/www/us/en/docs/vtune-profiler/user-guide/2026-1/gpu-compute-media-hotspots-analysis.html).
+
+Start with the overview metric set:
+
+```bash
+HOT="perf/results/$(date +%F_%H%M%S)-nvfp4-moe-hotspots"
+
+vtune -collect gpu-hotspots \
+    -knob target-gpu=0:108:0.0 \
+    -knob gpu-profiling-mode=characterization \
+    -knob characterization-mode=overview \
+    -result-dir "$HOT" -- \
+    ./build-sycl/quixicore_xpu_bench \
+        --kernel nvfp4_moe --variant sycl --dtype bf16 --approx split \
+        --M 4 --N 256 --K 2048 --rows 8 --dim 512 \
+        --device 0 --warmup 3 --iters 10
+
+vtune -report hotspots -group-by=computing-task -r "$HOT"
+vtune-gui "$HOT"
+```
+
+Then rerun only the counter group needed to test the hypothesis:
+
+- `characterization-mode=global-memory-accesses` for streaming, cache,
+  coalescing, staging, or quant-decode questions;
+- `characterization-mode=compute-extended` for ALU/XMX utilization and
+  occupancy;
+- `characterization-mode=instruction-count` for integer indexing, format
+  decode, branching, or transcendental work; and
+- `characterization-mode=full-compute` only when smaller focused passes do not
+  classify the issue.
+
+Source-analysis and stall-sampling support varies by GPU. Do not assume a mode
+is supported on B60 merely because it appears in `vtune -help`; start with
+characterization and follow the collector's supported-mode guidance.
+
+### Reading the evidence
+
+| Observation | Likely bottleneck | First controlled A/B |
+| --- | --- | --- |
+| GPU queue repeatedly empty | Launch/runtime overhead | Fuse kernels, cache primitives, remove waits |
+| Bandwidth near 388–410 GB/s | At the memory roofline | Reduce bytes moved or eliminate staging |
+| Low bandwidth and low occupancy | Grid, work-group, subgroup, or register pressure | Sweep one launch/tile factor at a time |
+| High memory stalls and poor cache behavior | Irregular or noncoalesced access | Change layout or vectorize adjacent accesses |
+| High instruction count with low bandwidth | Decode, indexing, or scalar ALU work | Remove div/mod, hoist branches, simplify decode |
+| Low SIMD utilization | Divergent control flow | Specialize dtype, format, or edge paths |
+| Several intermediate kernels or copies | Decomposition overhead | Fuse or dequantize directly into compute |
+
+Register pressure deserves explicit attention in fused MoE, attention, and
+decode kernels. It can reduce SIMD width/occupancy or spill private state into
+memory. See Intel's
+[register-pressure guidance](https://www.intel.com/content/www/us/en/docs/oneapi/optimization-guide-gpu/2025-2/registers-and-performance.html),
+then test smaller tiles, less unrolling, shorter live ranges, or SLM staging one
+factor at a time.
+
+### Source and assembly attribution
+
+The normal `sycl` preset is the source of truth for benchmark numbers. Its
+current RelWithDebInfo compile line uses `-O2 -g`. For reliable VTune mapping
+from GPU instructions back to source, create a separate profiling build/preset
+that preserves optimization and adds `-gline-tables-only` and
+`-fdebug-info-for-profiling`, as required by Intel's
+[current DPC++ profiling guidance](https://www.intel.com/content/www/us/en/developer/articles/release-notes/oneapi-dpcpp/2026.html).
+Do not replace the production timing preset with profiler-specific flags without
+first confirming identical generated-code performance.
+
+### Profiling record
+
+Store result directories under `perf/results/`; do not commit large VTune
+results or profiler traces. In `perf/optimization_status.md`, record the kernel,
+route, dtype/format, shapes, BDF/device, compiler/runtime/driver, exact command,
+trace path, observed bottleneck, and the controlled A/B it motivated. After the
+change, pass correctness and rerun the uninstrumented event benchmark. The final
+entry must include baseline/current/candidate timing and a keep/reject decision.
 
 ## Correctness gates (a win is not a win until these pass)
 
