@@ -30,4 +30,14 @@ void kv_cache_gather(sycl::queue& q, const void* cache, const int* idx,
   if (blocking) ev.wait();
 }
 
+void pool_mean_rms_l2(sycl::queue& q, const void* x, const void* weight,
+                      const int* offsets, void* out, std::size_t batch,
+                      std::size_t dim, float eps, DType dt, Variant variant,
+                      bool blocking) {
+  (void)variant;
+  sycl::event ev =
+      kernels::pool_mean_rms_l2_sycl(q, x, weight, offsets, out, batch, dim, eps, dt);
+  if (blocking) ev.wait();
+}
+
 }  // namespace quixicore::xpu::ops

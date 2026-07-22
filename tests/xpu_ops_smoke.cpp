@@ -142,6 +142,69 @@ bool check_serving(sycl::queue& q, DType dt) {
   return ok;
 }
 
+// pool_mean_rms_l2: masked mean-pool over each sequence's tokens with a per-token
+// RMSNorm folded in, then L2-normalize. The fp64 oracle mirrors the reference
+// order exactly (RMSNorm each token -> accumulate -> mean -> L2), applying the
+// learned weight directly and rounding the final vector to storage dtype T. The
+// two-level reduction (per-token over dim, then across tokens) widens rtol by
+// sqrt(dim), matching the attention/linear-attn oracle convention. Ragged token
+// counts (incl. a single-token sequence) exercise the masked mean.
+template <typename T>
+bool check_pool_mean_rms_l2(sycl::queue& q, DType dt, std::size_t dim,
+                            const std::vector<int>& tok_counts) {
+  const std::size_t batch = tok_counts.size();
+  std::vector<int> off(batch + 1, 0);
+  for (std::size_t s = 0; s < batch; ++s) off[s + 1] = off[s] + tok_counts[s];
+  const std::size_t total = static_cast<std::size_t>(off[batch]);
+
+  T* x = sycl::malloc_shared<T>(total * dim, q);
+  T* w = sycl::malloc_shared<T>(dim, q);
+  int* offd = sycl::malloc_shared<int>(batch + 1, q);
+  T* out = sycl::malloc_shared<T>(batch * dim, q);
+  for (std::size_t i = 0; i < total * dim; ++i) x[i] = static_cast<T>(sample(i));
+  for (std::size_t i = 0; i < dim; ++i) w[i] = static_cast<T>(0.5f + sample(i + 7) * 0.1f);
+  for (std::size_t s = 0; s <= batch; ++s) offd[s] = off[s];
+  const float eps = 1e-6f;
+
+  ops::pool_mean_rms_l2(q, x, w, offd, out, batch, dim, eps, dt, Variant::sycl, /*blocking=*/true);
+
+  const Tol tol = tol_for(dt);
+  const double rtol = tol.rtol * std::sqrt(static_cast<double>(dim)) + 5e-3;
+  double worst_excess = 0.0, max_abs = 0.0;
+  std::vector<double> m(dim);
+  for (std::size_t s = 0; s < batch; ++s) {
+    const int start = off[s], stop = off[s + 1];
+    for (std::size_t d = 0; d < dim; ++d) m[d] = 0.0;
+    for (int t = start; t < stop; ++t) {
+      const std::size_t base = static_cast<std::size_t>(t) * dim;
+      double ss = 0.0;
+      for (std::size_t d = 0; d < dim; ++d) {
+        const double v = static_cast<double>(x[base + d]);
+        ss += v * v;
+      }
+      const double inv = 1.0 / std::sqrt(ss / static_cast<double>(dim) + static_cast<double>(eps));
+      for (std::size_t d = 0; d < dim; ++d)
+        m[d] += static_cast<double>(x[base + d]) * inv * static_cast<double>(w[d]);
+    }
+    const double inv_tokens = (stop > start) ? 1.0 / static_cast<double>(stop - start) : 0.0;
+    double ss2 = 0.0;
+    for (std::size_t d = 0; d < dim; ++d) { m[d] *= inv_tokens; ss2 += m[d] * m[d]; }
+    const double inv_l2 = (ss2 == 0.0) ? 1.0 : 1.0 / std::sqrt(ss2);
+    for (std::size_t d = 0; d < dim; ++d) {
+      const double ref = static_cast<double>(static_cast<T>(m[d] * inv_l2));
+      const double err = std::abs(static_cast<double>(out[s * dim + d]) - ref);
+      max_abs = std::max(max_abs, err);
+      worst_excess = std::max(worst_excess, err - (tol.atol + rtol * std::abs(ref)));
+    }
+  }
+  sycl::free(x, q); sycl::free(w, q); sycl::free(offd, q); sycl::free(out, q);
+  const bool ok = worst_excess <= 0.0;
+  std::cout << "  pool_mean_rms_l2 dt=" << dtype_name(dt) << " dim=" << dim
+            << " batch=" << batch << " max_abs=" << max_abs
+            << " worst_excess=" << worst_excess << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 bool check_dropout(sycl::queue& q, DType dt) {
   const std::size_t n = 1u << 16;
   const float p = 0.3f;
@@ -2337,6 +2400,17 @@ int main() {
   // serving: embedding + kv-cache scatter/gather (exact copy).
   failures += check_serving<float>(q, DType::f32) ? 0 : 1;
   failures += check_serving<bf16_t>(q, DType::bf16) ? 0 : 1;
+
+  // serving: sentence-embedding pooling head (masked mean + per-token RMSNorm +
+  // L2). Ragged token counts, incl. a 1-token sequence, across the dim shape keys.
+  {
+    const std::vector<int> tok = {1, 5, 16, 37, 64, 80, 3};
+    for (const std::size_t d : {std::size_t(256), std::size_t(512), std::size_t(768), std::size_t(1024)}) {
+      failures += check_pool_mean_rms_l2<float>(q, DType::f32, d, tok) ? 0 : 1;
+      failures += check_pool_mean_rms_l2<half_t>(q, DType::f16, d, tok) ? 0 : 1;
+      failures += check_pool_mean_rms_l2<bf16_t>(q, DType::bf16, d, tok) ? 0 : 1;
+    }
+  }
 
   // attention: flash-style SDPA (MHA + GQA, causal + non-causal).
   failures += check_attention<float>(q, DType::f32, 8, 8, 128, 128, 64, true) ? 0 : 1;

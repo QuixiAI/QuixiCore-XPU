@@ -371,6 +371,24 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/serving/variants/xpu_sycl}
+  pool_mean_rms_l2:
+    family: serving
+    status: implemented
+    path: kernels/serving
+    dtypes: [f32, f16, bf16]
+    shape: masked-mean + per-token RMSNorm + L2 pooling head
+    shape_keys: {dim: [256, 512, 768, 1024]}
+    note: >-
+      Sentence-embedding pooling head. One kernel fuses per-token RMSNorm (learned
+      weight), a masked mean over each sequence's token range (CSR offsets), and a
+      final L2 normalize -- reading the token embeddings once and writing one
+      vector per sequence. One subgroup owns each sequence's dim-vector; dim is a
+      compile-time shape key. Ported from embeddinggemma.c's engine_xpu.cpp
+      launch_pool / kernels.c ei_mean_pool_rms_l2 (fp64 oracle).
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel pool_mean_rms_l2 --approx {fused,unfused}"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/serving/variants/xpu_sycl}
   attention:
     family: attention
     status: implemented

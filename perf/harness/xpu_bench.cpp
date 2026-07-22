@@ -65,6 +65,8 @@ namespace {
 
 using quixicore::xpu::DType;
 using quixicore::xpu::Variant;
+using quixicore::xpu::half_t;
+using quixicore::xpu::bf16_t;
 
 DType parse_dtype(const std::string& s) {
   if (s == "f32") return DType::f32;
@@ -93,6 +95,55 @@ struct DeviceTiming {
   double min_ms;
   double max_ms;
 };
+
+// Baseline second pass for the pool_mean_rms_l2 A/B: masked mean over each
+// sequence's tokens + L2, reading rows that a prior rms_norm pass already
+// normalized. Together with kernels::rms_norm_sycl this is the naive two-pass
+// decomposition the fused kernel collapses (the delta is the [total,dim] scratch
+// round-trip). Same subgroup-per-sequence layout as the shipped kernel.
+template <typename T, int DIM>
+sycl::event pool_meanl2_from_normed(sycl::queue& q, const T* normed,
+                                    const int* off, T* out, std::size_t batch) {
+  constexpr int SG = 16, SLOTS = DIM / SG;
+  return q.parallel_for(
+      sycl::nd_range<1>(sycl::range<1>(batch * SG), sycl::range<1>(SG)),
+      [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const std::size_t seq = it.get_group(0);
+        const int lane = static_cast<int>(sg.get_local_linear_id());
+        const int a = off[seq], b = off[seq + 1];
+        float p[SLOTS];
+#pragma unroll
+        for (int s = 0; s < SLOTS; ++s) p[s] = 0.0f;
+        for (int t = a; t < b; ++t) {
+          const std::size_t base = static_cast<std::size_t>(t) * DIM;
+#pragma unroll
+          for (int s = 0; s < SLOTS; ++s)
+            p[s] += static_cast<float>(normed[base + lane + s * SG]);
+        }
+        const int c = b - a;
+        const float invt = c > 0 ? 1.0f / static_cast<float>(c) : 0.0f;
+        float ss = 0.0f;
+#pragma unroll
+        for (int s = 0; s < SLOTS; ++s) { p[s] *= invt; ss = sycl::fma(p[s], p[s], ss); }
+        ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+        const float invl = ss == 0.0f ? 1.0f : sycl::rsqrt(ss);
+#pragma unroll
+        for (int s = 0; s < SLOTS; ++s)
+          out[seq * DIM + lane + s * SG] = static_cast<T>(p[s] * invl);
+      });
+}
+
+template <typename T>
+sycl::event pool_meanl2_dispatch(sycl::queue& q, const T* normed, const int* off,
+                                 T* out, std::size_t batch, std::size_t dim) {
+  switch (dim) {
+    case 256:  return pool_meanl2_from_normed<T, 256>(q, normed, off, out, batch);
+    case 512:  return pool_meanl2_from_normed<T, 512>(q, normed, off, out, batch);
+    case 768:  return pool_meanl2_from_normed<T, 768>(q, normed, off, out, batch);
+    default:   return pool_meanl2_from_normed<T, 1024>(q, normed, off, out, batch);
+  }
+}
 
 }  // namespace
 
@@ -699,6 +750,68 @@ int main(int argc, char** argv) {
               << ",\"min_ms\":" << s.front() << ",\"max_ms\":" << s.back()
               << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
     sycl::free(Q, q); sycl::free(K, q); sycl::free(V, q); sycl::free(O, q); sycl::free(O16, q);
+    return 0;
+  }
+  if (kernel == "pool_mean_rms_l2") {
+    // Sentence-embedding pooling head. A/B for the RMSNorm -> masked-mean -> L2
+    // fusion. --approx fused (default): the single pool_mean_rms_l2_sycl kernel
+    // (reads x once, writes one vector per sequence). --approx unfused: the naive
+    // two-pass decomposition -- rms_norm over all [total,dim] token rows into
+    // scratch, then a masked-mean+L2 pass reading scratch -- timed as the sum of
+    // both device events. The delta is the eliminated [total,dim] scratch
+    // round-trip. --rows = batch (sequences), --M = tokens/sequence, --dim = the
+    // shape key (256/512/768/1024; other values fall back to 768).
+    const std::size_t D =
+        (dim == 256 || dim == 512 || dim == 768 || dim == 1024) ? dim : 768;
+    const std::size_t batch = rows;
+    const std::size_t tok = M;  // tokens per sequence (uniform for the benchmark)
+    const std::size_t total = batch * tok;
+    void* x = sycl::malloc_device(total * D * elem, q);
+    void* w = sycl::malloc_device(D * elem, q);
+    void* out = sycl::malloc_device(batch * D * elem, q);
+    void* scratch = sycl::malloc_device(total * D * elem, q);
+    int* off = sycl::malloc_shared<int>(batch + 1, q);
+    q.memset(x, 0, total * D * elem).wait();
+    q.memset(w, 0, D * elem).wait();
+    for (std::size_t s = 0; s <= batch; ++s) off[s] = static_cast<int>(s * tok);
+    const float eps = 1e-6f;
+    const bool unfused = (approx_s == "unfused");
+    auto once = [&]() -> double {
+      if (unfused) {
+        sycl::event er = kernels::rms_norm_sycl(q, x, w, scratch, total, D, eps, dt);
+        er.wait();
+        sycl::event em;
+        switch (dt) {
+          case DType::f16:
+            em = pool_meanl2_dispatch<half_t>(q, static_cast<const half_t*>(scratch), off, static_cast<half_t*>(out), batch, D);
+            break;
+          case DType::bf16:
+            em = pool_meanl2_dispatch<bf16_t>(q, static_cast<const bf16_t*>(scratch), off, static_cast<bf16_t*>(out), batch, D);
+            break;
+          default:
+            em = pool_meanl2_dispatch<float>(q, static_cast<const float*>(scratch), off, static_cast<float*>(out), batch, D);
+            break;
+        }
+        em.wait();
+        return event_ms(er) + event_ms(em);
+      }
+      sycl::event ef =
+          kernels::pool_mean_rms_l2_sycl(q, x, w, off, out, batch, D, eps, dt);
+      ef.wait();
+      return event_ms(ef);
+    };
+    for (int i = 0; i < warmup; ++i) once();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) s.push_back(once());
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    std::cout << "{\"schema_version\":2,\"kernel\":\"pool_mean_rms_l2\",\"variant\":\"sycl\",\"approx\":\""
+              << (unfused ? "unfused" : "fused") << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"batch\":" << batch << ",\"tokens\":" << tok << ",\"dim\":" << D
+              << ",\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"min_ms\":" << s.front() << ",\"max_ms\":" << s.back()
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(x, q); sycl::free(w, q); sycl::free(out, q); sycl::free(scratch, q); sycl::free(off, q);
     return 0;
   }
   if (kernel == "selective_scan") {

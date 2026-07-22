@@ -1773,3 +1773,78 @@ store when the caller passes an O_f16 sink.
 
 Raw results: interleaved best-of-7 A/B above; machine-specific JSON not archived
 (git-ignored perf/results/).
+
+## 2026-07-22: pool_mean_rms_l2 (sentence-embedding pooling head)
+
+Status: landed.
+
+Current implementation: `kernels/serving/variants/xpu_sycl/serving.sycl.cpp`
+(`pool_mean_rms_l2_sycl`), a new op in the serving family alongside
+embedding_lookup / kv_cache. One subgroup owns each sequence's dim-vector; each
+lane holds DIM/16 pooled accumulators in registers (DIM is a compile-time shape
+key, dispatched over {256,512,768,1024}). The kernel fuses three passes: a
+per-token RMSNorm with the learned weight, a masked mean over the sequence's
+token range (CSR `offsets[batch+1]`), and a final L2 normalize -- reading the
+token embeddings once and writing one vector per sequence. Two subgroup
+reductions (one per token for the RMS scale, one at the end for the L2 sum);
+fp32 accumulation; empty sequence -> zero vector. Shape: masked-mean +
+per-token RMSNorm + L2 pooling head.
+
+Current public route: `ops::pool_mean_rms_l2(...)` (dispatch/serving.cpp), new
+operation in the serving family. New op (not a variant) -- distinct signature
+(token embeddings + CSR offsets + weight -> one vector per sequence), the
+pooling family did not exist in QuixiCore-XPU before this.
+
+References inspected: embeddinggemma.c `src/engine_xpu.cpp` `launch_pool`
+(the plain subgroup masked-mean -> per-token RMS -> L2 variant; the
+cooperative/workgroup variant was not ported) and the CPU reference
+`src/kernels.c` `ei_mean_pool_rms_l2` -> `ei_rms_norm_inplace` /
+`ei_norm_scale` / `ei_l2_normalize`. Math matched exactly: per-token
+`inv = rsqrt(mean(x^2) + eps)`, accumulate `x*weight*inv`, `*= 1/count`, then
+`rsqrt(sum(m^2))` (with the reference's `sum==0 -> 1` L2 guard). The learned
+RMSNorm weight is applied directly (`x*inv*w`) exactly as both references do;
+the Gemma `(1+w)` convention is folded into the weight upstream at load, not in
+the kernel.
+
+Environment: Arc Pro B60 (Battlemage), Level Zero V2 driver 1.14.37020, oneAPI
+DPC++/C++ 2026.1.0, `--preset sycl`, working tree at HEAD 3253bac, device 0.
+gnome-shell shares the GPUs (noisy) -> best-of-7 with interleaved fused/unfused.
+
+Correctness: fp64 host oracle in `tests/xpu_ops_smoke.cpp`
+(`check_pool_mean_rms_l2`), umbrella per-dtype tolerances with rtol widened by
+sqrt(dim) for the two-level reduction (same convention as the attention /
+linear-attn oracles). Ragged token counts {1,5,16,37,64,80,3} (incl. a
+single-token sequence) exercise the masked mean; swept over f32/f16/bf16 x
+dim {256,512,768,1024} = 12 cases. All `worst_excess=0`; max_abs f32 <=4.5e-8,
+f16 <=1.5e-5, bf16 <=3.8e-6. Full smoke suite: PASS.
+
+Baseline / A/B: harness `--kernel pool_mean_rms_l2 --approx {fused,unfused}`.
+`unfused` = the naive two-pass decomposition -- `rms_norm_sycl` over all
+[total_tokens, dim] token rows into a scratch buffer, then a masked-mean+L2 pass
+reading scratch -- timed as the sum of both device events. `fused` = the single
+`pool_mean_rms_l2_sycl` event. Same shapes; the delta is the eliminated
+[total_tokens, dim] scratch write+read (2x the token-embedding traffic) and a
+kernel launch. Interleaved best-of-7 medians (warmup 12, iters 50), device 0:
+
+| dtype | batch x tokens x dim | unfused ms | fused ms | fused faster |
+|---|---|---:|---:|---:|
+| f32  | 64 x 64 x 768  | 0.6673 | **0.3218** | **2.07x** |
+| f32  | 32 x 256 x 768 | 1.0064 | **0.6810** | **1.48x** |
+| f32  | 64 x 64 x 1024 | 0.7617 | **0.3500** | **2.18x** |
+| f16  | 64 x 64 x 768  | 0.6003 | **0.3401** | **1.76x** |
+| bf16 | 64 x 64 x 768  | 0.6776 | **0.3324** | **2.04x** |
+
+Decision: **keep**. Correctness-equivalent and 1.48-2.18x faster than the naive
+two-pass decomposition across dtypes/shapes. Short sequences (tokens=64) pay the
+scratch round-trip as a larger share of the work, so the fusion wins ~2x;
+longer sequences (tokens=256) amortize it into the growing mean reduction, so
+the win narrows to ~1.5x -- consistent with the memory-traffic model (unfused
+moves ~3x total*dim vs the fused ~1x total*dim + batch*dim).
+
+Open questions: a cooperative/workgroup variant (as in engine_xpu.cpp) could
+help very large `dim` or tiny `batch` where one-subgroup-per-sequence
+under-fills the device; not needed at the measured serving shapes. A
+`Variant::best` heuristic is trivial today (single variant).
+
+Raw results: interleaved best-of-7 medians above; machine-specific JSON not
+archived (git-ignored perf/results/).

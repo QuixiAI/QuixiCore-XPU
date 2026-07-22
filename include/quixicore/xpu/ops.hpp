@@ -174,6 +174,22 @@ void kv_cache_gather(sycl::queue& q, const void* cache, const int* idx,
                      void* out, std::size_t n, std::size_t row, DType dt,
                      Variant variant = Variant::sycl, bool blocking = true);
 
+// Sentence-embedding pooling head: masked mean-pool over each sequence's tokens
+// with a per-token RMSNorm (learned weight) folded in, then L2-normalize. `x` is
+// [total_tokens, dim] row-major; sequence s owns rows [offsets[s], offsets[s+1])
+// (`offsets` is [batch+1] int32, monotonic). `weight` is [dim], `out` is
+// [batch, dim], all dtype dt. For sequence s over token range [a, b):
+//   r_t   = x[t] * rsqrt(mean_d(x[t,d]^2) + eps) * weight   (RMSNorm, per token)
+//   m     = (1/(b-a)) * sum_t r_t                           (masked mean)
+//   out[s]= m * rsqrt(sum_d m[d]^2)                         (L2; 0-vector passes)
+// `dim` is the shape key {256,512,768,1024}; fp32 accumulation. An empty
+// sequence (b==a) yields a zero vector. Shape: masked-mean + per-token RMSNorm +
+// L2 pooling head. Native-only.
+void pool_mean_rms_l2(sycl::queue& q, const void* x, const void* weight,
+                      const int* offsets, void* out, std::size_t batch,
+                      std::size_t dim, float eps, DType dt,
+                      Variant variant = Variant::sycl, bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // utils
 // ----------------------------------------------------------------------------
