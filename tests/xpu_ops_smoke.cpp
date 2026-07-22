@@ -651,6 +651,81 @@ bool check_attention_f16ctx(sycl::queue& q, DType dt, std::size_t nh, std::size_
   return ok;
 }
 
+// attn_swa: symmetric sliding-window attention. Two fp64 checks in one:
+//   (1) the kernel output MUST match a windowed SDPA oracle that attends the
+//       symmetric band [center-window/2, center+window/2] (center = qi+sk-sq);
+//   (2) the kernel output MUST NOT match a CAUSAL-window oracle (same left edge
+//       but never looking past `center`). For interior queries the symmetric
+//       band contains future keys the causal oracle drops, so a genuinely
+//       symmetric kernel diverges from it -- vs_causal_gap must be large. An
+//       accidentally-causal kernel would pass (1)'s left half but collapse the
+//       gap in (2) and FAIL. This is the "a causal mask would FAIL" proof.
+template <typename T>
+bool check_attn_swa(sycl::queue& q, DType dt, std::size_t nh, std::size_t nkv,
+                    std::size_t sq, std::size_t sk, std::size_t d, std::size_t window) {
+  T* Q = sycl::malloc_shared<T>(nh * sq * d, q);
+  T* K = sycl::malloc_shared<T>(nkv * sk * d, q);
+  T* V = sycl::malloc_shared<T>(nkv * sk * d, q);
+  T* O = sycl::malloc_shared<T>(nh * sq * d, q);
+  for (std::size_t i = 0; i < nh * sq * d; ++i) Q[i] = static_cast<T>(sample(i) * 0.5f);
+  for (std::size_t i = 0; i < nkv * sk * d; ++i) { K[i] = static_cast<T>(sample(i + 3) * 0.5f); V[i] = static_cast<T>(sample(i + 7)); }
+  ops::attn_swa(q, Q, K, V, O, nh, nkv, sq, sk, d, window, dt, Variant::sycl, true);
+
+  const double scale = 1.0 / std::sqrt((double)d);
+  const std::size_t gqa = nh / nkv, delta = sk - sq, half = window / 2;
+  const Tol tol = tol_for(dt);
+  const double rtol = tol.rtol * 8 + 5e-3;
+  double worst = 0.0;       // symmetric-window oracle: kernel MUST match
+  double causal_gap = 0.0;  // vs causal-window oracle: kernel MUST diverge
+  std::vector<double> sc(sk);
+  for (std::size_t h = 0; h < nh; ++h)
+    for (std::size_t qi = 0; qi < sq; ++qi) {
+      const std::size_t kvh = h / gqa;
+      const std::size_t center = qi + delta;
+      std::size_t first = 0, last = sk;
+      if (window != 0) {
+        first = (center > half) ? (center - half) : 0;
+        const std::size_t cand = center + half + 1;
+        last = (cand < sk) ? cand : sk;
+      }
+      // (1) symmetric band reference
+      double m = -1e30;
+      for (std::size_t ki = first; ki < last; ++ki) {
+        double s = 0; for (std::size_t j = 0; j < d; ++j) s += (double)Q[(h * sq + qi) * d + j] * (double)K[(kvh * sk + ki) * d + j];
+        sc[ki] = s * scale; m = std::max(m, sc[ki]);
+      }
+      double l = 0; for (std::size_t ki = first; ki < last; ++ki) { sc[ki] = std::exp(sc[ki] - m); l += sc[ki]; }
+      for (std::size_t j = 0; j < d; ++j) {
+        double acc = 0; for (std::size_t ki = first; ki < last; ++ki) acc += sc[ki] * (double)V[(kvh * sk + ki) * d + j];
+        const double ref = (double)static_cast<T>(acc / l);
+        worst = std::max(worst, std::abs((double)O[(h * sq + qi) * d + j] - ref) - (tol.atol + rtol * std::abs(ref)));
+      }
+      // (2) causal-window reference: same left edge, keys capped at center
+      const std::size_t clast = (last < center + 1) ? last : (center + 1);
+      double cm = -1e30;
+      for (std::size_t ki = first; ki < clast; ++ki) {
+        double s = 0; for (std::size_t j = 0; j < d; ++j) s += (double)Q[(h * sq + qi) * d + j] * (double)K[(kvh * sk + ki) * d + j];
+        sc[ki] = s * scale; cm = std::max(cm, sc[ki]);
+      }
+      double cl = 0; for (std::size_t ki = first; ki < clast; ++ki) { sc[ki] = std::exp(sc[ki] - cm); cl += sc[ki]; }
+      for (std::size_t j = 0; j < d; ++j) {
+        double acc = 0; for (std::size_t ki = first; ki < clast; ++ki) acc += sc[ki] * (double)V[(kvh * sk + ki) * d + j];
+        const double cref = acc / cl;
+        causal_gap = std::max(causal_gap, std::abs((double)O[(h * sq + qi) * d + j] - cref));
+      }
+    }
+  sycl::free(Q, q); sycl::free(K, q); sycl::free(V, q); sycl::free(O, q);
+  // window>0 self-attention has future keys in the band for interior queries, so
+  // a symmetric kernel must diverge from the causal oracle by a clear margin.
+  const bool symmetric_proof = (window == 0) || (causal_gap > 1e-2);
+  const bool ok = worst <= 0.0 && symmetric_proof;
+  std::cout << "  attn_swa dt=" << dtype_name(dt) << " (h=" << nh << "/" << nkv << " sq=" << sq
+            << " sk=" << sk << " d=" << d << " window=" << window << ") worst_excess=" << worst
+            << " vs_causal_gap=" << causal_gap << (window ? " (must be > 1e-2)" : " (dense)")
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 template <typename T>
 bool check_sampling(sycl::queue& q, DType dt, std::size_t rows, std::size_t vocab, int k) {
   T* logits = sycl::malloc_shared<T>(rows * vocab, q);
@@ -2600,6 +2675,16 @@ int main() {
   failures += check_attention_f16ctx<half_t>(q, DType::f16, 16, 4, 64, 64, 128, true) ? 0 : 1;   // GQA + d=128
   failures += check_attention_f16ctx<bf16_t>(q, DType::bf16, 8, 8, 96, 96, 64, true) ? 0 : 1;
   failures += check_attention_f16ctx<float>(q, DType::f32, 4, 4, 96, 160, 64, false) ? 0 : 1;      // cross-attn
+
+  // attn_swa: symmetric sliding-window attention. worst_excess==0 vs the windowed
+  // oracle AND vs_causal_gap large (a causal mask would FAIL) across window sizes,
+  // seq lengths, dtypes, GQA, and the EmbeddingGemma d=256 shape. window=0 == dense.
+  failures += check_attn_swa<float>(q, DType::f32, 8, 8, 256, 256, 64, 64) ? 0 : 1;       // MHA, window 64
+  failures += check_attn_swa<float>(q, DType::f32, 3, 3, 320, 320, 256, 128) ? 0 : 1;     // EmbeddingGemma d=256
+  failures += check_attn_swa<half_t>(q, DType::f16, 16, 4, 256, 256, 128, 96) ? 0 : 1;    // GQA, d=128
+  failures += check_attn_swa<bf16_t>(q, DType::bf16, 8, 8, 200, 200, 64, 50) ? 0 : 1;     // odd-ish window, half=25
+  failures += check_attn_swa<float>(q, DType::f32, 4, 4, 96, 96, 64, 512) ? 0 : 1;        // window > seq: full band
+  failures += check_attn_swa<float>(q, DType::f32, 4, 4, 128, 128, 64, 0) ? 0 : 1;        // window=0 == dense
 
   // linear_attention: non-causal linear attention.
   failures += check_linear_attn<float>(q, DType::f32, 8, 256, 64) ? 0 : 1;

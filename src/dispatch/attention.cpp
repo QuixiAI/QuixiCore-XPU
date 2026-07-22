@@ -31,6 +31,16 @@ void attention_f16ctx(sycl::queue& q, const void* Q, const void* K,
   if (blocking) ev.wait();
 }
 
+void attn_swa(sycl::queue& q, const void* Q, const void* K, const void* V,
+              void* O, std::size_t n_heads, std::size_t n_kv_heads,
+              std::size_t seq_q, std::size_t seq_k, std::size_t d,
+              std::size_t window, DType dt, Variant variant, bool blocking) {
+  (void)variant;  // native flash + symmetric sliding-window band mask
+  sycl::event ev = kernels::attn_swa_sycl(q, Q, K, V, O, n_heads, n_kv_heads,
+                                          seq_q, seq_k, d, window, dt);
+  if (blocking) ev.wait();
+}
+
 void rope(sycl::queue& q, const void* x, void* out, std::size_t tokens,
           std::size_t n_heads, std::size_t head_dim, float base,
           std::size_t pos0, DType dt, Variant variant, bool blocking) {

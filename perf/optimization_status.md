@@ -2070,3 +2070,97 @@ the point on this submission-bound backend.
 
 Raw results: interleaved best-of-7 medians above; machine-specific JSON not
 archived (git-ignored perf/results/).
+
+## 2026-07-22: attn_swa (symmetric sliding-window attention)
+
+Status: landed.
+
+Current implementation:
+`kernels/attention/attention/variants/xpu_sycl/attn_swa.sycl.cpp`
+(`attn_swa_sycl`), a new op in the attention family alongside attention /
+attention_f16ctx / rope / qk_norm_rope. Same flash online-softmax recurrence and
+per-(head, query) work-item layout as attention_sycl (running max m, running
+denom l, running weighted-value acc[d]; no materialized score matrix), but the
+mask is a SYMMETRIC band instead of causal: query qi attends keys in
+`[center - window/2, center + window/2]` clamped to `[0, seq_k)`, where
+`center = qi + (seq_k - seq_q)` end-aligns the query into the key axis
+(`center == qi` for self-attention). `window == 0` means dense (attend all keys),
+byte-identical to attention_sycl non-causal. head_dim d <= 256 (kMaxD raised to
+256 for the EmbeddingGemma d=256 shape). Shape: symmetric sliding-window, GQA,
+D<=256.
+
+Current public route: `ops::attn_swa(...)` (dispatch/attention.cpp). New
+operation in the attention family -- the `causal` bool of attention() is replaced
+by a `window` size, so it is a distinct signature/op, not a variant of the
+existing dense kernel.
+
+References inspected: embeddinggemma.c `src/engine_xpu.cpp` `launch_attention`
+(the online-softmax path with the `window` band branch) and
+`launch_attention_softmax_banded` / `launch_banded_tensor_attention` (the tiled
+oneMKL QK^T -> banded softmax -> P*V path used above swa_tensor_banded_min_tokens
+= 1536), and the CPU reference `src/kernels.c` `ei_attention_mha_range`. Band
+math matched exactly: `first = qt-half > 0 ? qt-half : 0`,
+`last = qt+half+1 < n ? qt+half+1 : n`, `half = window/2`. Only the banded key
+range is ported as the new op; the QK/PV matmul itself is the same dot-product /
+weighted-sum as the dense flash kernel (the tiled joint_matrix banded-GEMM form
+of launch_banded_tensor_attention is a throughput optimization, deferred to the
+attention depth wave -- noted in the kernel header). The reference applies no
+1/sqrt(d) scale (embeddinggemma pre-scales Q in qk_norm_rope); attn_swa keeps the
+attention-family contract scale = 1/sqrt(d), and the oracle uses the same scale.
+
+Environment: Arc Pro B60 (Battlemage), Level Zero V2 driver 1.14.37020, oneAPI
+DPC++/C++ 2026.1.0, `--preset sycl`, base HEAD 7fd69c1, device 0. gnome-shell
+shares the GPUs (noisy) -> interleaved best-of-7 banded/dense alternated.
+
+Correctness: fp64 host oracle in `tests/xpu_ops_smoke.cpp` (`check_attn_swa`)
+runs TWO checks per case. (1) The kernel output must match a windowed fp64 SDPA
+oracle that attends exactly the symmetric band -> `worst_excess` (error minus
+tolerance). (2) The kernel output must NOT match a CAUSAL-window oracle (same
+left edge, keys capped at `center`) -> `vs_causal_gap` (max abs difference). For
+interior queries the symmetric band contains future keys the causal oracle drops,
+so a genuinely symmetric kernel diverges from it; the test requires the gap to
+exceed 1e-2, so an accidentally-causal kernel would FAIL. This is the "a causal
+mask would FAIL" symmetry proof. Cases: f32 MHA (8/8, sq=sk=256, d=64,
+window=64); f32 EmbeddingGemma shape (3/3, sq=sk=320, d=256, window=128); f16 GQA
+(16/4, sq=sk=256, d=128, window=96); bf16 (8/8, sq=sk=200, d=64, window=50);
+f32 window=512 > seq=96 (full band, still passes the symmetry proof); f32
+window=0 (dense). All `worst_excess = 0`; `vs_causal_gap` 2.64-3.19 across the
+banded cases. Full smoke suite: PASS.
+
+Baseline / A/B: harness `--kernel attn_swa --approx {banded,dense} --window W`.
+`banded` = attn_swa with the requested window (each query streams ~W keys);
+`dense` = the SAME kernel with window=0 (streams all seq keys) -- the dense flash
+SDPA baseline (identical math to attention_sycl non-causal). The only difference
+is the banded key range, so at long seq with W << seq the banded pass does O(W)
+work per query instead of O(seq). Shapes: heads=8, d=64, window=256, seq
+1024/2048/4096. Interleaved best-of-7 medians (warmup 10, iters 40), device 0:
+
+| dtype | seq | window | dense ms | banded ms | banded faster |
+|---|---:|---:|---:|---:|---:|
+| f16  | 1024 | 256 | 17.458  | **5.313**  | **3.29x** |
+| f16  | 2048 | 256 | 44.209  | **6.908**  | **6.40x** |
+| f16  | 4096 | 256 | 182.647 | **16.208** | **11.27x** |
+| f32  | 1024 | 256 | 17.436  | **5.932**  | **2.94x** |
+| f32  | 2048 | 256 | 43.534  | **7.723**  | **5.64x** |
+| f32  | 4096 | 256 | 183.402 | **26.523** | **6.91x** |
+
+Decision: **keep**. Correct against the windowed oracle (worst_excess=0) and
+provably symmetric (diverges from the causal oracle), and the band delivers the
+expected O(window)/O(seq) speedup that grows with sequence length -- 2.9-3.3x at
+seq=1024 up to 6.9-11.3x at seq=4096, approaching the ~256/seq work-ratio ceiling
+minus fixed per-query overhead. This is the honest lever for EmbeddingGemma's
+local encoder layers: half the layers are local (window band) and never pay the
+full seq^2 cost. f16 scales better than f32 at seq=4096 (11.3x vs 6.9x) because
+the dense f32 case is more bandwidth-bound on the wider K/V reads while the
+banded case reads far less.
+
+Open questions: the per-work-item register kernel (qreg[d]+acc[d], d up to 256)
+is correctness-first; at d=256 it carries 2 KB of registers per work-item and may
+spill -- a cooperative subgroup form (as in the engine_xpu.cpp reference, each
+lane holding d/kSubgroup slots) would relieve that and is the natural next step
+for the d=256 EmbeddingGemma shape. The tiled joint_matrix banded-GEMM path
+(launch_banded_tensor_attention, gated at >=1536 tokens in the source) is the
+throughput ceiling for very long sequences and is deferred.
+
+Raw results: interleaved best-of-7 medians above; machine-specific JSON not
+archived (git-ignored perf/results/).

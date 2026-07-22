@@ -452,6 +452,27 @@ operations:
     benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel attention_f16ctx --approx {fused,unfused}"}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/attention/attention/variants/xpu_sycl}
+  attn_swa:
+    family: attention
+    status: implemented
+    path: kernels/attention/attention
+    dtypes: [f32, f16, bf16]
+    shape: symmetric sliding-window, GQA, D<=256
+    note: >-
+      Flash online-softmax SDPA whose mask is a SYMMETRIC sliding window instead
+      of causal: query qi attends keys in [center - window/2, center + window/2]
+      clamped to [0, seq_k), center = qi + (seq_k - seq_q). Unlike causal SWA the
+      band looks both forward and backward -- the mask EmbeddingGemma's local
+      encoder layers use in its alternating global/local stack. window == 0 is
+      dense. head_dim d <= 256. Ported from embeddinggemma.c engine_xpu.cpp
+      launch_attention / launch_attention_softmax_banded (the window branch);
+      kernels.c ei_attention_mha_range is the fp64 oracle. The band correctness
+      is proven both against the windowed reference and against a causal
+      reference that it must NOT match (symmetry check).
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel attn_swa --approx {banded,dense} --window W"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/attention/attention/variants/xpu_sycl}
   rope:
     family: attention
     status: implemented

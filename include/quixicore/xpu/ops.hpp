@@ -127,6 +127,22 @@ void attention_f16ctx(sycl::queue& q, const void* Q, const void* K,
                       std::size_t seq_k, std::size_t d, bool causal, DType dt,
                       Variant variant = Variant::sycl, bool blocking = true);
 
+// Symmetric sliding-window attention (SWA). Same contract, layout, and flash
+// online-softmax math as attention() above, but the mask is a SYMMETRIC band
+// rather than causal: query qi attends key positions in [center - window/2,
+// center + window/2] clamped to [0, seq_k), where center = qi + (seq_k - seq_q)
+// end-aligns the query into the key axis (center == qi when seq_q == seq_k).
+// Unlike causal sliding-window attention the band looks BOTH forward and
+// backward within +-window/2 -- the mask EmbeddingGemma's local encoder layers
+// use in its alternating global/local stack. window == 0 means dense (attend
+// all keys), identical to attention() with causal == false. head_dim d <= 256.
+// Shape: symmetric sliding-window, GQA, D<=256.
+void attn_swa(sycl::queue& q, const void* Q, const void* K, const void* V,
+              void* O, std::size_t n_heads, std::size_t n_kv_heads,
+              std::size_t seq_q, std::size_t seq_k, std::size_t d,
+              std::size_t window, DType dt, Variant variant = Variant::sycl,
+              bool blocking = true);
+
 
 // Fused per-head QK-norm + RoPE (+ optional f16 convert). For every (token,
 // head) of Q and K: RMS-normalize the head-dim vector by its learned weight,

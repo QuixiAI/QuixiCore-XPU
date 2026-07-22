@@ -179,6 +179,7 @@ int main(int argc, char** argv) {
   std::size_t rows = 4096;   // row kernels: [rows, dim]
   std::size_t dim = 4096;
   std::size_t M = 1024, N = 1024, K = 1024;  // gemm dims
+  std::size_t window = 256;  // attn_swa symmetric sliding-window size
   int iters = 50;
   int warmup = 10;
   std::size_t device_index = 0;
@@ -199,6 +200,7 @@ int main(int argc, char** argv) {
     else if (a == "--M") M = std::stoull(next());
     else if (a == "--N") N = std::stoull(next());
     else if (a == "--K") K = std::stoull(next());
+    else if (a == "--window") window = std::stoull(next());
     else if (a == "--iters") iters = std::stoi(next());
     else if (a == "--warmup") warmup = std::stoi(next());
     else if (a == "--device") device_index = std::stoull(next());
@@ -771,6 +773,33 @@ int main(int argc, char** argv) {
               << ",\"min_ms\":" << s.front() << ",\"max_ms\":" << s.back()
               << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
     sycl::free(Q, q); sycl::free(K, q); sycl::free(V, q); sycl::free(O, q); sycl::free(O16, q);
+    return 0;
+  }
+  if (kernel == "attn_swa") {
+    // A/B for the symmetric sliding-window band. --approx banded (default):
+    // attn_swa with the requested --window W, so each query streams only the
+    // ~W keys in its symmetric band. --approx dense: the SAME kernel with
+    // window=0, which streams all `seq` keys -- i.e. the dense flash SDPA
+    // baseline (identical math to attention_sycl non-causal). The only
+    // difference between the two is the banded key range, so at long seq with
+    // W << seq the banded pass does O(W) work per query instead of O(seq).
+    // d = 64 (matches the attention harness); nh kv heads == nh (MHA).
+    const std::size_t nh = rows, seq = dim, d = 64;
+    const std::size_t ne = nh * seq * d;
+    void* Q = sycl::malloc_device(ne * elem, q);
+    void* K = sycl::malloc_device(ne * elem, q);
+    void* V = sycl::malloc_device(ne * elem, q);
+    void* O = sycl::malloc_device(ne * elem, q);
+    q.memset(Q, 0, ne * elem).wait(); q.memset(K, 0, ne * elem).wait(); q.memset(V, 0, ne * elem).wait();
+    const bool dense = (approx_s == "dense");
+    const std::size_t win = dense ? 0 : window;
+    const double med = time_median([&] { return kernels::attn_swa_sycl(q, Q, K, V, O, nh, nh, seq, seq, d, win, dt); });
+    std::cout << "{\"schema_version\":2,\"kernel\":\"attn_swa\",\"variant\":\"sycl\",\"approx\":\""
+              << (dense ? "dense" : "banded") << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"heads\":" << nh << ",\"seq\":" << seq << ",\"d\":" << d
+              << ",\"window\":" << win << ",\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(Q, q); sycl::free(K, q); sycl::free(V, q); sycl::free(O, q);
     return 0;
   }
   if (kernel == "pool_mean_rms_l2") {
