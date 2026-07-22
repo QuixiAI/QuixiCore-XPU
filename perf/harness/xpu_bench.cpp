@@ -650,6 +650,57 @@ int main(int argc, char** argv) {
     sycl::free(Q, q); sycl::free(K, q); sycl::free(V, q); sycl::free(O, q);
     return 0;
   }
+  if (kernel == "attention_f16ctx") {
+    // A/B for the fused ctx->f16 store. --approx fused (default): time the single
+    // attention_f16ctx kernel (writes O + O_f16). --approx unfused: baseline of
+    // attention_sycl (writes O) followed by a standalone O->O_f16 convert kernel
+    // -- the exact pass the fused epilogue folds away -- timed as the sum of both
+    // device events. Same shapes; the delta is the eliminated convert traffic.
+    const std::size_t nh = rows, seq = dim, d = 64;
+    const std::size_t ne = nh * seq * d;
+    void* Q = sycl::malloc_device(ne * elem, q);
+    void* K = sycl::malloc_device(ne * elem, q);
+    void* V = sycl::malloc_device(ne * elem, q);
+    void* O = sycl::malloc_device(ne * elem, q);
+    half_t* O16 = sycl::malloc_device<half_t>(ne, q);
+    q.memset(Q, 0, ne * elem).wait(); q.memset(K, 0, ne * elem).wait(); q.memset(V, 0, ne * elem).wait();
+    const bool unfused = (approx_s == "unfused");
+    auto convert = [&]() -> sycl::event {
+      switch (dt) {
+        case DType::f16: { const half_t* o = static_cast<const half_t*>(O);
+          return q.parallel_for(sycl::range<1>(ne), [=](sycl::id<1> i) { O16[i[0]] = o[i[0]]; }); }
+        case DType::bf16: { const bf16_t* o = static_cast<const bf16_t*>(O);
+          return q.parallel_for(sycl::range<1>(ne), [=](sycl::id<1> i) { O16[i[0]] = static_cast<half_t>(static_cast<float>(o[i[0]])); }); }
+        default: { const float* o = static_cast<const float*>(O);
+          return q.parallel_for(sycl::range<1>(ne), [=](sycl::id<1> i) { O16[i[0]] = static_cast<half_t>(o[i[0]]); }); }
+      }
+    };
+    auto once = [&]() -> double {
+      if (unfused) {
+        sycl::event ea = kernels::attention_sycl(q, Q, K, V, O, nh, nh, seq, seq, d, true, dt);
+        ea.wait();
+        sycl::event ec = convert();
+        ec.wait();
+        return event_ms(ea) + event_ms(ec);
+      }
+      sycl::event ef = kernels::attention_f16ctx_sycl(q, Q, K, V, O, O16, nh, nh, seq, seq, d, true, dt);
+      ef.wait();
+      return event_ms(ef);
+    };
+    for (int i = 0; i < warmup; ++i) once();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) s.push_back(once());
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    std::cout << "{\"schema_version\":2,\"kernel\":\"attention_f16ctx\",\"variant\":\"sycl\",\"approx\":\""
+              << (unfused ? "unfused" : "fused") << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"heads\":" << nh << ",\"seq\":" << seq << ",\"d\":" << d
+              << ",\"causal\":true,\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"min_ms\":" << s.front() << ",\"max_ms\":" << s.back()
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(Q, q); sycl::free(K, q); sycl::free(V, q); sycl::free(O, q); sycl::free(O16, q);
+    return 0;
+  }
   if (kernel == "selective_scan") {
     const std::size_t nc = rows, seq = dim, st = 16;
     void* u = sycl::malloc_device(nc * seq * elem, q);

@@ -379,6 +379,21 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/attention/attention/variants/xpu_sycl}
+  attention_f16ctx:
+    family: attention
+    status: implemented
+    path: kernels/attention/attention
+    dtypes: [f32, f16, bf16]
+    shape: online-attention + fused f16 context store
+    note: >-
+      Flash SDPA whose epilogue also writes a rounded f16 copy of the output
+      (O_f16), folding the ctx->f16 convert a downstream attention-output GEMM
+      needs into the attention pass. Ported from embeddinggemma.c's
+      EI_XPU_FUSE_ATTN_OUTPUT_HALF online-attention epilogue.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel attention_f16ctx --approx {fused,unfused}"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/attention/attention/variants/xpu_sycl}
   rope:
     family: attention
     status: implemented

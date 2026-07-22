@@ -103,6 +103,18 @@ void attention(sycl::queue& q, const void* Q, const void* K, const void* V,
                std::size_t seq_q, std::size_t seq_k, std::size_t d, bool causal,
                DType dt, Variant variant = Variant::sycl, bool blocking = true);
 
+// Flash-style SDPA with a fused f16 context store. Same contract and math as
+// attention() above, but writes the output twice in one epilogue: O in dtype dt
+// and O_f16 in f16 (same [n_heads, seq_q, d] layout). This folds the ctx->f16
+// convert a downstream attention-output GEMM needs into the attention pass,
+// removing a standalone O-sized convert kernel. O_f16 equals the f16 rounding of
+// O. Shape: online-attention + fused f16 context store.
+void attention_f16ctx(sycl::queue& q, const void* Q, const void* K,
+                      const void* V, void* O, void* O_f16, std::size_t n_heads,
+                      std::size_t n_kv_heads, std::size_t seq_q,
+                      std::size_t seq_k, std::size_t d, bool causal, DType dt,
+                      Variant variant = Variant::sycl, bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // optimizers
 // ----------------------------------------------------------------------------

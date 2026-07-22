@@ -396,6 +396,58 @@ bool check_attention(sycl::queue& q, DType dt, std::size_t nh, std::size_t nkv,
   return ok;
 }
 
+// attention_f16ctx: same fp64 SDPA oracle as check_attention for the dtype-T
+// output O, PLUS a check that the fused half store O_f16 equals the f16 rounding
+// of the attention result within the f16 contract tolerance. Exercises both the
+// unchanged compute-dtype path and the new fused f16 store.
+template <typename T>
+bool check_attention_f16ctx(sycl::queue& q, DType dt, std::size_t nh, std::size_t nkv,
+                            std::size_t sq, std::size_t sk, std::size_t d, bool causal) {
+  T* Q = sycl::malloc_shared<T>(nh * sq * d, q);
+  T* K = sycl::malloc_shared<T>(nkv * sk * d, q);
+  T* V = sycl::malloc_shared<T>(nkv * sk * d, q);
+  T* O = sycl::malloc_shared<T>(nh * sq * d, q);
+  half_t* O16 = sycl::malloc_shared<half_t>(nh * sq * d, q);
+  for (std::size_t i = 0; i < nh * sq * d; ++i) Q[i] = static_cast<T>(sample(i) * 0.5f);
+  for (std::size_t i = 0; i < nkv * sk * d; ++i) { K[i] = static_cast<T>(sample(i + 3) * 0.5f); V[i] = static_cast<T>(sample(i + 7)); }
+  ops::attention_f16ctx(q, Q, K, V, O, O16, nh, nkv, sq, sk, d, causal, dt, Variant::sycl, true);
+
+  const double scale = 1.0 / std::sqrt((double)d);
+  const std::size_t gqa = nh / nkv, delta = sk - sq;
+  const Tol tol = tol_for(dt);
+  const double rtol = tol.rtol * 8 + 5e-3;
+  const Tol tol16 = tol_for(DType::f16);
+  const double rtol16 = tol16.rtol * 8 + 5e-3;
+  double worst = 0.0, worst16 = 0.0;
+  std::vector<double> sc(sk);
+  for (std::size_t h = 0; h < nh; ++h)
+    for (std::size_t qi = 0; qi < sq; ++qi) {
+      const std::size_t kvh = h / gqa;
+      const std::size_t last = causal ? (qi + delta) : (sk - 1);
+      double m = -1e30;
+      for (std::size_t ki = 0; ki <= last && ki < sk; ++ki) {
+        double s = 0; for (std::size_t j = 0; j < d; ++j) s += (double)Q[(h * sq + qi) * d + j] * (double)K[(kvh * sk + ki) * d + j];
+        sc[ki] = s * scale; m = std::max(m, sc[ki]);
+      }
+      double l = 0; for (std::size_t ki = 0; ki <= last && ki < sk; ++ki) { sc[ki] = std::exp(sc[ki] - m); l += sc[ki]; }
+      for (std::size_t j = 0; j < d; ++j) {
+        double acc = 0; for (std::size_t ki = 0; ki <= last && ki < sk; ++ki) acc += sc[ki] * (double)V[(kvh * sk + ki) * d + j];
+        const double raw = acc / l;
+        const double ref = (double)static_cast<T>(raw);
+        const double ref16 = (double)static_cast<half_t>((float)raw);
+        const std::size_t off = (h * sq + qi) * d + j;
+        worst = std::max(worst, std::abs((double)O[off] - ref) - (tol.atol + rtol * std::abs(ref)));
+        worst16 = std::max(worst16, std::abs((double)O16[off] - ref16) - (tol16.atol + rtol16 * std::abs(ref16)));
+      }
+    }
+  sycl::free(Q, q); sycl::free(K, q); sycl::free(V, q); sycl::free(O, q); sycl::free(O16, q);
+  const bool ok = worst <= 0.0 && worst16 <= 0.0;
+  std::cout << "  attention_f16ctx dt=" << dtype_name(dt) << " (h=" << nh << "/" << nkv << " sq=" << sq
+            << " sk=" << sk << " d=" << d << (causal ? " causal" : "") << ") worst_excess=" << worst
+            << " worst16=" << worst16 << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 template <typename T>
 bool check_sampling(sycl::queue& q, DType dt, std::size_t rows, std::size_t vocab, int k) {
   T* logits = sycl::malloc_shared<T>(rows * vocab, q);
@@ -2290,6 +2342,12 @@ int main() {
   failures += check_attention<float>(q, DType::f32, 8, 8, 128, 128, 64, true) ? 0 : 1;
   failures += check_attention<bf16_t>(q, DType::bf16, 16, 4, 64, 64, 128, true) ? 0 : 1;   // GQA + d=128
   failures += check_attention<float>(q, DType::f32, 4, 4, 96, 160, 64, false) ? 0 : 1;      // cross-attn
+
+  // attention_f16ctx: flash SDPA + fused f16 context store (dtype-T + f16 outputs checked).
+  failures += check_attention_f16ctx<float>(q, DType::f32, 8, 8, 128, 128, 64, true) ? 0 : 1;
+  failures += check_attention_f16ctx<half_t>(q, DType::f16, 16, 4, 64, 64, 128, true) ? 0 : 1;   // GQA + d=128
+  failures += check_attention_f16ctx<bf16_t>(q, DType::bf16, 8, 8, 96, 96, 64, true) ? 0 : 1;
+  failures += check_attention_f16ctx<float>(q, DType::f32, 4, 4, 96, 160, 64, false) ? 0 : 1;      // cross-attn
 
   // linear_attention: non-causal linear attention.
   failures += check_linear_attn<float>(q, DType::f32, 8, 256, 64) ? 0 : 1;

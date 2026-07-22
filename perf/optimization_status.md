@@ -1712,3 +1712,64 @@ improves 1.99% by process median (0.296146 -> 0.290252 ms).
 Raw benchmark record:
 `perf/results/2026-07-11/nvfp4-moe-packed-dot-vector-load/raw.md`. VTune result:
 `perf/results/2026-07-11/nvfp4-moe-vector-load-offload/`.
+
+## 2026-07-22: attention_f16ctx (fused f16 context store)
+
+Status: landed.
+
+Current implementation: `kernels/attention/attention/variants/xpu_sycl/attention_f16ctx.sycl.cpp`
+(`attention_f16ctx_sycl`), a shape-named sibling of `attention_sycl`. Identical
+flash / online-softmax math and per-query register layout, but the epilogue
+writes the output twice from one `acc[j]*inv`: `O` in dtype dt and `O_f16` in
+f16. Shape: online-attention + fused f16 context store.
+
+Current public route: `ops::attention_f16ctx(...)` (dispatch/attention.cpp),
+new operation in the attention family (co-exists with `attention`, does not
+replace it). New op because the extra `O_f16` output is a signature change --
+same precedent as `fused_add_rms_norm` vs `rms_norm`.
+
+References inspected: embeddinggemma.c `src/engine_xpu.cpp`
+`EI_XPU_FUSE_ATTN_OUTPUT_HALF` / `fuse_attn_output_half` -- its online-attention
+epilogue emits a half copy of the context so the attention-output GEMM reads
+`half_input` directly, skipping a standalone `float_to_half(ctx)` submission.
+This kernel is the decoupled-library form of that fusion.
+
+Environment: Arc Pro B60 (Battlemage G21), Level Zero V2 driver 1.14.37020,
+oneAPI icpx, `--preset sycl`, working tree at HEAD 4eb01b1, device 0.
+gnome-shell shares the GPUs (noisy) -> best-of-N with interleaved fused/unfused.
+
+Correctness: fp64 host oracle in `tests/xpu_ops_smoke.cpp`
+(`check_attention_f16ctx`), umbrella per-dtype tolerances. Checks BOTH outputs:
+the dtype-dt O against the SDPA oracle (unchanged compute path) and the fused
+O_f16 against the f16 rounding of the same result. f32/f16/bf16, MHA + GQA
+(16/4) + cross-attn (sq=96, sk=160). All cases `worst_excess=0 worst16=0`. Base
+`attention` op unchanged (still `worst_excess=0`). Full smoke suite: PASS.
+
+Baseline / A/B: harness `--kernel attention_f16ctx --approx {fused,unfused}`.
+`unfused` = `attention_sycl` (writes O) + a standalone O->O_f16 convert kernel
+(the pass the fusion folds away), timed as the sum of both device events;
+`fused` = the single `attention_f16ctx_sycl` event. Interleaved best-of-7
+medians (warmup 12, iters 50), f16, device 0:
+
+| shape (heads x seq, d=64) | unfused ms | fused ms | fused faster |
+|---|---:|---:|---:|
+| 32 x 128 (decode-ish) | 1.70823 | **1.69198** | **0.95%** |
+| 16 x 512 | 6.39812 | **6.36437** | **0.53%** |
+| 8 x 1024 | 12.5369 | **12.4283** | **0.87%** |
+
+Decision: **keep**. Correctness-equivalent and never slower than the two-kernel
+baseline (consistently ~0.5-1% lower device time across shapes), while
+structurally removing a full O-sized (2*|O|) read+write convert pass and its
+launch. The absolute gain is small here only because the current attention
+variant is the correctness-first one-work-item-per-query shape (compute-bound),
+so the eliminated convert is a small fraction of total; the relative payoff
+grows once the tiled/subgroup throughput attention variant lands (attention
+cheaper -> convert a larger share), which is the regime the fusion targets in
+embeddinggemma (fast subgroup online-attention + free f16 store).
+
+Open questions: fold into the deferred tiled/joint_matrix attention variant when
+it lands, and expose an `attention` `Variant::best` route that picks the fused
+store when the caller passes an O_f16 sink.
+
+Raw results: interleaved best-of-7 A/B above; machine-specific JSON not archived
+(git-ignored perf/results/).
