@@ -53,6 +53,7 @@
 #include "quantization/nvfp4_gemv/nvfp4_kernel.hpp"
 #include "quantization/qgemm/qgemm_kernel.hpp"
 #include "quantization/qgemv/qgemv_kernel.hpp"
+#include "quantization/w4a16_gemm/w4a16_gemm_kernel.hpp"
 #include "sampling/argmax/argmax_kernel.hpp"
 #include "sampling/sample/sample_kernel.hpp"
 #include "linear_attention/linear_attn/linear_attn_kernel.hpp"
@@ -582,6 +583,69 @@ int main(int argc, char** argv) {
               << ",\"gops\":" << gops << ",\"device\":\""
               << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
     sycl::free(A, q); sycl::free(B, q); sycl::free(as, q); sycl::free(bs, q); sycl::free(C, q);
+    return 0;
+  }
+
+  if (kernel == "w4a16_gemm") {
+    // int4-weight x 16-bit-activation DPAS GEMM vs the existing int4/int8 paths.
+    // --approx dpas (default): the new w4a16_gemm_sycl (joint_matrix). --approx
+    // gemv: the current int4 path applied per-row -- M sequential qgemv_int4
+    // launches (summed device time), i.e. how int4-weight GEMM is done today.
+    // --approx int8: qgemm_int8_sycl (the existing int8 w8a8 GEMM native tile) at
+    // the same M/N/K. Same M,N,K; group=128 (or K). Activation dtype must be
+    // 16-bit; f32 is remapped to bf16 for this kernel.
+    DType adt = (dt == DType::f32) ? DType::bf16 : dt;
+    const std::size_t elem16 = dtype_size(adt);
+    const std::size_t group = (K % 128 == 0) ? 128 : K;
+    void* w = sycl::malloc_device(N * (K / 2), q);            // int4 packed [N,K/2]
+    void* sc = sycl::malloc_device(N * (K / group) * 2, q);   // f16 scales [N,K/group]
+    void* A = sycl::malloc_device(M * K * elem16, q);         // [M,K] act
+    void* C = sycl::malloc_device(M * N * elem16, q);         // [M,N] out
+    q.memset(w, 1, N * (K / 2)).wait();
+    q.memset(sc, 0, N * (K / group) * 2).wait();
+    q.memset(A, 0, M * K * elem16).wait();
+    // int8 comparison operands
+    std::int8_t* iA = sycl::malloc_device<std::int8_t>(M * K, q);
+    std::int8_t* iB = sycl::malloc_device<std::int8_t>(K * N, q);
+    float* ias = sycl::malloc_device<float>(M, q);
+    float* ibs = sycl::malloc_device<float>(N, q);
+    void* iC = sycl::malloc_device(M * N * elem16, q);
+    q.memset(iA, 0, M * K).wait(); q.memset(iB, 0, K * N).wait();
+    q.memset(ias, 0, M * 4).wait(); q.memset(ibs, 0, N * 4).wait();
+
+    const std::string mode = approx_s;  // dpas | gemv | int8
+    auto once = [&]() -> double {
+      if (mode == "gemv") {
+        double t = 0.0;
+        for (std::size_t m = 0; m < M; ++m) {
+          const char* xrow = static_cast<const char*>(A) + m * K * elem16;
+          char* yrow = static_cast<char*>(C) + m * N * elem16;
+          sycl::event e = kernels::qgemv_int4_sycl(q, w, sc, xrow, yrow, N, K, group, adt);
+          e.wait(); t += event_ms(e);
+        }
+        return t;
+      }
+      if (mode == "int8") {
+        sycl::event e = kernels::qgemm_int8_sycl(q, iA, iB, ias, ibs, iC, M, N, K, adt);
+        e.wait(); return event_ms(e);
+      }
+      sycl::event e = kernels::w4a16_gemm_sycl(q, A, w, sc, C, M, N, K, group, adt);
+      e.wait(); return event_ms(e);
+    };
+    for (int i = 0; i < warmup; ++i) once();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) s.push_back(once());
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    const double gops = 2.0 * (double)M * (double)N * (double)K / (med * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"w4a16_gemm\",\"variant\":\"sycl\",\"approx\":\""
+              << (mode == "gemv" ? "gemv" : (mode == "int8" ? "int8" : "dpas"))
+              << "\",\"dtype\":\"" << dtype_name(adt) << "\",\"M\":" << M << ",\"N\":" << N
+              << ",\"K\":" << K << ",\"group\":" << group << ",\"iters\":" << iters
+              << ",\"median_ms\":" << med << ",\"min_ms\":" << s.front() << ",\"gops\":" << gops
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(w, q); sycl::free(sc, q); sycl::free(A, q); sycl::free(C, q);
+    sycl::free(iA, q); sycl::free(iB, q); sycl::free(ias, q); sycl::free(ibs, q); sycl::free(iC, q);
     return 0;
   }
 

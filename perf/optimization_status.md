@@ -2164,3 +2164,99 @@ throughput ceiling for very long sequences and is deferred.
 
 Raw results: interleaved best-of-7 medians above; machine-specific JSON not
 archived (git-ignored perf/results/).
+
+## 2026-07-22: w4a16_gemm (int4-weight x f16/bf16-activation DPAS GEMM)
+
+Status: landed (correctness-first native DPAS baseline).
+
+Feasibility first (the gating question): the reference EI_XPU_XE2_W4 path
+(embeddinggemma.c engine_xpu_w4.cpp launch_w4 -> xe_gemm_4bits with
+w4a16_policy_m_{8,16,32}, XE_DPAS_TT) is built on cutlass-sycl / cute. Those
+sources ARE present on the box (~/vllm-xpu-kernels/.deps/cutlass-sycl-src/include/cute,
+and the csrc/xpu/grouped_gemm/xe_2 headers under
+~/embeddinggemma-bench/.xpu-deps/vllm-xpu-kernels), so that path is not
+dep-blocked -- but porting it would import cutlass-sycl wholesale, which
+AGENTS.md forbids without a licensing/provenance review. The preferred route is a
+NATIVE int4 DPAS GEMM using SYCL's own joint_matrix (no external GEMM library).
+QuixiCore had NO joint_matrix usage anywhere (dense_gemm and qgemm are both
+scalar SLM tiles; the only "joint_matrix" strings were comments deferring it), so
+the decisive unknown was whether joint_matrix compiles+runs on the B60 with this
+oneAPI. Probe (/tmp/jm_probe.cpp): a bf16 8x16x16 joint_matrix MMA -> f32 was
+built and run, bit-exact (worst_abs=0), under BOTH AoT (intel_gpu_bmg_g21) and
+plain-`-fsycl` JIT (the QuixiCore build config). => native route FEASIBLE; built.
+
+Current implementation:
+`kernels/quantization/w4a16_gemm/variants/xpu_sycl/w4a16_gemm.sycl.cpp`
+(`w4a16_gemm_sycl`). C[M,N] = A[M,K] . dequant(W)^T; W [N,K] int4 group-quant in
+the qgemv_int4 / quantize_int4_group encoding (2 nibbles/byte, low=even k,
+high=odd k, signed s4; f16 scales [N,K/group]; dequant = s4(nibble)*scale). One
+subgroup (SG=16) owns one TMxTN = 8x16 output tile and loops K in TK=16 steps;
+per step it stages the A tile and the DEQUANTIZED, transposed weight tile
+(bt[kk][nn]=dequant(W[n0+nn][k0+kk])) into SLM (both zero-padded on the M/N/K
+edges), then joint_matrix_load + joint_matrix_mad accumulates in fp32; the fp32
+accumulator is stored to SLM and written out masked in act_dt. act_dt in
+{f16, bf16} (a16); f32 activation is out of contract (empty event). Shape:
+int4-weight x f16/bf16-activation DPAS GEMM (small-M decode).
+
+Current public route: `ops::w4a16_gemm(...)` (dispatch/quantization.cpp). New,
+additive op (opt-in by being a distinct entry point -- it replaces no existing
+route; qgemv_int4 and qgemm_int8 are unchanged). Written natively against SYCL
+joint_matrix; pulls in NO cutlass-sycl / cute.
+
+References inspected: embeddinggemma.c engine_xpu_w4.cpp `launch_w4` /
+`ei_xpu_w4_matmul` (the EI_XPU_XE2_W4 small-M int4 DPAS path -- its cutlass-based
+xe_gemm_4bits was intentionally NOT ported; the joint_matrix tiling here is
+independent) and the int4 encoding of qgemv_int4 / quantize_int4_group.
+
+Environment: Arc Pro B60 (Battlemage), Level Zero V2 driver 1.14.37020, oneAPI
+DPC++/C++ 2026.1.0, `--preset sycl` (JIT), base HEAD ff0093c, device 0.
+gnome-shell shares the GPUs (noisy) -> interleaved best-of-7, min_ms reported.
+
+Correctness: fp64 host oracle in `tests/xpu_ops_smoke.cpp`
+(`check_w4a16_gemm`) is the CPU q4-dequant reference C[m,n] = sum_k A[m,k] *
+dequant(W)[n,k], with the dequantized weight ROUNDED to the compute dtype T
+(bf16/f16) before the multiply -- faithful to the DPAS algorithm, which
+necessarily dequantizes int4 into the 16-bit tensor dtype before the MMA (the
+same way the repo's other quant oracles model their compute-dtype rounding; an
+initial ideal-fp64 oracle over-tightened bf16 by ~7e-4). rtol widened by
+sqrt(K). Cases: f16/bf16, M {5,8,16,32}, N {20,48,64,128}, K {40,128,256,512},
+group {8,32,64,128}, including non-tile-multiple M/N and a K tail (edge masking).
+All `worst_excess = 0` and `max_abs = 0` -- BIT-EXACT to the faithful oracle.
+Full smoke suite: PASS.
+
+Baseline / A/B: harness `--kernel w4a16_gemm --approx {dpas,gemv,int8}`. `dpas` =
+the new joint_matrix kernel; `gemv` = the current int4-weight path applied
+per-row (M sequential qgemv_int4 launches, summed device time -- how int4 GEMM is
+done today); `int8` = the existing int8 w8a8 GEMM native SLM tile
+(qgemm_int8_sycl) at the same M/N/K. bf16, N=K=4096, group=128. Interleaved
+best-of-7 min_ms (warmup 8, iters 30), device 0:
+
+| M | dpas ms | gemv (int4 xM) ms | int8 gemm ms | dpas vs gemv | dpas vs int8 |
+|---:|---:|---:|---:|---:|---:|
+| 8  | 1.771 | 1.269 | 0.930 | 0.72x | 0.53x |
+| 16 | 2.497 | 3.815 | 0.928 | **1.53x** | 0.37x |
+| 32 | 3.590 | 7.599 | 1.868 | **2.12x** | 0.52x |
+
+Decision: **keep** (correctness-first). The kernel is bit-exact and fills the
+genuinely missing native int4-weight DPAS-GEMM shape. Against the int4 path it is
+designed to replace (per-row GEMV, which re-reads all N*K/2 weight bytes once PER
+row -> M x weight bandwidth), it wins increasingly with batch: 1.53x at M=16,
+2.12x at M=32, crossing over below M=8 (at M=8 eight bandwidth-bound GEMV launches
+still beat the naive 8x16-tile DPAS by 0.72x). It is NOT yet faster than the int8
+w8a8 SLM GEMM (0.37-0.53x): the per-tile int4 unpack+scale ALU and the
+one-subgroup-per-8x16-tile occupancy offset the tensor-engine advantage, and int8
+moves half the compute of the reference qgemm baseline. Honest standing:
+correct + beats the existing int4 path in its target batch regime, not yet a
+throughput winner overall.
+
+Open questions / next: this is an untuned baseline. Register-blocking multiple
+DPAS tiles per subgroup (larger BM/BN, several accumulators), avoiding the A-tile
+SLM round-trip (A is already row-major bf16 -> load joint_matrix use::a straight
+from global), and prefetching / double-buffering the dequantized weight tile are
+the obvious levers to close the int8 gap. int4 packed into a VNNI-ready layout
+once (vs per-tile unpack) would cut the dequant ALU. Deferred to a w4a16
+throughput pass.
+
+Raw results: interleaved best-of-7 min_ms above; feasibility probe
+/tmp/jm_probe.cpp (bf16 joint_matrix worst_abs=0); machine-specific JSON not
+archived (git-ignored perf/results/).

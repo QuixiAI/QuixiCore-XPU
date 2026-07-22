@@ -243,6 +243,28 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/quantization/qgemv/variants/xpu_sycl}
+  w4a16_gemm:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/w4a16_gemm
+    dtypes: [f16, bf16]
+    quant_format: int4_group
+    shape: int4-weight x f16/bf16-activation DPAS GEMM (small-M decode)
+    note: >-
+      W4A16 GEMM on the Xe tensor engine (DPAS via SYCL joint_matrix):
+      C[M,N] = A[M,K] . dequant(W)^T, W [N,K] int4 group-quant (the qgemv_int4 /
+      quantize_int4_group encoding), A/C 16-bit float. One subgroup owns an
+      8x16 output tile; the weight tile is dequantized on the fly into SLM and
+      fed to joint_matrix as the B operand, fp32 accumulation. The batched
+      analogue of qgemv_int4 -- the genuinely missing int4-weight DPAS shape
+      (the box had int4 only as a batch-1 GEMV and int8 GEMM without DPAS).
+      Written natively against SYCL joint_matrix, NOT the embeddinggemma.c
+      EI_XPU_XE2_W4 path's cutlass-sycl / cute xe_gemm_4bits (no external GEMM
+      library pulled in). fp64 oracle vs the CPU q4 dequant reference.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel w4a16_gemm --M M --N N --K K"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/quantization/w4a16_gemm/variants/xpu_sycl}
   qgemm_int8:
     family: quantization
     status: implemented

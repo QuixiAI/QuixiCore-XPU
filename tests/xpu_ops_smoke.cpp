@@ -1842,6 +1842,66 @@ bool check_qgemv_int4(sycl::queue& q, DType act_dt, std::size_t N, std::size_t K
   return ok;
 }
 
+// w4a16_gemm: int4 group-quant weight x f16/bf16 activation DPAS GEMM. fp64
+// oracle is the CPU q4 dequant reference C[m,n] = sum_k A[m,k] * wint[n,k] *
+// scale[n,k/group] (same int4 encoding + weight/scale generation as
+// check_qgemv_int4, so the two share the q4 reference). Shapes cover the small-M
+// decode regime and non-tile-multiple M/N and a K tail (edge masking).
+template <typename T>
+bool check_w4a16_gemm(sycl::queue& q, DType act_dt, std::size_t M, std::size_t N,
+                      std::size_t K, std::size_t group) {
+  const std::size_t bpr = K / 2, gpr = K / group;
+  std::uint8_t* w = sycl::malloc_shared<std::uint8_t>(N * bpr, q);
+  half_t* scales = sycl::malloc_shared<half_t>(N * gpr, q);
+  T* Amat = sycl::malloc_shared<T>(M * K, q);
+  T* Cmat = sycl::malloc_shared<T>(M * N, q);
+
+  auto qval = [](std::size_t i) {
+    int v = static_cast<int>(std::floor(sample(i) * 4.0f));  // ~[-8,7]
+    return std::max(-8, std::min(7, v));
+  };
+  std::vector<int> wint(N * K);
+  for (std::size_t n = 0; n < N; ++n)
+    for (std::size_t b = 0; b < bpr; ++b) {
+      const int lo = qval(n * K + 2 * b);
+      const int hi = qval(n * K + 2 * b + 1);
+      wint[n * K + 2 * b] = lo;
+      wint[n * K + 2 * b + 1] = hi;
+      w[n * bpr + b] = static_cast<std::uint8_t>((lo & 0xF) | ((hi & 0xF) << 4));
+    }
+  for (std::size_t i = 0; i < N * gpr; ++i) scales[i] = static_cast<half_t>(0.02f + 0.01f * std::abs(sample(i + 9)));
+  for (std::size_t i = 0; i < M * K; ++i) Amat[i] = static_cast<T>(sample(i + 13) * 0.5f);
+
+  ops::w4a16_gemm(q, Amat, w, scales, Cmat, M, N, K, group, act_dt, Variant::sycl, true);
+
+  double worst = 0.0, max_abs = 0.0;
+  const Tol base = tol_for(act_dt);
+  const double rtol = base.rtol * std::sqrt(static_cast<double>(K));
+  for (std::size_t m = 0; m < M; ++m)
+    for (std::size_t n = 0; n < N; ++n) {
+      double acc = 0.0;
+      for (std::size_t k = 0; k < K; ++k) {
+        // Faithful to the DPAS algorithm: the int4 weight is dequantized INTO the
+        // 16-bit compute dtype (bf16/f16) before the tensor multiply, so the
+        // oracle rounds dequant(W) to T too (the a16 quant numerics -- the same
+        // way the repo's other quant oracles model their compute-dtype rounding).
+        const T wq = static_cast<T>(static_cast<float>(wint[n * K + k]) *
+                                    static_cast<float>(scales[n * gpr + k / group]));
+        acc += static_cast<double>(Amat[m * K + k]) * static_cast<double>(wq);
+      }
+      const double ref = static_cast<double>(static_cast<T>(acc));
+      const double err = std::abs(static_cast<double>(Cmat[m * N + n]) - ref);
+      max_abs = std::max(max_abs, err);
+      worst = std::max(worst, err - (base.atol + rtol * std::abs(ref)));
+    }
+  sycl::free(w, q); sycl::free(scales, q); sycl::free(Amat, q); sycl::free(Cmat, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  w4a16_gemm act=" << dtype_name(act_dt) << " (M=" << M << " N=" << N
+            << " K=" << K << " g=" << group << ") max_abs=" << max_abs
+            << " worst_excess=" << worst << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 template <typename T>
 bool check_rope(sycl::queue& q, DType dt, std::size_t tokens, std::size_t heads,
                 std::size_t hd) {
@@ -2556,6 +2616,13 @@ int main() {
   // int4 quantized GEMV (native).
   failures += check_qgemv_int4<float>(q, DType::f32, 128, 4096, 128) ? 0 : 1;
   failures += check_qgemv_int4<bf16_t>(q, DType::bf16, 128, 4096, 128) ? 0 : 1;
+
+  // w4a16_gemm: int4-weight x f16/bf16-activation DPAS (joint_matrix) GEMM.
+  // fp64 q4-dequant oracle; small-M decode regime + edge masking (M/N/K tails).
+  failures += check_w4a16_gemm<half_t>(q, DType::f16, 8, 64, 512, 128) ? 0 : 1;   // clean tiles
+  failures += check_w4a16_gemm<bf16_t>(q, DType::bf16, 32, 128, 256, 64) ? 0 : 1;  // bigger M, bf16
+  failures += check_w4a16_gemm<half_t>(q, DType::f16, 5, 20, 40, 8) ? 0 : 1;       // M/N mask + K tail
+  failures += check_w4a16_gemm<bf16_t>(q, DType::bf16, 16, 48, 128, 32) ? 0 : 1;   // GQA-ish N, bf16
 
   // mxfp4 GEMV (native e2m1 + e8m0 block-scale decode).
   failures += check_mxfp4_gemv<float>(q, DType::f32, 128, 4096) ? 0 : 1;

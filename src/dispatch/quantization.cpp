@@ -12,6 +12,7 @@
 #include "quantization/nvfp4_gemv/nvfp4_kernel.hpp"
 #include "quantization/qgemm/qgemm_kernel.hpp"
 #include "quantization/qgemv/qgemv_kernel.hpp"
+#include "quantization/w4a16_gemm/w4a16_gemm_kernel.hpp"
 
 namespace quixicore::xpu::ops {
 
@@ -141,6 +142,16 @@ void qgemv_int4(sycl::queue& q, const void* w_packed, const void* scales,
   (void)variant;  // native only
   sycl::event ev =
       kernels::qgemv_int4_sycl(q, w_packed, scales, x, y, N, K, group, act_dt);
+  if (blocking) ev.wait();
+}
+
+void w4a16_gemm(sycl::queue& q, const void* A, const void* w_packed,
+                const void* scales, void* C, std::size_t M, std::size_t N,
+                std::size_t K, std::size_t group, DType act_dt, Variant variant,
+                bool blocking) {
+  (void)variant;  // native DPAS joint_matrix only
+  sycl::event ev = kernels::w4a16_gemm_sycl(q, A, w_packed, scales, C, M, N, K,
+                                            group, act_dt);
   if (blocking) ev.wait();
 }
 

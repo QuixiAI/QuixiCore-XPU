@@ -388,6 +388,21 @@ void qgemv_int4(sycl::queue& q, const void* w_packed, const void* scales,
                 std::size_t group, DType act_dt, Variant variant = Variant::sycl,
                 bool blocking = true);
 
+// W4A16 GEMM on the Xe tensor engine (DPAS via SYCL joint_matrix):
+// C[M,N] = A[M,K] . dequant(W)^T. A/C are 16-bit float (`act_dt` in {f16, bf16}
+// -- "a16"); W is [N,K] int4 group-quantized with the SAME encoding
+// qgemv_int4 / quantize_int4_group use: `w_packed` is 2 nibbles/byte (low nibble
+// = even k, high = odd k, signed two's-complement), `scales` is f16 [N, K/group],
+// dequant(W)[n,k] = s4(nibble) * scales[n, k/group]. The weight tile is
+// dequantized on the fly into SLM and multiplied by the activation tile on the
+// int4-weight tensor path (DPAS), fp32 accumulation. Small-M (M<=32) decode-GEMM
+// shape (the batched analogue of qgemv_int4). K must be even and `group` must
+// divide K; any M/N are handled by edge masking. act_dt f32 is unsupported.
+void w4a16_gemm(sycl::queue& q, const void* A, const void* w_packed,
+                const void* scales, void* C, std::size_t M, std::size_t N,
+                std::size_t K, std::size_t group, DType act_dt,
+                Variant variant = Variant::sycl, bool blocking = true);
+
 // fp8 format selector (OCP / NVIDIA fp8).
 enum class Fp8Kind {
   e4m3,
