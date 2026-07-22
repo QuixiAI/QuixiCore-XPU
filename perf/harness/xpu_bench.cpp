@@ -147,6 +147,25 @@ sycl::event pool_meanl2_dispatch(sycl::queue& q, const T* normed, const int* off
   }
 }
 
+// Baseline for the glu_gelu_f16 A/B: GEGLU (tanh-gelu gate x value) writing the
+// storage dtype, matching the fused kernels math exactly so the only delta is
+// the [rows,d] scratch round-trip + f16 convert that the fusion folds away.
+inline float bench_gelu_tanh(float x) {
+  constexpr float a = 0.044715f, s = 0.79788456080286535587989211986876f;
+  return 0.5f * x * (1.0f + sycl::tanh(s * x * (1.0f + a * x * x)));
+}
+template <typename T>
+sycl::event glu_gelu_tanh_dt(sycl::queue& q, const T* x, T* out, std::size_t rows,
+                             std::size_t d) {
+  return q.parallel_for(sycl::range<2>(rows, d), [=](sycl::id<2> idx) {
+    const std::size_t row = idx[0], col = idx[1];
+    const T* gate = x + row * 2 * d;
+    const T* val = gate + d;
+    out[row * d + col] = static_cast<T>(
+        bench_gelu_tanh(static_cast<float>(gate[col])) * static_cast<float>(val[col]));
+  });
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -935,6 +954,57 @@ int main(int argc, char** argv) {
               << ",\"min_ms\":" << s.front() << ",\"max_ms\":" << s.back()
               << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
     sycl::free(Q, q); sycl::free(K, q); sycl::free(qw, q); sycl::free(kw, q);
+    return 0;
+  }
+  if (kernel == "glu_gelu_f16") {
+    // A/B for the fused GEGLU -> f16. --approx fused (default): the single
+    // glu_gelu_f16_sycl kernel (dt in -> f16 out). --approx unfused: the composed
+    // baseline -- a tanh-gelu GLU writing dt into scratch, then a dt->f16 convert
+    // -- timed as the sum of both device events. Same math; the delta is the
+    // eliminated [rows,d] scratch round-trip and a launch. --rows, --dim = d.
+    const std::size_t R = rows, D = dim;
+    void* x = sycl::malloc_device(R * 2 * D * elem, q);
+    void* scratch = sycl::malloc_device(R * D * elem, q);
+    half_t* out = sycl::malloc_device<half_t>(R * D, q);
+    q.memset(x, 0, R * 2 * D * elem).wait();
+    auto convert16 = [&]() -> sycl::event {
+      switch (dt) {
+        case DType::f16: { const half_t* s = static_cast<const half_t*>(scratch);
+          return q.parallel_for(sycl::range<1>(R * D), [=](sycl::id<1> i){ out[i[0]] = s[i[0]]; }); }
+        case DType::bf16: { const bf16_t* s = static_cast<const bf16_t*>(scratch);
+          return q.parallel_for(sycl::range<1>(R * D), [=](sycl::id<1> i){ out[i[0]] = static_cast<half_t>(static_cast<float>(s[i[0]])); }); }
+        default: { const float* s = static_cast<const float*>(scratch);
+          return q.parallel_for(sycl::range<1>(R * D), [=](sycl::id<1> i){ out[i[0]] = static_cast<half_t>(s[i[0]]); }); }
+      }
+    };
+    const bool unfused = (approx_s == "unfused");
+    auto once = [&]() -> double {
+      if (unfused) {
+        sycl::event e1;
+        switch (dt) {
+          case DType::f16: e1 = glu_gelu_tanh_dt<half_t>(q, static_cast<const half_t*>(x), static_cast<half_t*>(scratch), R, D); break;
+          case DType::bf16: e1 = glu_gelu_tanh_dt<bf16_t>(q, static_cast<const bf16_t*>(x), static_cast<bf16_t*>(scratch), R, D); break;
+          default: e1 = glu_gelu_tanh_dt<float>(q, static_cast<const float*>(x), static_cast<float*>(scratch), R, D); break;
+        }
+        e1.wait();
+        sycl::event e2 = convert16(); e2.wait();
+        return event_ms(e1) + event_ms(e2);
+      }
+      sycl::event ef = kernels::glu_gelu_f16_sycl(q, x, out, R, D, dt); ef.wait();
+      return event_ms(ef);
+    };
+    for (int i = 0; i < warmup; ++i) once();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) s.push_back(once());
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    std::cout << "{\"schema_version\":2,\"kernel\":\"glu_gelu_f16\",\"variant\":\"sycl\",\"approx\":\""
+              << (unfused ? "unfused" : "fused") << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"rows\":" << R << ",\"d\":" << D
+              << ",\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"min_ms\":" << s.front() << ",\"max_ms\":" << s.back()
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(x, q); sycl::free(scratch, q); sycl::free(out, q);
     return 0;
   }
   if (kernel == "selective_scan") {

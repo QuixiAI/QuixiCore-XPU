@@ -2002,3 +2002,71 @@ counts; not needed at the measured shapes.
 
 Raw results: interleaved best-of-7 medians above; machine-specific JSON not
 archived (git-ignored perf/results/).
+
+## 2026-07-22: glu_gelu_f16 (GEGLU with fused f16 output)
+
+Status: landed.
+
+Current implementation:
+`kernels/activations/glu/variants/xpu_sycl/glu.sycl.cpp` (`glu_gelu_f16_sycl`),
+a new op in the activations family alongside glu. One work-item per output
+element (a [rows, d] range, no flat-id div/mod); reads the two dt input halves
+(gate half then value half, glu's layout), computes `gelu_tanh(gate) * value` in
+fp32, and stores f16. The gate uses the tanh GELU approximation, matching the
+embeddinggemma.c source -- deliberately NOT `detail::geluf` (the erf GELU that
+glu mode=geglu uses). Shape: GEGLU -> f16.
+
+Current public route: `ops::glu_gelu_f16(...)` (dispatch/activations.cpp). New
+operation in the activations family -- the f16-context variant of glu (the f16
+output is a signature change, same precedent as attention_f16ctx vs attention);
+the base glu op is unchanged.
+
+References inspected: embeddinggemma.c `src/engine_xpu.cpp`
+`launch_up_gate_gelu_half` (GELU-tanh gate x up with a fused f32->f16 convert;
+the plain launch_gelu_mul is the dt-out sibling) and the CPU reference
+`src/kernels.c` `ei_gelu_tanh` / `ei_gelu_mul_inplace`. Math matched exactly:
+`0.5*x*(1 + tanh(0.7978845608 * x * (1 + 0.044715*x*x)))` times the value half.
+The source packs the combined buffer as [up, gate]; this op follows glu's [gate,
+value] half order instead -- the product gelu(gate)*value is identical, and it
+keeps glu_gelu_f16 a true sibling of glu (same input layout, f16 out).
+
+Environment: Arc Pro B60 (Battlemage), Level Zero V2 driver 1.14.37020, oneAPI
+DPC++/C++ 2026.1.0, `--preset sycl`, base HEAD 703fed4, device 0. gnome-shell
+shares the GPUs (noisy) -> interleaved best-of-7 fused/unfused alternated.
+
+Correctness: fp64 host oracle in `tests/xpu_ops_smoke.cpp`
+(`check_glu_gelu_f16`); pure elementwise (no reduction), so `report<half_t>`
+with the f16 tolerance suffices -- the oracle computes `gelu_tanh(gate)*value`
+in fp64 and report rounds to f16. Cases: dt-in {f32,f16,bf16} at d=1024 plus a
+d=1000 (scalar-tail) f32 case. All ok; max_abs f16/f32-in <=3.1e-5, bf16-in
+<=4.9e-4. Full smoke suite: PASS.
+
+Baseline / A/B: harness `--kernel glu_gelu_f16 --approx {fused,unfused}`.
+`unfused` = the composed baseline -- a tanh-gelu GLU writing dt into scratch
+(same math as the fused kernel, so the A/B is correctness-equivalent; the
+library glu mode=geglu could NOT serve as the baseline because it is erf-gelu),
+then a dt->f16 convert -- timed as the sum of both device events. `fused` = the
+single `glu_gelu_f16_sycl` event. The delta is the eliminated [rows,d] scratch
+round-trip and a launch. Interleaved best-of-7 medians (warmup 12, iters 50),
+device 0:
+
+| dtype | rows x d | unfused us | fused us | fused faster |
+|---|---|---:|---:|---:|
+| f32  | 64 x 1152  | 4.583  | **2.916**  | **1.57x** |
+| f32  | 512 x 1152 | 24.896 | **16.875** | **1.48x** |
+| f16  | 64 x 1152  | 4.791  | **2.916**  | **1.64x** |
+| bf16 | 64 x 1152  | 4.687  | **2.812**  | **1.67x** |
+
+Decision: **keep**. Correctness-equivalent and 1.48-1.67x faster than the
+glu + standalone convert two-pass across dtypes/shapes -- the smallest but still
+solid of the three fusions (only one launch and one scratch round-trip are
+folded away). The win narrows slightly as rows grow (the scratch traffic is a
+smaller share of a larger activation), consistent with the memory-traffic model.
+
+Open questions: the elementwise form leaves a vectorized 16-byte-load variant
+(as in glu_typed / vec_map) on the table; not pursued because glu_gelu_f16 is
+memory-bound and already saturates at the measured shapes, and the launch cut is
+the point on this submission-bound backend.
+
+Raw results: interleaved best-of-7 medians above; machine-specific JSON not
+archived (git-ignored perf/results/).

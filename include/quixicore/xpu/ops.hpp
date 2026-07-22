@@ -81,6 +81,18 @@ void glu(sycl::queue& q, const void* x, void* out, std::size_t rows,
          std::size_t d, DType dt, GluMode mode = GluMode::swiglu,
          Variant variant = Variant::sycl, bool blocking = true);
 
+
+// GEGLU with a fused f16 output. Input `x` is [rows, 2*d] row-major (gate half
+// then value half, the same layout as glu); `out` is [rows, d] and always f16:
+//   out[r,i] = f16( gelu_tanh(x[r,i]) * x[r,d+i] )
+// The gate uses the tanh GELU approximation (matching the embeddinggemma.c FFN
+// source); compute is fp32. This is the f16-context variant of glu (cf.
+// attention_f16ctx), folding the dt->f16 convert a downstream f16 GEMM needs
+// into the activation. Shape: GEGLU -> f16.
+void glu_gelu_f16(sycl::queue& q, const void* x, void* out, std::size_t rows,
+                  std::size_t d, DType dt, Variant variant = Variant::sycl,
+                  bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // attention
 // ----------------------------------------------------------------------------

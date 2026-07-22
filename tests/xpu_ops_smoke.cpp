@@ -744,6 +744,32 @@ bool check_gelu_bwd(sycl::queue& q, DType dt, std::size_t n) {
   return ok;
 }
 
+// glu_gelu_f16: GEGLU (tanh-gelu gate x value) with a fused f16 output. Pure
+// elementwise (no reduction), so report<half_t> with the f16 tolerance suffices:
+// the fp64 oracle computes gelu_tanh(gate)*value and report rounds it to f16.
+template <typename T>
+bool check_glu_gelu_f16(sycl::queue& q, DType dt, const char* name,
+                        std::size_t rows, std::size_t d) {
+  T* x = sycl::malloc_shared<T>(rows * 2 * d, q);
+  half_t* out = sycl::malloc_shared<half_t>(rows * d, q);
+  for (std::size_t i = 0; i < rows * 2 * d; ++i) x[i] = static_cast<T>(sample(i) * 2.0f);
+  ops::glu_gelu_f16(q, x, out, rows, d, dt, Variant::sycl, /*blocking=*/true);
+  std::vector<float> o(rows * d);
+  std::vector<double> r(rows * d);
+  const double a = 0.044715, s = 0.79788456080286535587989211986876;
+  for (std::size_t rr = 0; rr < rows; ++rr)
+    for (std::size_t i = 0; i < d; ++i) {
+      const double gate = static_cast<double>(x[rr * 2 * d + i]);
+      const double val = static_cast<double>(x[rr * 2 * d + d + i]);
+      const double g = 0.5 * gate * (1.0 + std::tanh(s * gate * (1.0 + a * gate * gate)));
+      o[rr * d + i] = static_cast<float>(out[rr * d + i]);
+      r[rr * d + i] = g * val;
+    }
+  const bool ok = report<half_t>(name, DType::f16, o, r);
+  sycl::free(x, q); sycl::free(out, q);
+  return ok;
+}
+
 template <typename T>
 bool check_glu(sycl::queue& q, DType dt, ops::GluMode mode, const char* mname,
                std::size_t rows, std::size_t d) {
@@ -2440,6 +2466,11 @@ int main() {
   failures += check_glu<float>(q, DType::f32, ops::GluMode::geglu, "glu_geglu", 64, 1024) ? 0 : 1;
   failures += check_glu<bf16_t>(q, DType::bf16, ops::GluMode::swiglu, "glu_swiglu_bf16", 64, 1024) ? 0 : 1;
   failures += check_glu<float>(q, DType::f32, ops::GluMode::reglu, "glu_reglu", 64, 1000) ? 0 : 1;  // d not mult of 4: scalar path
+  // activations: GEGLU -> f16 fused convert (glu_gelu_f16). dt-in {f32,f16,bf16}.
+  failures += check_glu_gelu_f16<float>(q, DType::f32, "glu_gelu_f16(f32-in)", 64, 1024) ? 0 : 1;
+  failures += check_glu_gelu_f16<half_t>(q, DType::f16, "glu_gelu_f16(f16-in)", 64, 1024) ? 0 : 1;
+  failures += check_glu_gelu_f16<bf16_t>(q, DType::bf16, "glu_gelu_f16(bf16-in)", 64, 1024) ? 0 : 1;
+  failures += check_glu_gelu_f16<float>(q, DType::f32, "glu_gelu_f16(f32-in,d1000)", 64, 1000) ? 0 : 1;
 
   // Dense GEMM, both variants, f32 + bf16.
   for (const Variant v : variants) {

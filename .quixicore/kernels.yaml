@@ -131,6 +131,25 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/activations/glu/variants/xpu_sycl}
+
+  glu_gelu_f16:
+    family: activations
+    status: implemented
+    path: kernels/activations/glu
+    dtypes: [f32, f16, bf16]
+    shape: GEGLU -> f16
+    note: >-
+      GEGLU (tanh-gelu gate x value) with a fused f16 output -- the f16-context
+      variant of glu, mirroring attention_f16ctx. Input [rows, 2*d] (gate half
+      then value half, same layout as glu), output [rows, d] always f16:
+      out = f16(gelu_tanh(gate) * value). Uses the tanh GELU approximation
+      (matching the embeddinggemma.c source), NOT the erf GELU of glu mode=geglu.
+      Ported from embeddinggemma.c engine_xpu.cpp launch_up_gate_gelu_half;
+      kernels.c ei_gelu_tanh / ei_gelu_mul_inplace is the fp64 oracle.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel glu_gelu_f16 --approx {fused,unfused}"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/activations/glu/variants/xpu_sycl}
   rms_norm:
     family: norms
     status: implemented
