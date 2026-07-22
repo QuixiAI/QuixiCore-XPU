@@ -115,6 +115,25 @@ void attention_f16ctx(sycl::queue& q, const void* Q, const void* K,
                       std::size_t seq_k, std::size_t d, bool causal, DType dt,
                       Variant variant = Variant::sycl, bool blocking = true);
 
+
+// Fused per-head QK-norm + RoPE (+ optional f16 convert). For every (token,
+// head) of Q and K: RMS-normalize the head-dim vector by its learned weight,
+// scale the query heads by `query_scale` (key heads by 1), then apply NeoX
+// half-split RoPE at position (pos0 + token). Q is [tokens, n_head, head_dim],
+// K is [tokens, n_head_kv, head_dim] row-major (GQA when n_head_kv < n_head),
+// both dtype dt and updated in place; `q_weight` / `k_weight` are [head_dim].
+// When `Q_f16` / `K_f16` are non-null (f16, same layout) the rotated result is
+// also written there (fused convert for a downstream f16 QK GEMM); pass null to
+// skip. head_dim must be even; fp32 accumulation. Collapses the per-head
+// rms_norm(Q) + rms_norm(K) + query-scale + rope(Q) + rope(K) chain into one
+// launch. Shape: per-head RMSNorm + query-scale + RoPE.
+void qk_norm_rope(sycl::queue& q, void* Q, void* K, const void* q_weight,
+                  const void* k_weight, void* Q_f16, void* K_f16,
+                  std::size_t tokens, std::size_t n_head, std::size_t n_head_kv,
+                  std::size_t head_dim, float base, std::size_t pos0,
+                  float query_scale, float eps, DType dt,
+                  Variant variant = Variant::sycl, bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // optimizers
 // ----------------------------------------------------------------------------

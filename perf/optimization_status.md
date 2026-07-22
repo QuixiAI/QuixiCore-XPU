@@ -1925,3 +1925,80 @@ dtype-generic sink is a trivial future extension.
 
 Raw results: interleaved best-of-7 medians above; machine-specific JSON not
 archived (git-ignored perf/results/).
+
+## 2026-07-22: qk_norm_rope (fused per-head QK-norm + query-scale + RoPE)
+
+Status: landed.
+
+Current implementation:
+`kernels/attention/qk_norm_rope/variants/xpu_sycl/qk_norm_rope.sycl.cpp`
+(`qk_norm_rope_sycl`), a new op in the attention family alongside attention /
+rope. One subgroup owns each (token, head); the subgroup reduces sum(x^2) over
+head_dim (fp32) for the RMS scale, then each lane rotates its strided NeoX
+half-split pairs (i, i+head_dim/2). For every (token, head) of Q
+([tokens,n_head,head_dim]) and K ([tokens,n_head_kv,head_dim], GQA via
+n_head_kv<n_head): RMS-normalize by the learned weight, fold the query scale
+into the inverse-RMS for query heads (keys use 1), apply weight*inv before the
+rotation, and optionally also write an f16 copy (Q_f16/K_f16, null to skip). The
+RoPE angle is computed on the fly from `base` and a contiguous position
+(pos0+token), matching rope.sycl.cpp exactly so the unfused baseline composes
+the shipped rms_norm + rope. Shape: per-head RMSNorm + query-scale + RoPE.
+
+Current public route: `ops::qk_norm_rope(...)` (dispatch/attention.cpp). New
+operation in the attention family -- signature couples in-place Q/K, two learned
+weights, a query scale, and optional f16 sinks; it did not exist before.
+
+References inspected: embeddinggemma.c `src/engine_xpu.cpp`
+`launch_qk_norm_rope` (the per-head QK-norm + query-scale + RoPE shape; the
+richer `launch_qkv_epilogue`, which additionally encodes the model's fused-QKV
+memory layout, was intentionally NOT ported -- it is more model-specific) and
+the CPU reference `src/kernels.c` `ei_qk_norm_rope_qk_inplace`. Math matched
+exactly: `inv = rsqrt(mean(x^2) + eps)`, query heads `*= query_scale`, then
+`x0 = x[i]*w[i]*inv`, `x1 = x[i+half]*w[i+half]*inv`,
+`out[i] = x0*cos - x1*sin`, `out[i+half] = x0*sin + x1*cos` with
+`angle = pos * base^(-2i/head_dim)`. The reference applies the query scale after
+the rotation; folding it into inv before rotation is identical (rotation is
+linear).
+
+Environment: Arc Pro B60 (Battlemage), Level Zero V2 driver 1.14.37020, oneAPI
+DPC++/C++ 2026.1.0, `--preset sycl`, base HEAD 459fbe0, device 0. gnome-shell
+shares the GPUs (noisy) -> interleaved best-of-7 fused/unfused alternated.
+
+Correctness: fp64 host oracle in `tests/xpu_ops_smoke.cpp`
+(`check_qk_norm_rope`), checking the in-place dt output of BOTH Q and K and, when
+enabled, the f16 sinks; the head_dim reduction widens rtol by sqrt(head_dim)
+(pool/attention oracle convention). Cases: MHA (8/8, hd 64), GQA (16/4 hd 128;
+32/8 hd 128), with and without the f16 sink, across f32/f16/bf16. All `worst=0`
+and `worst16=0`; max_abs f32 <=9.1e-7, f16 <=9.8e-4, bf16 <=3.9e-3. Full smoke
+suite: PASS.
+
+Baseline / A/B: harness `--kernel qk_norm_rope --approx {fused,unfused}`.
+`unfused` = the composed separate-ops decomposition -- `rms_norm(Q,q_weight)`,
+scale Q by query_scale, `rope(Q)`, `rms_norm(K,k_weight)`, `rope(K)` -- timed as
+the sum of the five device events. `fused` = the single `qk_norm_rope_sycl`
+event. Shapes: tokens=rows, n_head 32, n_head_kv 8 (GQA), head_dim 128. The
+delta is 4 eliminated kernel launches -- the whole point on this
+submission-bound backend. Interleaved best-of-7 medians (warmup 12, iters 50),
+device 0:
+
+| dtype | tokens | unfused us | fused us | fused faster |
+|---|---|---:|---:|---:|
+| f32  | 32  | 19.062 | **5.104**  | **3.74x** |
+| f32  | 128 | 58.750 | **17.187** | **3.42x** |
+| f16  | 32  | 21.145 | **5.104**  | **4.14x** |
+| bf16 | 32  | 21.563 | **5.000**  | **4.31x** |
+
+Decision: **keep**. Correctness-equivalent and 3.4-4.3x faster than the
+five-launch decomposition -- the largest fusion win of the three ported kernels,
+consistent with the submission-bound cost model (5 launches -> 1). The advantage
+narrows slightly as tokens grow (more per-launch compute to amortize) but stays
+>3.4x at 128 tokens.
+
+Open questions: the f16 sink was benchmarked off (the launch-cut is measured on
+the core dt path); with the sink on, the fused kernel additionally subsumes two
+convert passes the decomposition would need. A cooperative multi-subgroup form
+(as in the engine_xpu.cpp reference) could raise occupancy at very small token
+counts; not needed at the measured shapes.
+
+Raw results: interleaved best-of-7 medians above; machine-specific JSON not
+archived (git-ignored perf/results/).

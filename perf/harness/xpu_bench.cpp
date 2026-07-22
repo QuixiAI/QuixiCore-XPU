@@ -40,6 +40,8 @@
 #include "activations/softmax/softmax_kernel.hpp"
 #include "attention/attention/attention_kernel.hpp"
 #include "attention/rope/rope_kernel.hpp"
+
+#include "attention/qk_norm_rope/qk_norm_rope_kernel.hpp"
 #include "matmul/dense_gemm/dense_gemm_kernel.hpp"
 #include "norms/norms_kernel.hpp"
 #include "optimizers/adamw/adamw_kernel.hpp"
@@ -879,6 +881,60 @@ int main(int argc, char** argv) {
               << ",\"min_ms\":" << s.front() << ",\"max_ms\":" << s.back()
               << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
     sycl::free(proj, q); sycl::free(pw, q); sycl::free(res, q); sycl::free(nw, q); sycl::free(out, q); sycl::free(scratch, q); sycl::free(scratch2, q);
+    return 0;
+  }
+  if (kernel == "qk_norm_rope") {
+    // A/B for the fused per-head QK-norm + query-scale + RoPE. --approx fused
+    // (default): the single qk_norm_rope_sycl kernel. --approx unfused: the
+    // composed separate-ops baseline -- rms_norm(Q,qw)->Q, scale Q by
+    // query_scale, rope(Q), rms_norm(K,kw)->K, rope(K) -- timed as the sum of
+    // the five device events. Same shapes; the delta is 4 eliminated launches
+    // (submission-bound). --rows = tokens; n_head/n_head_kv/head_dim fixed below
+    // (GQA: 32/8, head_dim 128).
+    const std::size_t tok = rows, NH = 32, NKV = 8, HD = 128;
+    const std::size_t nq = tok * NH * HD, nk = tok * NKV * HD;
+    void* Q = sycl::malloc_device(nq * elem, q);
+    void* K = sycl::malloc_device(nk * elem, q);
+    void* qw = sycl::malloc_device(HD * elem, q);
+    void* kw = sycl::malloc_device(HD * elem, q);
+    q.memset(Q, 0, nq * elem).wait(); q.memset(K, 0, nk * elem).wait();
+    q.memset(qw, 0, HD * elem).wait(); q.memset(kw, 0, HD * elem).wait();
+    const float eps = 1e-6f, base = 10000.0f, qscale = 0.0625f;
+    auto scaleQ = [&]() -> sycl::event {
+      switch (dt) {
+        case DType::f16: { half_t* p = static_cast<half_t*>(Q);
+          return q.parallel_for(sycl::range<1>(nq), [=](sycl::id<1> i){ p[i[0]] = static_cast<half_t>(static_cast<float>(p[i[0]]) * qscale); }); }
+        case DType::bf16: { bf16_t* p = static_cast<bf16_t*>(Q);
+          return q.parallel_for(sycl::range<1>(nq), [=](sycl::id<1> i){ p[i[0]] = static_cast<bf16_t>(static_cast<float>(p[i[0]]) * qscale); }); }
+        default: { float* p = static_cast<float*>(Q);
+          return q.parallel_for(sycl::range<1>(nq), [=](sycl::id<1> i){ p[i[0]] *= qscale; }); }
+      }
+    };
+    const bool unfused = (approx_s == "unfused");
+    auto once = [&]() -> double {
+      if (unfused) {
+        sycl::event e1 = kernels::rms_norm_sycl(q, Q, qw, Q, tok * NH, HD, eps, dt); e1.wait();
+        sycl::event e2 = scaleQ(); e2.wait();
+        sycl::event e3 = kernels::rope_sycl(q, Q, Q, tok, NH, HD, base, 0, dt); e3.wait();
+        sycl::event e4 = kernels::rms_norm_sycl(q, K, kw, K, tok * NKV, HD, eps, dt); e4.wait();
+        sycl::event e5 = kernels::rope_sycl(q, K, K, tok, NKV, HD, base, 0, dt); e5.wait();
+        return event_ms(e1) + event_ms(e2) + event_ms(e3) + event_ms(e4) + event_ms(e5);
+      }
+      sycl::event ef = kernels::qk_norm_rope_sycl(q, Q, K, qw, kw, nullptr, nullptr, tok, NH, NKV, HD, base, 0, qscale, eps, dt); ef.wait();
+      return event_ms(ef);
+    };
+    for (int i = 0; i < warmup; ++i) once();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) s.push_back(once());
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    std::cout << "{\"schema_version\":2,\"kernel\":\"qk_norm_rope\",\"variant\":\"sycl\",\"approx\":\""
+              << (unfused ? "unfused" : "fused") << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"tokens\":" << tok << ",\"n_head\":" << NH << ",\"n_head_kv\":" << NKV
+              << ",\"head_dim\":" << HD << ",\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"min_ms\":" << s.front() << ",\"max_ms\":" << s.back()
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(Q, q); sycl::free(K, q); sycl::free(qw, q); sycl::free(kw, q);
     return 0;
   }
   if (kernel == "selective_scan") {

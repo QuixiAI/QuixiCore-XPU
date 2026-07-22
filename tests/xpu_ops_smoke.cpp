@@ -263,6 +263,88 @@ bool check_rms_residual_next(sycl::queue& q, DType dt, std::size_t rows, std::si
   return ok;
 }
 
+// qk_norm_rope: fused per-head QK-norm + query-scale + NeoX RoPE (+ optional f16
+// convert). The fp64 oracle mirrors the kernel order exactly -- per (token,head)
+// RMS over head_dim from the ORIGINAL values, query scale folded into inv, then
+// weight*inv applied before the rotation -- for Q (n_head) and K (n_head_kv,
+// GQA-capable) from saved input copies. Checks the in-place dt output and, when
+// requested, the f16 output; the head_dim reduction widens rtol by sqrt(head_dim).
+template <typename T>
+bool check_qk_norm_rope(sycl::queue& q, DType dt, std::size_t tokens,
+                        std::size_t n_head, std::size_t n_head_kv,
+                        std::size_t hd, bool use_half) {
+  const std::size_t nq = tokens * n_head * hd, nk = tokens * n_head_kv * hd;
+  T* Q = sycl::malloc_shared<T>(nq, q);
+  T* K = sycl::malloc_shared<T>(nk, q);
+  T* qw = sycl::malloc_shared<T>(hd, q);
+  T* kw = sycl::malloc_shared<T>(hd, q);
+  half_t* Qh = use_half ? sycl::malloc_shared<half_t>(nq, q) : nullptr;
+  half_t* Kh = use_half ? sycl::malloc_shared<half_t>(nk, q) : nullptr;
+  std::vector<double> q0(nq), k0(nk);
+  for (std::size_t i = 0; i < nq; ++i) { Q[i] = static_cast<T>(sample(i)); q0[i] = static_cast<double>(Q[i]); }
+  for (std::size_t i = 0; i < nk; ++i) { K[i] = static_cast<T>(sample(i + 5)); k0[i] = static_cast<double>(K[i]); }
+  for (std::size_t i = 0; i < hd; ++i) { qw[i] = static_cast<T>(0.5f + sample(i + 7) * 0.1f); kw[i] = static_cast<T>(0.5f + sample(i + 13) * 0.1f); }
+  const float eps = 1e-6f, base = 10000.0f, query_scale = 0.0625f;
+
+  ops::qk_norm_rope(q, Q, K, qw, kw, Qh, Kh, tokens, n_head, n_head_kv, hd, base, 0, query_scale, eps, dt, Variant::sycl, /*blocking=*/true);
+
+  const std::size_t half = hd / 2;
+  const Tol tol = tol_for(dt);
+  const Tol tol16 = tol_for(DType::f16);
+  const double sq = std::sqrt(static_cast<double>(hd));
+  const double rtol = tol.rtol * sq + 5e-3;
+  const double rtol16 = tol16.rtol * sq + 5e-3;
+  double worst = 0.0, worst16 = 0.0, max_abs = 0.0;
+
+  auto check_buf = [&](const T* buf, const half_t* hbuf, const std::vector<double>& src,
+                       const double* weight, std::size_t heads, bool is_key) {
+    for (std::size_t t = 0; t < tokens; ++t)
+      for (std::size_t h = 0; h < heads; ++h) {
+        const std::size_t bb = (t * heads + h) * hd;
+        double ss = 0.0;
+        for (std::size_t d = 0; d < hd; ++d) ss += src[bb + d] * src[bb + d];
+        const double scale = is_key ? 1.0 : static_cast<double>(query_scale);
+        const double inv = (1.0 / std::sqrt(ss / static_cast<double>(hd) + static_cast<double>(eps))) * scale;
+        for (std::size_t i = 0; i < half; ++i) {
+          const double freq = std::pow(static_cast<double>(base), -2.0 * static_cast<double>(i) / static_cast<double>(hd));
+          const double ang = static_cast<double>(t) * freq;
+          const double x0 = src[bb + i] * weight[i] * inv;
+          const double x1 = src[bb + i + half] * weight[i + half] * inv;
+          const double r0 = x0 * std::cos(ang) - x1 * std::sin(ang);
+          const double r1 = x0 * std::sin(ang) + x1 * std::cos(ang);
+          const double ref0 = static_cast<double>(static_cast<T>(r0));
+          const double ref1 = static_cast<double>(static_cast<T>(r1));
+          const double e0 = std::abs(static_cast<double>(buf[bb + i]) - ref0);
+          const double e1 = std::abs(static_cast<double>(buf[bb + i + half]) - ref1);
+          max_abs = std::max(max_abs, std::max(e0, e1));
+          worst = std::max(worst, e0 - (tol.atol + rtol * std::abs(ref0)));
+          worst = std::max(worst, e1 - (tol.atol + rtol * std::abs(ref1)));
+          if (hbuf) {
+            const double h0 = static_cast<double>(static_cast<half_t>(static_cast<float>(r0)));
+            const double h1 = static_cast<double>(static_cast<half_t>(static_cast<float>(r1)));
+            worst16 = std::max(worst16, std::abs(static_cast<double>(hbuf[bb + i]) - h0) - (tol16.atol + rtol16 * std::abs(h0)));
+            worst16 = std::max(worst16, std::abs(static_cast<double>(hbuf[bb + i + half]) - h1) - (tol16.atol + rtol16 * std::abs(h1)));
+          }
+        }
+      }
+  };
+
+  std::vector<double> qwd(hd), kwd(hd);
+  for (std::size_t i = 0; i < hd; ++i) { qwd[i] = static_cast<double>(qw[i]); kwd[i] = static_cast<double>(kw[i]); }
+  check_buf(Q, Qh, q0, qwd.data(), n_head, /*is_key=*/false);
+  check_buf(K, Kh, k0, kwd.data(), n_head_kv, /*is_key=*/true);
+
+  sycl::free(Q, q); sycl::free(K, q); sycl::free(qw, q); sycl::free(kw, q);
+  if (Qh) sycl::free(Qh, q);
+  if (Kh) sycl::free(Kh, q);
+  const bool ok = worst <= 0.0 && worst16 <= 0.0;
+  std::cout << "  qk_norm_rope dt=" << dtype_name(dt) << " t=" << tokens << " h=" << n_head
+            << "/" << n_head_kv << " hd=" << hd << (use_half ? " +f16" : "")
+            << " max_abs=" << max_abs << " worst=" << worst << " worst16=" << worst16
+            << (ok ? "  ok" : "  FAIL") << "\n";
+  return ok;
+}
+
 bool check_dropout(sycl::queue& q, DType dt) {
   const std::size_t n = 1u << 16;
   const float p = 0.3f;
@@ -2452,6 +2534,13 @@ int main() {
   // rope / adamw / argmax (native only).
   failures += check_rope<float>(q, DType::f32, 32, 8, 64) ? 0 : 1;
   failures += check_rope<bf16_t>(q, DType::bf16, 32, 8, 64) ? 0 : 1;
+
+  // attention: fused per-head QK-norm + query-scale + RoPE (qk_norm_rope). MHA
+  // and GQA, head_dim {64,128}, dt {f32,f16,bf16}, with and without the f16 sink.
+  failures += check_qk_norm_rope<float>(q, DType::f32, 32, 8, 8, 64, false) ? 0 : 1;
+  failures += check_qk_norm_rope<half_t>(q, DType::f16, 32, 8, 8, 64, true) ? 0 : 1;
+  failures += check_qk_norm_rope<bf16_t>(q, DType::bf16, 24, 16, 4, 128, false) ? 0 : 1;
+  failures += check_qk_norm_rope<float>(q, DType::f32, 16, 32, 8, 128, true) ? 0 : 1;
   failures += check_adamw(q, DType::f32, 4096) ? 0 : 1;
   failures += check_argmax(q, DType::f32, 64, 4000) ? 0 : 1;
 
