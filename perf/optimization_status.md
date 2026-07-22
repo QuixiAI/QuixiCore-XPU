@@ -1848,3 +1848,80 @@ under-fills the device; not needed at the measured serving shapes. A
 
 Raw results: interleaved best-of-7 medians above; machine-specific JSON not
 archived (git-ignored perf/results/).
+
+## 2026-07-22: rms_residual_next (fused residual-add + double RMSNorm -> f16)
+
+Status: landed.
+
+Current implementation: `kernels/norms/rms_norm/variants/xpu_sycl/rms_norm.sycl.cpp`
+(`rms_residual_next_sycl`), a new op in the norms family alongside rms_norm /
+fused_add_rms_norm. One work-group per row; two group reductions -- RMS of the
+sublayer output `projection` (for its post-norm scale), then RMS of the updated
+residual (for the next layer's pre-norm). The kernel fuses four passes: the
+sublayer post-norm (`projection * post_weight * pinv`), the residual add (writes
+the residual stream in place), the next layer's pre-norm
+(`residual * next_weight * rinv`), and the f16 convert of that pre-norm into
+`next_out`. The residual store uses the fp32 sum while its square feeds the
+second reduction unrounded; the pre-norm re-reads the storage-dtype residual and
+converts to f16, exactly as the reference does. Shape: residual-add + double
+RMSNorm -> f16.
+
+Current public route: `ops::rms_residual_next(...)` (dispatch/norms.cpp). New
+operation in the norms family -- distinct signature (two weights + an in-place
+residual + an f16 sink) extending fused_add_rms_norm (single add+norm) to the
+transformer layer boundary's post-norm/pre-norm pair, same precedent as
+fused_add_rms_norm vs rms_norm.
+
+References inspected: embeddinggemma.c `src/engine_xpu.cpp`
+`launch_rms_residual_next_half` (the clean subgroup-per-row form; the
+register-cache and cooperative-workgroup variants were NOT ported -- their
+self-parity ceiling ~0.999997 is documented in the source, and the clean form
+that re-reads the residual from global is more accurate) and the CPU reference
+`src/kernels.c` `ei_rms_norm_residual_inplace` / `ei_rms_norm` / `ei_norm_scale`.
+Math matched exactly: `pinv = rsqrt(mean(projection^2) + eps)`, then
+`residual += projection * post_weight * pinv`, then
+`rinv = rsqrt(mean(residual^2) + eps)`, then `next_out = f16(residual *
+next_weight * rinv)`. The learned RMSNorm weights are applied directly (Gemma's
+`(1+w)` convention is folded upstream at load, not in the kernel).
+
+Environment: Arc Pro B60 (Battlemage), Level Zero V2 driver 1.14.37020, oneAPI
+DPC++/C++ 2026.1.0, `--preset sycl`, base HEAD b4b177e, device 0. gnome-shell
+shares the GPUs (noisy) -> interleaved best-of-7 with fused/unfused alternated.
+
+Correctness: fp64 host oracle in `tests/xpu_ops_smoke.cpp`
+(`check_rms_residual_next`), checking BOTH the in-place residual (dtype dt) and
+the f16 `next_out`; the two-level reduction widens rtol by sqrt(dim) (same
+convention as the pool / attention oracles). Swept f32/f16/bf16 x dim
+{256,768,1024} = 9 cases. All `worst_res=0` and `worst_out=0`; max_abs f32/f16
+<=4.9e-4, bf16 <=6.1e-5. Full smoke suite: PASS.
+
+Baseline / A/B: harness `--kernel rms_residual_next --approx {fused,unfused}`.
+`unfused` = the composed separate-ops decomposition --
+`rms_norm(projection,post_weight)`->scratch, `residual += scratch`,
+`rms_norm(residual,next_weight)`->scratch2, `convert scratch2->f16` -- timed as
+the sum of the four device events. `fused` = the single `rms_residual_next_sycl`
+event. Same shapes; the delta is ~2 eliminated scratch round-trips and 3 kernel
+launches -- the launch cut being the point on this submission-bound backend.
+Interleaved best-of-7 medians (warmup 12, iters 50), device 0:
+
+| dtype | rows x dim | unfused us | fused us | fused faster |
+|---|---|---:|---:|---:|
+| f32  | 64 x 768   | 7.290  | **4.063** | **1.79x** |
+| f32  | 512 x 768  | 24.062 | **13.958**| **1.72x** |
+| f32  | 64 x 1024  | 7.915  | **4.688** | **1.69x** |
+| f16  | 64 x 768   | 7.603  | **4.167** | **1.83x** |
+| bf16 | 64 x 768   | 7.604  | **4.063** | **1.87x** |
+
+Decision: **keep**. Correctness-equivalent and 1.69-1.87x faster than the
+four-launch decomposition across dtypes/shapes. The win is dominated by cutting
+3 launches/instance (submission-bound) plus eliminating two [rows,dim] scratch
+round-trips; it holds at both small (64) and larger (512) row counts.
+
+Open questions: the register-cache / cooperative-workgroup variants from the
+engine_xpu.cpp reference could help very large `dim` or tiny `rows`, at the cost
+of the documented ~0.999997 self-parity ceiling; not needed at the measured
+serving shapes. `next_out` is always f16 (the fused-convert purpose); a
+dtype-generic sink is a trivial future extension.
+
+Raw results: interleaved best-of-7 medians above; machine-specific JSON not
+archived (git-ignored perf/results/).

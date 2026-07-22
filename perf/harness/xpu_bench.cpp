@@ -814,6 +814,73 @@ int main(int argc, char** argv) {
     sycl::free(x, q); sycl::free(w, q); sycl::free(out, q); sycl::free(scratch, q); sycl::free(off, q);
     return 0;
   }
+  if (kernel == "rms_residual_next") {
+    // A/B for the fused residual-add + double RMSNorm -> f16. --approx fused
+    // (default): the single rms_residual_next_sycl kernel (sublayer post-norm +
+    // residual add + next pre-norm + f16 convert in one launch). --approx
+    // unfused: the composed separate-ops baseline --
+    // rms_norm(projection,post_weight)->scratch, residual += scratch,
+    // rms_norm(residual,next_weight)->scratch2, convert scratch2->f16 -- timed as
+    // the sum of the four device events. The delta is ~2 eliminated scratch
+    // round-trips and 3 launches. --rows, --dim.
+    const std::size_t R = rows, D = dim;
+    const std::size_t total = R * D;
+    void* proj = sycl::malloc_device(total * elem, q);
+    void* pw = sycl::malloc_device(D * elem, q);
+    void* res = sycl::malloc_device(total * elem, q);
+    void* nw = sycl::malloc_device(D * elem, q);
+    half_t* out = sycl::malloc_device<half_t>(total, q);
+    void* scratch = sycl::malloc_device(total * elem, q);
+    void* scratch2 = sycl::malloc_device(total * elem, q);
+    q.memset(proj, 0, total * elem).wait(); q.memset(pw, 0, D * elem).wait();
+    q.memset(res, 0, total * elem).wait(); q.memset(nw, 0, D * elem).wait();
+    const float eps = 1e-6f;
+    auto add_into = [&]() -> sycl::event {
+      switch (dt) {
+        case DType::f16: { half_t* r = static_cast<half_t*>(res); const half_t* s = static_cast<const half_t*>(scratch);
+          return q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i){ r[i[0]] = static_cast<half_t>(static_cast<float>(r[i[0]]) + static_cast<float>(s[i[0]])); }); }
+        case DType::bf16: { bf16_t* r = static_cast<bf16_t*>(res); const bf16_t* s = static_cast<const bf16_t*>(scratch);
+          return q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i){ r[i[0]] = static_cast<bf16_t>(static_cast<float>(r[i[0]]) + static_cast<float>(s[i[0]])); }); }
+        default: { float* r = static_cast<float*>(res); const float* s = static_cast<const float*>(scratch);
+          return q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i){ r[i[0]] += s[i[0]]; }); }
+      }
+    };
+    auto convert16 = [&]() -> sycl::event {
+      switch (dt) {
+        case DType::f16: { const half_t* s = static_cast<const half_t*>(scratch2);
+          return q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i){ out[i[0]] = s[i[0]]; }); }
+        case DType::bf16: { const bf16_t* s = static_cast<const bf16_t*>(scratch2);
+          return q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i){ out[i[0]] = static_cast<half_t>(static_cast<float>(s[i[0]])); }); }
+        default: { const float* s = static_cast<const float*>(scratch2);
+          return q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i){ out[i[0]] = static_cast<half_t>(s[i[0]]); }); }
+      }
+    };
+    const bool unfused = (approx_s == "unfused");
+    auto once = [&]() -> double {
+      if (unfused) {
+        sycl::event e1 = kernels::rms_norm_sycl(q, proj, pw, scratch, R, D, eps, dt); e1.wait();
+        sycl::event e2 = add_into(); e2.wait();
+        sycl::event e3 = kernels::rms_norm_sycl(q, res, nw, scratch2, R, D, eps, dt); e3.wait();
+        sycl::event e4 = convert16(); e4.wait();
+        return event_ms(e1) + event_ms(e2) + event_ms(e3) + event_ms(e4);
+      }
+      sycl::event ef = kernels::rms_residual_next_sycl(q, proj, pw, res, nw, out, R, D, eps, dt); ef.wait();
+      return event_ms(ef);
+    };
+    for (int i = 0; i < warmup; ++i) once();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) s.push_back(once());
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    std::cout << "{\"schema_version\":2,\"kernel\":\"rms_residual_next\",\"variant\":\"sycl\",\"approx\":\""
+              << (unfused ? "unfused" : "fused") << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"rows\":" << R << ",\"dim\":" << D
+              << ",\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"min_ms\":" << s.front() << ",\"max_ms\":" << s.back()
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(proj, q); sycl::free(pw, q); sycl::free(res, q); sycl::free(nw, q); sycl::free(out, q); sycl::free(scratch, q); sycl::free(scratch2, q);
+    return 0;
+  }
   if (kernel == "selective_scan") {
     const std::size_t nc = rows, seq = dim, st = 16;
     void* u = sycl::malloc_device(nc * seq * elem, q);

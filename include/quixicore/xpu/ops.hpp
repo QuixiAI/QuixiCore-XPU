@@ -468,6 +468,26 @@ void fused_add_rms_norm(sycl::queue &q, const void *x, void *residual, const voi
                         void *out, std::size_t rows, std::size_t dim, float eps, DType dt,
                         Variant variant = Variant::sycl, bool blocking = true);
 
+
+// Fused residual-add + double RMSNorm with f16 convert. Extends
+// fused_add_rms_norm to the transformer layer boundary: `projection` is a
+// sublayer output, RMS-normalized by `post_weight` and added into the
+// `residual` stream (updated in place); the updated residual is then
+// RMS-normalized by `next_weight` for the next layer and written to `next_out`
+// as f16. Per row over `dim`, fp32 accumulation:
+//   pinv     = rsqrt(mean_d(projection^2) + eps)
+//   residual = residual + projection * post_weight * pinv
+//   rinv     = rsqrt(mean_d(residual^2) + eps)
+//   next_out = f16(residual * next_weight * rinv)
+// `projection`, `post_weight`, `residual`, `next_weight` are dtype dt;
+// `next_out` is always f16 and must not alias `residual`. Collapses the
+// post-norm, residual add, next pre-norm, and f16 convert into one launch.
+// Shape: residual-add + double RMSNorm -> f16.
+void rms_residual_next(sycl::queue &q, const void *projection, const void *post_weight,
+                       void *residual, const void *next_weight, void *next_out,
+                       std::size_t rows, std::size_t dim, float eps, DType dt,
+                       Variant variant = Variant::sycl, bool blocking = true);
+
 // LayerNorm over the last axis of a [rows, dim] row-major tensor:
 //   out[r, i] = (x[r, i] - mean) * rsqrt(var + eps) * weight[i] + bias[i]
 // with mean/var over x[r, :]. `bias` may be null to skip the shift. `weight`,

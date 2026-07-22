@@ -113,6 +113,58 @@ sycl::event fused_add_rms_norm_typed(sycl::queue &q, const T *x, T *residual, co
   });
 }
 
+template <typename T> class RmsResidualNextKernel;
+
+// Fused residual-add + double RMSNorm -> f16 (extends the single-norm
+// fused_add_rms_norm above). One work-group per row; two group reductions (RMS
+// of the projection, then RMS of the updated residual). The residual store uses
+// the fp32 sum while its square feeds the second reduction unrounded, exactly as
+// the embeddinggemma.c launch_rms_residual_next_half reference does; the final
+// pre-norm re-reads the (storage-dtype) residual and converts to f16.
+template <typename T>
+sycl::event rms_residual_next_typed(sycl::queue &q, const T *projection,
+                                    const T *post_weight, T *residual,
+                                    const T *next_weight, half_t *next_out,
+                                    std::size_t rows, std::size_t dim, float eps) {
+  const sycl::nd_range<1> range(sycl::range<1>(rows * kRowThreads),
+                                sycl::range<1>(kRowThreads));
+  const float inv_dim = 1.0f / static_cast<float>(dim);
+  return q.parallel_for<RmsResidualNextKernel<T>>(range, [=](sycl::nd_item<1> item) {
+    const std::size_t row = item.get_group(0);
+    const std::size_t lane = item.get_local_id(0);
+    const T *proj = projection + row * dim;
+    T *res = residual + row * dim;
+    half_t *out = next_out + row * dim;
+
+    // Pass 1: RMS of the sublayer output for its post-norm scale.
+    float proj_ss = 0.0f;
+    for (std::size_t i = lane; i < dim; i += kRowThreads) {
+      const float v = static_cast<float>(proj[i]);
+      proj_ss += v * v;
+    }
+    proj_ss = sycl::reduce_over_group(item.get_group(), proj_ss, sycl::plus<float>());
+    const float proj_inv = sycl::rsqrt(proj_ss * inv_dim + eps);
+
+    // Pass 2: post-norm the projection into the residual stream (in place) and
+    // accumulate the RMS of the updated residual for the next layers pre-norm.
+    float res_ss = 0.0f;
+    for (std::size_t i = lane; i < dim; i += kRowThreads) {
+      const float value = static_cast<float>(res[i]) +
+          static_cast<float>(proj[i]) * static_cast<float>(post_weight[i]) * proj_inv;
+      res[i] = static_cast<T>(value);
+      res_ss += value * value;
+    }
+    res_ss = sycl::reduce_over_group(item.get_group(), res_ss, sycl::plus<float>());
+    const float res_inv = sycl::rsqrt(res_ss * inv_dim + eps);
+
+    // Pass 3: next layers pre-norm, converted to f16.
+    for (std::size_t i = lane; i < dim; i += kRowThreads) {
+      out[i] = static_cast<half_t>(
+          static_cast<float>(res[i]) * static_cast<float>(next_weight[i]) * res_inv);
+    }
+  });
+}
+
 }  // namespace
 
 sycl::event rms_norm_sycl(sycl::queue& q, const void* x, const void* weight,
@@ -151,6 +203,33 @@ sycl::event fused_add_rms_norm_sycl(sycl::queue &q, const void *x, void *residua
     return fused_add_rms_norm_typed(
         q, static_cast<const bf16_t *>(x), static_cast<bf16_t *>(residual),
         static_cast<const bf16_t *>(weight), static_cast<bf16_t *>(out), rows, dim, eps);
+  }
+  return {};
+}
+
+
+sycl::event rms_residual_next_sycl(sycl::queue &q, const void *projection,
+                                   const void *post_weight, void *residual,
+                                   const void *next_weight, void *next_out,
+                                   std::size_t rows, std::size_t dim, float eps,
+                                   DType dt) {
+  auto *out = static_cast<half_t *>(next_out);
+  switch (dt) {
+  case DType::f32:
+    return rms_residual_next_typed(
+        q, static_cast<const float *>(projection),
+        static_cast<const float *>(post_weight), static_cast<float *>(residual),
+        static_cast<const float *>(next_weight), out, rows, dim, eps);
+  case DType::f16:
+    return rms_residual_next_typed(
+        q, static_cast<const half_t *>(projection),
+        static_cast<const half_t *>(post_weight), static_cast<half_t *>(residual),
+        static_cast<const half_t *>(next_weight), out, rows, dim, eps);
+  case DType::bf16:
+    return rms_residual_next_typed(
+        q, static_cast<const bf16_t *>(projection),
+        static_cast<const bf16_t *>(post_weight), static_cast<bf16_t *>(residual),
+        static_cast<const bf16_t *>(next_weight), out, rows, dim, eps);
   }
   return {};
 }

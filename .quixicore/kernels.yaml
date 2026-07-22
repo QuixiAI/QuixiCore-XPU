@@ -152,6 +152,27 @@ operations:
     benchmarks: {default: perf/configs/serving_qwen_decode.yaml}
     variants:
       - {name: xpu_sycl, status: experimental, path: kernels/norms/rms_norm/variants/xpu_sycl}
+
+  rms_residual_next:
+    family: norms
+    status: implemented
+    path: kernels/norms/rms_norm
+    dtypes: [f32, f16, bf16]
+    shape: residual-add + double RMSNorm -> f16
+    note: >-
+      Fused residual-add + double RMSNorm with f16 convert. Extends
+      fused_add_rms_norm to the transformer layer boundary: RMS-normalize the
+      sublayer output (projection) by post_weight, add it into the residual
+      stream (in place), then RMS-normalize the updated residual by next_weight
+      for the next layer and convert to f16 -- one launch in place of the
+      post-norm + residual add + next pre-norm + f16 convert (~2 launches/layer
+      saved). Ported from embeddinggemma.c engine_xpu.cpp
+      launch_rms_residual_next_half (clean subgroup form) with kernels.c
+      ei_rms_norm_residual_inplace / ei_rms_norm as the fp64 oracle.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel rms_residual_next --approx {fused,unfused}"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/norms/rms_norm/variants/xpu_sycl}
   dense_gemm:
     family: matmul
     status: implemented

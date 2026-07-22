@@ -22,6 +22,27 @@ sycl::event fused_add_rms_norm_sycl(sycl::queue &q, const void *x, void *residua
                                     const void *weight, void *out, std::size_t rows,
                                     std::size_t dim, float eps, DType dt);
 
+
+// Fused residual-add + double RMSNorm with f16 convert. Extends
+// fused_add_rms_norm to the transformer layer boundary: RMS-normalize the
+// sublayer output `projection` by `post_weight`, add it into the `residual`
+// stream (updated in place), then RMS-normalize the updated residual by
+// `next_weight` for the next layer and write it to `next_out` as f16. Per row
+// over `dim`, fp32 accumulation:
+//   pinv     = rsqrt(mean_d(projection^2) + eps)
+//   residual = residual + projection * post_weight * pinv
+//   rinv     = rsqrt(mean_d(residual^2) + eps)
+//   next_out = f16(residual * next_weight * rinv)
+// `projection`, `post_weight`, `residual`, `next_weight` are dtype dt;
+// `next_out` is always f16. Collapses the post-norm, residual add, next
+// pre-norm, and f16 convert into one launch (~2 launches/layer saved). Shape:
+// residual-add + double RMSNorm -> f16.
+sycl::event rms_residual_next_sycl(sycl::queue& q, const void* projection,
+                                   const void* post_weight, void* residual,
+                                   const void* next_weight, void* next_out,
+                                   std::size_t rows, std::size_t dim, float eps,
+                                   DType dt);
+
 sycl::event layernorm_sycl(sycl::queue& q, const void* x, const void* weight,
                            const void* bias, void* out, std::size_t rows,
                            std::size_t dim, float eps, DType dt);

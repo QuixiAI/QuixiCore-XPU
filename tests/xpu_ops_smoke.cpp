@@ -205,6 +205,64 @@ bool check_pool_mean_rms_l2(sycl::queue& q, DType dt, std::size_t dim,
   return ok;
 }
 
+// rms_residual_next: fused residual-add + double RMSNorm -> f16. The fp64 oracle
+// mirrors the kernel order exactly -- post-norm the projection into a saved copy
+// of the residual (accumulating the updated residuals RMS from the unrounded
+// fp32-analogue sum), round the residual to storage dtype T, then pre-norm the
+// rounded residual and round the result to f16. Both the in-place residual (dt)
+// and the f16 next_out are checked; the two-level reduction widens rtol by
+// sqrt(dim), matching the pool / attention oracle convention.
+template <typename T>
+bool check_rms_residual_next(sycl::queue& q, DType dt, std::size_t rows, std::size_t dim) {
+  const std::size_t n = rows * dim;
+  T* proj = sycl::malloc_shared<T>(n, q);
+  T* pw = sycl::malloc_shared<T>(dim, q);
+  T* res = sycl::malloc_shared<T>(n, q);
+  T* nw = sycl::malloc_shared<T>(dim, q);
+  half_t* out = sycl::malloc_shared<half_t>(n, q);
+  std::vector<double> res_orig(n);
+  for (std::size_t i = 0; i < n; ++i) { proj[i] = static_cast<T>(sample(i)); res[i] = static_cast<T>(sample(i + 5) * 0.5f); res_orig[i] = static_cast<double>(res[i]); }
+  for (std::size_t i = 0; i < dim; ++i) { pw[i] = static_cast<T>(0.5f + sample(i + 7) * 0.1f); nw[i] = static_cast<T>(0.5f + sample(i + 13) * 0.1f); }
+  const float eps = 1e-6f;
+
+  ops::rms_residual_next(q, proj, pw, res, nw, out, rows, dim, eps, dt, Variant::sycl, /*blocking=*/true);
+
+  const Tol tol = tol_for(dt);
+  const Tol tol16 = tol_for(DType::f16);
+  const double sq = std::sqrt(static_cast<double>(dim));
+  const double rtol_res = tol.rtol * sq + 5e-3;
+  const double rtol_out = tol16.rtol * sq + 5e-3;
+  double worst_res = 0.0, worst_out = 0.0, max_abs = 0.0;
+  for (std::size_t r = 0; r < rows; ++r) {
+    double pss = 0.0;
+    for (std::size_t i = 0; i < dim; ++i) { const double v = static_cast<double>(proj[r * dim + i]); pss += v * v; }
+    const double pinv = 1.0 / std::sqrt(pss / static_cast<double>(dim) + static_cast<double>(eps));
+    std::vector<double> res_round(dim);
+    double rss = 0.0;
+    for (std::size_t i = 0; i < dim; ++i) {
+      const double value = res_orig[r * dim + i] +
+          static_cast<double>(proj[r * dim + i]) * static_cast<double>(pw[i]) * pinv;
+      res_round[i] = static_cast<double>(static_cast<T>(value));
+      rss += value * value;  // unrounded sum, matching the kernel
+    }
+    const double rinv = 1.0 / std::sqrt(rss / static_cast<double>(dim) + static_cast<double>(eps));
+    for (std::size_t i = 0; i < dim; ++i) {
+      const double res_err = std::abs(static_cast<double>(res[r * dim + i]) - res_round[i]);
+      worst_res = std::max(worst_res, res_err - (tol.atol + rtol_res * std::abs(res_round[i])));
+      const double ref = static_cast<double>(static_cast<half_t>(static_cast<float>(res_round[i] * static_cast<double>(nw[i]) * rinv)));
+      const double out_err = std::abs(static_cast<double>(out[r * dim + i]) - ref);
+      max_abs = std::max(max_abs, out_err);
+      worst_out = std::max(worst_out, out_err - (tol16.atol + rtol_out * std::abs(ref)));
+    }
+  }
+  sycl::free(proj, q); sycl::free(pw, q); sycl::free(res, q); sycl::free(nw, q); sycl::free(out, q);
+  const bool ok = worst_res <= 0.0 && worst_out <= 0.0;
+  std::cout << "  rms_residual_next dt=" << dtype_name(dt) << " rows=" << rows << " dim=" << dim
+            << " max_abs=" << max_abs << " worst_res=" << worst_res << " worst_out=" << worst_out
+            << (ok ? "  ok" : "  FAIL") << "\n";
+  return ok;
+}
+
 bool check_dropout(sycl::queue& q, DType dt) {
   const std::size_t n = 1u << 16;
   const float p = 0.3f;
@@ -2467,6 +2525,14 @@ int main() {
   failures += check_fused_add_rms_norm<float>(q, DType::f32, rows, dim) ? 0 : 1;
   failures += check_fused_add_rms_norm<half_t>(q, DType::f16, rows, dim) ? 0 : 1;
   failures += check_fused_add_rms_norm<bf16_t>(q, DType::bf16, rows, dim) ? 0 : 1;
+
+  // norms: fused residual-add + double RMSNorm -> f16 (rms_residual_next). Swept
+  // across dt in {f32,f16,bf16} x dim {256,768,1024} (768 = EI_N_EMBD shape).
+  for (const std::size_t d : {std::size_t(256), std::size_t(768), std::size_t(1024)}) {
+    failures += check_rms_residual_next<float>(q, DType::f32, 64, d) ? 0 : 1;
+    failures += check_rms_residual_next<half_t>(q, DType::f16, 64, d) ? 0 : 1;
+    failures += check_rms_residual_next<bf16_t>(q, DType::bf16, 64, d) ? 0 : 1;
+  }
 
   if (failures) {
     std::cerr << "FAIL: " << failures << " case(s) exceeded tolerance\n";

@@ -26,6 +26,18 @@ void fused_add_rms_norm(sycl::queue &q, const void *x, void *residual, const voi
     ev.wait();
 }
 
+
+void rms_residual_next(sycl::queue &q, const void *projection, const void *post_weight,
+                       void *residual, const void *next_weight, void *next_out,
+                       std::size_t rows, std::size_t dim, float eps, DType dt,
+                       Variant variant, bool blocking) {
+  (void)variant;
+  sycl::event ev = kernels::rms_residual_next_sycl(
+      q, projection, post_weight, residual, next_weight, next_out, rows, dim, eps, dt);
+  if (blocking)
+    ev.wait();
+}
+
 void layernorm(sycl::queue& q, const void* x, const void* weight,
                const void* bias, void* out, std::size_t rows, std::size_t dim,
                float eps, DType dt, Variant variant, bool blocking) {
