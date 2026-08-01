@@ -1,0 +1,23 @@
+# Focused Qwen3.6 decode paths ported from the vLLM optimization worktree.
+kernel: qwen_decode
+family: serving
+operation: qwen_decode
+runs:
+  - {kernel: fp8_w8a16, variant: vendor, dtype: bf16, approx: e4m3, M: 1, N: 4096, K: 4096, iters: 50, warmup: 15}
+  - {kernel: fp8_w8a16, variant: sycl, dtype: bf16, approx: e4m3, M: 1, N: 4096, K: 4096, iters: 50, warmup: 15}
+  - {kernel: fp8_w8a16, variant: vendor, dtype: bf16, approx: e4m3, M: 4, N: 4096, K: 4096, iters: 50, warmup: 15}
+  - {kernel: fp8_w8a16, variant: sycl, dtype: bf16, approx: e4m3, M: 4, N: 4096, K: 4096, iters: 50, warmup: 15}
+  - {kernel: nvfp4_gemm, variant: sycl, dtype: bf16, approx: row_loop, M: 1, N: 4096, K: 4096, iters: 50, warmup: 15}
+  - {kernel: nvfp4_gemm, variant: sycl, dtype: bf16, approx: mtiled, M: 1, N: 4096, K: 4096, iters: 50, warmup: 15}
+  - {kernel: nvfp4_gemm, variant: sycl, dtype: bf16, approx: row_loop, M: 4, N: 4096, K: 4096, iters: 50, warmup: 15}
+  - {kernel: nvfp4_gemm, variant: sycl, dtype: bf16, approx: mtiled, M: 4, N: 4096, K: 4096, iters: 50, warmup: 15}
+  - {kernel: nvfp4_gemm, variant: sycl, dtype: bf16, approx: row_loop, M: 8, N: 4096, K: 4096, iters: 30, warmup: 10}
+  - {kernel: nvfp4_gemm, variant: sycl, dtype: bf16, approx: mtiled, M: 8, N: 4096, K: 4096, iters: 30, warmup: 10}
+  - {kernel: nvfp4_moe, variant: sycl, dtype: bf16, approx: fused, M: 1, N: 256, K: 2048, rows: 8, dim: 512, iters: 30, warmup: 10}
+  - {kernel: nvfp4_moe, variant: sycl, dtype: bf16, approx: split, M: 1, N: 256, K: 2048, rows: 8, dim: 512, iters: 30, warmup: 10}
+  - {kernel: nvfp4_moe, variant: sycl, dtype: bf16, approx: fused, M: 4, N: 256, K: 2048, rows: 8, dim: 512, iters: 30, warmup: 10}
+  - {kernel: nvfp4_moe, variant: sycl, dtype: bf16, approx: split, M: 4, N: 256, K: 2048, rows: 8, dim: 512, iters: 30, warmup: 10}
+  - {kernel: qwen_gdn_decode, variant: sycl, dtype: bf16, M: 1, N: 8, iters: 100, warmup: 25}
+  - {kernel: qwen_gdn_decode, variant: sycl, dtype: bf16, M: 4, N: 8, iters: 100, warmup: 25}
+  - {kernel: fused_add_rms_norm, variant: sycl, dtype: bf16, rows: 1, dim: 4096, iters: 100, warmup: 25}
+  - {kernel: fused_add_rms_norm, variant: sycl, dtype: bf16, rows: 4, dim: 4096, iters: 100, warmup: 25}

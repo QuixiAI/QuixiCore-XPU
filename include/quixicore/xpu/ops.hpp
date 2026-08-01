@@ -81,6 +81,18 @@ void glu(sycl::queue& q, const void* x, void* out, std::size_t rows,
          std::size_t d, DType dt, GluMode mode = GluMode::swiglu,
          Variant variant = Variant::sycl, bool blocking = true);
 
+
+// GEGLU with a fused f16 output. Input `x` is [rows, 2*d] row-major (gate half
+// then value half, the same layout as glu); `out` is [rows, d] and always f16:
+//   out[r,i] = f16( gelu_tanh(x[r,i]) * x[r,d+i] )
+// The gate uses the tanh GELU approximation (matching the embeddinggemma.c FFN
+// source); compute is fp32. This is the f16-context variant of glu (cf.
+// attention_f16ctx), folding the dt->f16 convert a downstream f16 GEMM needs
+// into the activation. Shape: GEGLU -> f16.
+void glu_gelu_f16(sycl::queue& q, const void* x, void* out, std::size_t rows,
+                  std::size_t d, DType dt, Variant variant = Variant::sycl,
+                  bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // attention
 // ----------------------------------------------------------------------------
@@ -102,6 +114,53 @@ void attention(sycl::queue& q, const void* Q, const void* K, const void* V,
                void* O, std::size_t n_heads, std::size_t n_kv_heads,
                std::size_t seq_q, std::size_t seq_k, std::size_t d, bool causal,
                DType dt, Variant variant = Variant::sycl, bool blocking = true);
+
+// Flash-style SDPA with a fused f16 context store. Same contract and math as
+// attention() above, but writes the output twice in one epilogue: O in dtype dt
+// and O_f16 in f16 (same [n_heads, seq_q, d] layout). This folds the ctx->f16
+// convert a downstream attention-output GEMM needs into the attention pass,
+// removing a standalone O-sized convert kernel. O_f16 equals the f16 rounding of
+// O. Shape: online-attention + fused f16 context store.
+void attention_f16ctx(sycl::queue& q, const void* Q, const void* K,
+                      const void* V, void* O, void* O_f16, std::size_t n_heads,
+                      std::size_t n_kv_heads, std::size_t seq_q,
+                      std::size_t seq_k, std::size_t d, bool causal, DType dt,
+                      Variant variant = Variant::sycl, bool blocking = true);
+
+// Symmetric sliding-window attention (SWA). Same contract, layout, and flash
+// online-softmax math as attention() above, but the mask is a SYMMETRIC band
+// rather than causal: query qi attends key positions in [center - window/2,
+// center + window/2] clamped to [0, seq_k), where center = qi + (seq_k - seq_q)
+// end-aligns the query into the key axis (center == qi when seq_q == seq_k).
+// Unlike causal sliding-window attention the band looks BOTH forward and
+// backward within +-window/2 -- the mask EmbeddingGemma's local encoder layers
+// use in its alternating global/local stack. window == 0 means dense (attend
+// all keys), identical to attention() with causal == false. head_dim d <= 256.
+// Shape: symmetric sliding-window, GQA, D<=256.
+void attn_swa(sycl::queue& q, const void* Q, const void* K, const void* V,
+              void* O, std::size_t n_heads, std::size_t n_kv_heads,
+              std::size_t seq_q, std::size_t seq_k, std::size_t d,
+              std::size_t window, DType dt, Variant variant = Variant::sycl,
+              bool blocking = true);
+
+
+// Fused per-head QK-norm + RoPE (+ optional f16 convert). For every (token,
+// head) of Q and K: RMS-normalize the head-dim vector by its learned weight,
+// scale the query heads by `query_scale` (key heads by 1), then apply NeoX
+// half-split RoPE at position (pos0 + token). Q is [tokens, n_head, head_dim],
+// K is [tokens, n_head_kv, head_dim] row-major (GQA when n_head_kv < n_head),
+// both dtype dt and updated in place; `q_weight` / `k_weight` are [head_dim].
+// When `Q_f16` / `K_f16` are non-null (f16, same layout) the rotated result is
+// also written there (fused convert for a downstream f16 QK GEMM); pass null to
+// skip. head_dim must be even; fp32 accumulation. Collapses the per-head
+// rms_norm(Q) + rms_norm(K) + query-scale + rope(Q) + rope(K) chain into one
+// launch. Shape: per-head RMSNorm + query-scale + RoPE.
+void qk_norm_rope(sycl::queue& q, void* Q, void* K, const void* q_weight,
+                  const void* k_weight, void* Q_f16, void* K_f16,
+                  std::size_t tokens, std::size_t n_head, std::size_t n_head_kv,
+                  std::size_t head_dim, float base, std::size_t pos0,
+                  float query_scale, float eps, DType dt,
+                  Variant variant = Variant::sycl, bool blocking = true);
 
 // ----------------------------------------------------------------------------
 // optimizers
@@ -162,6 +221,22 @@ void kv_cache_gather(sycl::queue& q, const void* cache, const int* idx,
                      void* out, std::size_t n, std::size_t row, DType dt,
                      Variant variant = Variant::sycl, bool blocking = true);
 
+// Sentence-embedding pooling head: masked mean-pool over each sequence's tokens
+// with a per-token RMSNorm (learned weight) folded in, then L2-normalize. `x` is
+// [total_tokens, dim] row-major; sequence s owns rows [offsets[s], offsets[s+1])
+// (`offsets` is [batch+1] int32, monotonic). `weight` is [dim], `out` is
+// [batch, dim], all dtype dt. For sequence s over token range [a, b):
+//   r_t   = x[t] * rsqrt(mean_d(x[t,d]^2) + eps) * weight   (RMSNorm, per token)
+//   m     = (1/(b-a)) * sum_t r_t                           (masked mean)
+//   out[s]= m * rsqrt(sum_d m[d]^2)                         (L2; 0-vector passes)
+// `dim` is the shape key {256,512,768,1024}; fp32 accumulation. An empty
+// sequence (b==a) yields a zero vector. Shape: masked-mean + per-token RMSNorm +
+// L2 pooling head. Native-only.
+void pool_mean_rms_l2(sycl::queue& q, const void* x, const void* weight,
+                      const int* offsets, void* out, std::size_t batch,
+                      std::size_t dim, float eps, DType dt,
+                      Variant variant = Variant::sycl, bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // utils
 // ----------------------------------------------------------------------------
@@ -196,6 +271,31 @@ void moe_route_topk(sycl::queue& q, const void* router_logits, int* expert_ids,
                     std::size_t n_experts, int k, DType dt,
                     Variant variant = Variant::sycl, bool blocking = true);
 
+// Decode-oriented routed MoE with ModelOpt NVFP4 weights. `hidden` is [M,K]
+// dtype `act_dt`; ids/weights are [M,top_k] int32/f32. Weight layouts are
+// w13 [E,2I,K/2], w13_scales [E,2I,K/16], w2 [E,K,I/2], and w2_scales
+// [E,K,I/16], with one fp32 global scale per expert/projection. The output is
+// fp32 [M,K]. Invalid expert ids (<0 or >=E) are skipped. The call initializes
+// `out_f32` to zero before accumulating routed outputs.
+void nvfp4_moe_fused(sycl::queue &q, const void *hidden, const int *topk_ids,
+                     const float *topk_weights, const void *w13, const void *w13_scales,
+                     const float *w13_global_scales, const void *w2, const void *w2_scales,
+                     const float *w2_global_scales, float *out_f32, std::size_t M, std::size_t E,
+                     std::size_t top_k, std::size_t K, std::size_t I, DType act_dt,
+                     bool multiply_router_weight = true, Variant variant = Variant::sycl,
+                     bool blocking = true);
+
+// Higher-occupancy two-stage form of `nvfp4_moe_fused`. The caller supplies
+// fp32 scratch [M*top_k,2I]. This is the preferred batch-1 graph-replay path;
+// the fused form can be faster once M*top_k already fills the device.
+void nvfp4_moe_split(sycl::queue &q, const void *hidden, const int *topk_ids,
+                     const float *topk_weights, const void *w13, const void *w13_scales,
+                     const float *w13_global_scales, const void *w2, const void *w2_scales,
+                     const float *w2_global_scales, float *scratch_f32, float *out_f32,
+                     std::size_t M, std::size_t E, std::size_t top_k, std::size_t K, std::size_t I,
+                     DType act_dt, bool multiply_router_weight = true,
+                     Variant variant = Variant::sycl, bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // linear_attention
 // ----------------------------------------------------------------------------
@@ -207,6 +307,22 @@ void moe_route_topk(sycl::queue& q, const void* router_logits, int* expert_ids,
 void linear_attn(sycl::queue& q, const void* Q, const void* K, const void* V,
                  void* O, std::size_t n_heads, std::size_t seq, std::size_t dim,
                  DType dt, Variant variant = Variant::sycl, bool blocking = true);
+
+// Qwen3.5/Qwen3.6 Gated DeltaNet decode core for the non-interleaved layout.
+// Fixed model dimensions are q/k=16x128, v/z=32x128, conv width=4. Inputs are
+// projected_qkvz [B,12288] and projected_ba [B,64]. The call mutates conv_state
+// ([slots,3,8192] or [slots,8192,3]) and ssm_state [slots,32,128,128], writes
+// scratch `mixed_qkv` [B,8192], and returns core/z [B,32,128]. State indices in
+// [0,slots) are valid and must be unique within a decode batch. Negative or
+// out-of-range indices leave state untouched and produce zero core output;
+// `z` always passes through from the projected input.
+void qwen_gdn_decode(sycl::queue &q, const void *projected_qkvz, const void *projected_ba,
+                     void *conv_state, void *ssm_state, const void *conv_weight,
+                     const void *conv_bias, const float *A_log, const void *dt_bias,
+                     const int *state_indices, void *mixed_qkv, void *core_out, void *z_out,
+                     std::size_t batch, std::size_t state_slots, bool conv_dim_first, DType act_dt,
+                     DType state_dt, DType dt_bias_dt, Variant variant = Variant::sycl,
+                     bool blocking = true);
 
 // ----------------------------------------------------------------------------
 // ssm (state-space / Mamba)
@@ -272,6 +388,21 @@ void qgemv_int4(sycl::queue& q, const void* w_packed, const void* scales,
                 std::size_t group, DType act_dt, Variant variant = Variant::sycl,
                 bool blocking = true);
 
+// W4A16 GEMM on the Xe tensor engine (DPAS via SYCL joint_matrix):
+// C[M,N] = A[M,K] . dequant(W)^T. A/C are 16-bit float (`act_dt` in {f16, bf16}
+// -- "a16"); W is [N,K] int4 group-quantized with the SAME encoding
+// qgemv_int4 / quantize_int4_group use: `w_packed` is 2 nibbles/byte (low nibble
+// = even k, high = odd k, signed two's-complement), `scales` is f16 [N, K/group],
+// dequant(W)[n,k] = s4(nibble) * scales[n, k/group]. The weight tile is
+// dequantized on the fly into SLM and multiplied by the activation tile on the
+// int4-weight tensor path (DPAS), fp32 accumulation. Small-M (M<=32) decode-GEMM
+// shape (the batched analogue of qgemv_int4). K must be even and `group` must
+// divide K; any M/N are handled by edge masking. act_dt f32 is unsupported.
+void w4a16_gemm(sycl::queue& q, const void* A, const void* w_packed,
+                const void* scales, void* C, std::size_t M, std::size_t N,
+                std::size_t K, std::size_t group, DType act_dt,
+                Variant variant = Variant::sycl, bool blocking = true);
+
 // fp8 format selector (OCP / NVIDIA fp8).
 enum class Fp8Kind {
   e4m3,
@@ -287,6 +418,15 @@ void fp8_gemm(sycl::queue& q, const void* a_fp8, const void* b_fp8, void* c,
               std::size_t M, std::size_t N, std::size_t K, Fp8Kind kind,
               float scale, DType out_dt, Variant variant = Variant::best,
               bool blocking = true);
+
+// FP8 weight-only GEMM: C[M,N] = A[M,K] @ dequant(W[N,K])^T. Activations and
+// output use `act_dt`; W stores raw e4m3/e5m2 bytes in checkpoint-native [N,K]
+// layout. `weight_scale` is an fp32 device pointer to [N] (per-channel) or [1].
+// `best` routes M=1 to native decode GEMV and M>1 to oneDNN when present.
+void fp8_gemm_w8a16(sycl::queue &q, const void *activations, const void *weight_fp8,
+                    const float *weight_scale, void *out, std::size_t M, std::size_t N,
+                    std::size_t K, Fp8Kind kind, bool per_channel, DType act_dt,
+                    Variant variant = Variant::best, bool blocking = true);
 
 // fp8 codecs: f32 -> fp8 (out is 1 byte/elem) and fp8 -> f32, both over `n`
 // contiguous elements. Vendor-backed (oneDNN reorder). Useful for quantizing
@@ -318,6 +458,13 @@ void nvfp4_gemv(sycl::queue& q, const void* w_packed, const void* block_scales,
                 float global_scale, const void* x, void* y, std::size_t N,
                 std::size_t K, DType act_dt, Variant variant = Variant::sycl,
                 bool blocking = true);
+
+// Batched NVFP4 W4A16 GEMM with checkpoint-native packed W [N,K/2]. The
+// decode path submits one optimized GEMV per activation row; this beat the
+// decode-once M-tiled alternative at every measured serving shape M=1,4,8.
+void nvfp4_gemm(sycl::queue &q, const void *w_packed, const void *block_scales, float global_scale,
+                const void *x, void *y, std::size_t M, std::size_t N, std::size_t K, DType act_dt,
+                Variant variant = Variant::sycl, bool blocking = true);
 
 // GGUF (llama.cpp) block-quant GEMV, native decode from the authentic on-disk
 // block layout. `w_blocks` is row-major [N rows], each row = K/32 blocks laid
@@ -375,6 +522,33 @@ void qgemm_int8(sycl::queue& q, const void* a_int8, const void* b_int8,
 void rms_norm(sycl::queue& q, const void* x, const void* weight, void* out,
               std::size_t rows, std::size_t dim, float eps, DType dt,
               Variant variant = Variant::sycl, bool blocking = true);
+
+// Fused residual add + RMSNorm. For each row, normalize the unrounded fp32 sum
+// of x and residual, update residual in place with the storage-dtype sum, and
+// write the normalized/weighted result to out. `out` must not alias `residual`.
+void fused_add_rms_norm(sycl::queue &q, const void *x, void *residual, const void *weight,
+                        void *out, std::size_t rows, std::size_t dim, float eps, DType dt,
+                        Variant variant = Variant::sycl, bool blocking = true);
+
+
+// Fused residual-add + double RMSNorm with f16 convert. Extends
+// fused_add_rms_norm to the transformer layer boundary: `projection` is a
+// sublayer output, RMS-normalized by `post_weight` and added into the
+// `residual` stream (updated in place); the updated residual is then
+// RMS-normalized by `next_weight` for the next layer and written to `next_out`
+// as f16. Per row over `dim`, fp32 accumulation:
+//   pinv     = rsqrt(mean_d(projection^2) + eps)
+//   residual = residual + projection * post_weight * pinv
+//   rinv     = rsqrt(mean_d(residual^2) + eps)
+//   next_out = f16(residual * next_weight * rinv)
+// `projection`, `post_weight`, `residual`, `next_weight` are dtype dt;
+// `next_out` is always f16 and must not alias `residual`. Collapses the
+// post-norm, residual add, next pre-norm, and f16 convert into one launch.
+// Shape: residual-add + double RMSNorm -> f16.
+void rms_residual_next(sycl::queue &q, const void *projection, const void *post_weight,
+                       void *residual, const void *next_weight, void *next_out,
+                       std::size_t rows, std::size_t dim, float eps, DType dt,
+                       Variant variant = Variant::sycl, bool blocking = true);
 
 // LayerNorm over the last axis of a [rows, dim] row-major tensor:
 //   out[r, i] = (x[r, i] - mean) * rsqrt(var + eps) * weight[i] + bias[i]

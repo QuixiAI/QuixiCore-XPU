@@ -12,6 +12,13 @@ layout: canonical_variants
 # (oneDNN) path are co-equal, selectable at the ABI (quixicore::xpu::Variant),
 # analogous to the Metal backend's co-equal PyTorch and MLX bindings.
 variant_path_rule: kernels/<family>/<operation>/variants/xpu_<target>
+differentiation:
+  automatic_autograd: false
+  explicit_backward_operations: [gelu_backward]
+  scope: inference_first
+  note: >-
+    Forward operators require caller-managed gradients; training-complete
+    coverage is not claimed.
 families:
   norms:
     status: partial
@@ -108,9 +115,11 @@ operations:
   gelu_backward:
     family: activations
     status: implemented
+    direction: backward
     path: kernels/activations/gelu_backward
     dtypes: [f32, f16, bf16]
     tests: {correctness: tests/xpu_ops_smoke.cpp}
+    bindings: {pytorch: bindings/pytorch/tk_xpu_ext.sycl}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/activations/gelu_backward/variants/xpu_sycl}
   glu:
@@ -120,6 +129,25 @@ operations:
     dtypes: [f32, f16, bf16]
     modes: [swiglu, geglu, reglu, glu]
     tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/activations/glu/variants/xpu_sycl}
+
+  glu_gelu_f16:
+    family: activations
+    status: implemented
+    path: kernels/activations/glu
+    dtypes: [f32, f16, bf16]
+    shape: GEGLU -> f16
+    note: >-
+      GEGLU (tanh-gelu gate x value) with a fused f16 output -- the f16-context
+      variant of glu, mirroring attention_f16ctx. Input [rows, 2*d] (gate half
+      then value half, same layout as glu), output [rows, d] always f16:
+      out = f16(gelu_tanh(gate) * value). Uses the tanh GELU approximation
+      (matching the embeddinggemma.c source), NOT the erf GELU of glu mode=geglu.
+      Ported from embeddinggemma.c engine_xpu.cpp launch_up_gate_gelu_half;
+      kernels.c ei_gelu_tanh / ei_gelu_mul_inplace is the fp64 oracle.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel glu_gelu_f16 --approx {fused,unfused}"}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/activations/glu/variants/xpu_sycl}
   rms_norm:
@@ -134,6 +162,36 @@ operations:
         status: implemented
         path: kernels/norms/rms_norm/variants/xpu_sycl
       # No oneDNN RMSNorm primitive; vendor/best resolve to xpu_sycl.
+  fused_add_rms_norm:
+    family: norms
+    status: experimental
+    path: kernels/norms/rms_norm
+    dtypes: [f32, f16, bf16]
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {default: perf/configs/serving_qwen_decode.yaml}
+    variants:
+      - {name: xpu_sycl, status: experimental, path: kernels/norms/rms_norm/variants/xpu_sycl}
+
+  rms_residual_next:
+    family: norms
+    status: implemented
+    path: kernels/norms/rms_norm
+    dtypes: [f32, f16, bf16]
+    shape: residual-add + double RMSNorm -> f16
+    note: >-
+      Fused residual-add + double RMSNorm with f16 convert. Extends
+      fused_add_rms_norm to the transformer layer boundary: RMS-normalize the
+      sublayer output (projection) by post_weight, add it into the residual
+      stream (in place), then RMS-normalize the updated residual by next_weight
+      for the next layer and convert to f16 -- one launch in place of the
+      post-norm + residual add + next pre-norm + f16 convert (~2 launches/layer
+      saved). Ported from embeddinggemma.c engine_xpu.cpp
+      launch_rms_residual_next_half (clean subgroup form) with kernels.c
+      ei_rms_norm_residual_inplace / ei_rms_norm as the fp64 oracle.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel rms_residual_next --approx {fused,unfused}"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/norms/rms_norm/variants/xpu_sycl}
   dense_gemm:
     family: matmul
     status: implemented
@@ -185,6 +243,28 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/quantization/qgemv/variants/xpu_sycl}
+  w4a16_gemm:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/w4a16_gemm
+    dtypes: [f16, bf16]
+    quant_format: int4_group
+    shape: int4-weight x f16/bf16-activation DPAS GEMM (small-M decode)
+    note: >-
+      W4A16 GEMM on the Xe tensor engine (DPAS via SYCL joint_matrix):
+      C[M,N] = A[M,K] . dequant(W)^T, W [N,K] int4 group-quant (the qgemv_int4 /
+      quantize_int4_group encoding), A/C 16-bit float. One subgroup owns an
+      8x16 output tile; the weight tile is dequantized on the fly into SLM and
+      fed to joint_matrix as the B operand, fp32 accumulation. The batched
+      analogue of qgemv_int4 -- the genuinely missing int4-weight DPAS shape
+      (the box had int4 only as a batch-1 GEMV and int8 GEMM without DPAS).
+      Written natively against SYCL joint_matrix, NOT the embeddinggemma.c
+      EI_XPU_XE2_W4 path's cutlass-sycl / cute xe_gemm_4bits (no external GEMM
+      library pulled in). fp64 oracle vs the CPU q4 dequant reference.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel w4a16_gemm --M M --N N --K K"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/quantization/w4a16_gemm/variants/xpu_sycl}
   qgemm_int8:
     family: quantization
     status: implemented
@@ -223,6 +303,18 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/quantization/nvfp4_gemv/variants/xpu_sycl}
+  nvfp4_gemm:
+    family: quantization
+    status: experimental
+    path: kernels/quantization/nvfp4_gemv
+    dtypes: [f32, f16, bf16]
+    quant_format: nvfp4
+    layouts: {activation: "[M,K]", weight: "[N,K/2]", output: "[M,N]"}
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {default: perf/configs/serving_qwen_decode.yaml}
+    variants:
+      - {name: xpu_sycl_row_loop, status: experimental, path: kernels/quantization/nvfp4_gemv/variants/xpu_sycl}
+      - {name: xpu_sycl_mtiled, status: experimental, path: kernels/quantization/nvfp4_gemv/variants/xpu_sycl, note: "Measured research path; not selected at M=1,4,8"}
   fp8_gemm:
     family: quantization
     status: experimental
@@ -232,6 +324,18 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     note: Correct on B60 (e4m3/e5m2) but not hardware-accelerated this generation.
     variants:
+      - {name: xpu_onednn, status: experimental, path: kernels/quantization/fp8_gemm/variants/xpu_onednn}
+  fp8_gemm_w8a16:
+    family: quantization
+    status: experimental
+    path: kernels/quantization/fp8_gemm
+    quant_format: fp8
+    dtypes: [f32, f16, bf16]
+    layouts: {activation: "[M,K]", weight: "[N,K]", output: "[M,N]"}
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {default: perf/configs/serving_qwen_decode.yaml}
+    variants:
+      - {name: xpu_sycl, status: experimental, path: kernels/quantization/fp8_gemm/variants/xpu_sycl}
       - {name: xpu_onednn, status: experimental, path: kernels/quantization/fp8_gemm/variants/xpu_onednn}
   selective_scan:
     family: ssm
@@ -249,6 +353,19 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/linear_attention/linear_attn/variants/xpu_sycl}
+  qwen_gdn_decode:
+    family: linear_attention
+    status: experimental
+    path: kernels/linear_attention/qwen_gdn_decode
+    dtypes: [f32, f16, bf16]
+    scope: qwen3_5_qwen3_6_non_interleaved_decode
+    note: >-
+      State slots in [0,slots) are valid; invalid slots preserve z and skip
+      state mutation.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {default: perf/configs/serving_qwen_decode.yaml}
+    variants:
+      - {name: xpu_sycl, status: experimental, path: kernels/linear_attention/qwen_gdn_decode/variants/xpu_sycl}
   moe_route_topk:
     family: moe
     status: implemented
@@ -257,6 +374,17 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/moe/moe_route/variants/xpu_sycl}
+  nvfp4_moe:
+    family: moe
+    status: experimental
+    path: kernels/moe/nvfp4_moe
+    dtypes: [f32, f16, bf16]
+    quant_format: nvfp4
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {default: perf/configs/serving_qwen_decode.yaml}
+    variants:
+      - {name: xpu_sycl_fused, status: experimental, path: kernels/moe/nvfp4_moe/variants/xpu_sycl}
+      - {name: xpu_sycl_split, status: experimental, path: kernels/moe/nvfp4_moe/variants/xpu_sycl}
   dropout:
     family: utils
     status: implemented
@@ -305,12 +433,66 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/serving/variants/xpu_sycl}
+  pool_mean_rms_l2:
+    family: serving
+    status: implemented
+    path: kernels/serving
+    dtypes: [f32, f16, bf16]
+    shape: masked-mean + per-token RMSNorm + L2 pooling head
+    shape_keys: {dim: [256, 512, 768, 1024]}
+    note: >-
+      Sentence-embedding pooling head. One kernel fuses per-token RMSNorm (learned
+      weight), a masked mean over each sequence's token range (CSR offsets), and a
+      final L2 normalize -- reading the token embeddings once and writing one
+      vector per sequence. One subgroup owns each sequence's dim-vector; dim is a
+      compile-time shape key. Ported from embeddinggemma.c's engine_xpu.cpp
+      launch_pool / kernels.c ei_mean_pool_rms_l2 (fp64 oracle).
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel pool_mean_rms_l2 --approx {fused,unfused}"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/serving/variants/xpu_sycl}
   attention:
     family: attention
     status: implemented
     path: kernels/attention/attention
     dtypes: [f32, f16, bf16]
     tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/attention/attention/variants/xpu_sycl}
+  attention_f16ctx:
+    family: attention
+    status: implemented
+    path: kernels/attention/attention
+    dtypes: [f32, f16, bf16]
+    shape: online-attention + fused f16 context store
+    note: >-
+      Flash SDPA whose epilogue also writes a rounded f16 copy of the output
+      (O_f16), folding the ctx->f16 convert a downstream attention-output GEMM
+      needs into the attention pass. Ported from embeddinggemma.c's
+      EI_XPU_FUSE_ATTN_OUTPUT_HALF online-attention epilogue.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel attention_f16ctx --approx {fused,unfused}"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/attention/attention/variants/xpu_sycl}
+  attn_swa:
+    family: attention
+    status: implemented
+    path: kernels/attention/attention
+    dtypes: [f32, f16, bf16]
+    shape: symmetric sliding-window, GQA, D<=256
+    note: >-
+      Flash online-softmax SDPA whose mask is a SYMMETRIC sliding window instead
+      of causal: query qi attends keys in [center - window/2, center + window/2]
+      clamped to [0, seq_k), center = qi + (seq_k - seq_q). Unlike causal SWA the
+      band looks both forward and backward -- the mask EmbeddingGemma's local
+      encoder layers use in its alternating global/local stack. window == 0 is
+      dense. head_dim d <= 256. Ported from embeddinggemma.c engine_xpu.cpp
+      launch_attention / launch_attention_softmax_banded (the window branch);
+      kernels.c ei_attention_mha_range is the fp64 oracle. The band correctness
+      is proven both against the windowed reference and against a causal
+      reference that it must NOT match (symmetry check).
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel attn_swa --approx {banded,dense} --window W"}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/attention/attention/variants/xpu_sycl}
   rope:
@@ -321,6 +503,27 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/attention/rope/variants/xpu_sycl}
+
+  qk_norm_rope:
+    family: attention
+    status: implemented
+    path: kernels/attention/qk_norm_rope
+    dtypes: [f32, f16, bf16]
+    shape: per-head RMSNorm + query-scale + RoPE
+    note: >-
+      Fused per-head QK-norm + RoPE with an optional f16 convert. For every
+      (token, head) of Q and K: RMS-normalize the head-dim vector by its learned
+      weight, scale query heads by query_scale (keys by 1), then apply NeoX
+      half-split RoPE at position (pos0 + token) -- one launch in place of
+      rms_norm(Q) + rms_norm(K) + query-scale + rope(Q) + rope(K). One subgroup
+      per (token, head); GQA via n_head_kv < n_head. Ported from
+      embeddinggemma.c engine_xpu.cpp launch_qk_norm_rope (the richer
+      launch_qkv_epilogue, which encodes the model fused-QKV layout, was not
+      ported); kernels.c ei_qk_norm_rope_qk_inplace is the fp64 oracle.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel qk_norm_rope --approx {fused,unfused}"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/attention/qk_norm_rope/variants/xpu_sycl}
   adamw:
     family: optimizers
     status: implemented
@@ -354,10 +557,11 @@ operations:
 notes: >-
   GELU is the reference operation and landed with both a native SYCL variant and
   a co-equal oneDNN vendor variant, correctness-checked on Arc Pro B60 across
-  f32/f16/bf16 and benchmarked (see perf/optimization_status.md 2026-07-06). No
-  other family is claimed implemented until native XPU code, correctness tests,
-  and benchmark coverage land. GLU and GELU-backward remain planned, so the
-  activations family is `partial`.
+  f32/f16/bf16 and benchmarked (see perf/optimization_status.md 2026-07-06).
+  Operation status is authoritative per entry; family status remains `partial`
+  until the full shared-contract family is covered. The backend is
+  inference-first and does not claim complete backward or PyTorch-autograd
+  coverage.
 
 bindings:
   pytorch:
@@ -366,4 +570,6 @@ bindings:
     note: >-
       torch.xpu zero-copy binding (tk_xpu); queue off the tensor XPU stream ->
       ops ABI on data_ptr. Validated vs torch.xpu eager kernels (f32/bf16/f16).
+      Manual gelu_backward is exposed, but forward ops do not register autograd
+      formulas and training-complete backward coverage is not claimed.
       Requires a shared ops lib (icpx -fsycl) + a .sycl binding source.

@@ -10,7 +10,8 @@
 //
 // Methodology:
 //   * warm up (JIT + caches) for `--warmup` launches,
-//   * time `--iters` launches, each measured by its own profiling event,
+//   * time single-launch kernels by event and multi-launch ops in five
+//     profiled batches of `--iters` calls,
 //   * report median / min / max device time and effective bandwidth.
 //
 // Output is one JSON object per line on stdout (schema_version 2), suitable for
@@ -39,6 +40,8 @@
 #include "activations/softmax/softmax_kernel.hpp"
 #include "attention/attention/attention_kernel.hpp"
 #include "attention/rope/rope_kernel.hpp"
+
+#include "attention/qk_norm_rope/qk_norm_rope_kernel.hpp"
 #include "matmul/dense_gemm/dense_gemm_kernel.hpp"
 #include "norms/norms_kernel.hpp"
 #include "optimizers/adamw/adamw_kernel.hpp"
@@ -50,10 +53,13 @@
 #include "quantization/nvfp4_gemv/nvfp4_kernel.hpp"
 #include "quantization/qgemm/qgemm_kernel.hpp"
 #include "quantization/qgemv/qgemv_kernel.hpp"
+#include "quantization/w4a16_gemm/w4a16_gemm_kernel.hpp"
 #include "sampling/argmax/argmax_kernel.hpp"
 #include "sampling/sample/sample_kernel.hpp"
 #include "linear_attention/linear_attn/linear_attn_kernel.hpp"
+#include "linear_attention/qwen_gdn_decode/qwen_gdn_kernel.hpp"
 #include "moe/moe_route/moe_route_kernel.hpp"
+#include "moe/nvfp4_moe/nvfp4_moe_kernel.hpp"
 #include "ssm/selective_scan/selective_scan_kernel.hpp"
 #include "serving/serving_kernel.hpp"
 #include "utils/utils_kernel.hpp"
@@ -62,6 +68,8 @@ namespace {
 
 using quixicore::xpu::DType;
 using quixicore::xpu::Variant;
+using quixicore::xpu::half_t;
+using quixicore::xpu::bf16_t;
 
 DType parse_dtype(const std::string& s) {
   if (s == "f32") return DType::f32;
@@ -85,6 +93,80 @@ double event_ms(const sycl::event& ev) {
   return static_cast<double>(end - start) * 1e-6;  // ns -> ms
 }
 
+struct DeviceTiming {
+  double median_ms;
+  double min_ms;
+  double max_ms;
+};
+
+// Baseline second pass for the pool_mean_rms_l2 A/B: masked mean over each
+// sequence's tokens + L2, reading rows that a prior rms_norm pass already
+// normalized. Together with kernels::rms_norm_sycl this is the naive two-pass
+// decomposition the fused kernel collapses (the delta is the [total,dim] scratch
+// round-trip). Same subgroup-per-sequence layout as the shipped kernel.
+template <typename T, int DIM>
+sycl::event pool_meanl2_from_normed(sycl::queue& q, const T* normed,
+                                    const int* off, T* out, std::size_t batch) {
+  constexpr int SG = 16, SLOTS = DIM / SG;
+  return q.parallel_for(
+      sycl::nd_range<1>(sycl::range<1>(batch * SG), sycl::range<1>(SG)),
+      [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const std::size_t seq = it.get_group(0);
+        const int lane = static_cast<int>(sg.get_local_linear_id());
+        const int a = off[seq], b = off[seq + 1];
+        float p[SLOTS];
+#pragma unroll
+        for (int s = 0; s < SLOTS; ++s) p[s] = 0.0f;
+        for (int t = a; t < b; ++t) {
+          const std::size_t base = static_cast<std::size_t>(t) * DIM;
+#pragma unroll
+          for (int s = 0; s < SLOTS; ++s)
+            p[s] += static_cast<float>(normed[base + lane + s * SG]);
+        }
+        const int c = b - a;
+        const float invt = c > 0 ? 1.0f / static_cast<float>(c) : 0.0f;
+        float ss = 0.0f;
+#pragma unroll
+        for (int s = 0; s < SLOTS; ++s) { p[s] *= invt; ss = sycl::fma(p[s], p[s], ss); }
+        ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+        const float invl = ss == 0.0f ? 1.0f : sycl::rsqrt(ss);
+#pragma unroll
+        for (int s = 0; s < SLOTS; ++s)
+          out[seq * DIM + lane + s * SG] = static_cast<T>(p[s] * invl);
+      });
+}
+
+template <typename T>
+sycl::event pool_meanl2_dispatch(sycl::queue& q, const T* normed, const int* off,
+                                 T* out, std::size_t batch, std::size_t dim) {
+  switch (dim) {
+    case 256:  return pool_meanl2_from_normed<T, 256>(q, normed, off, out, batch);
+    case 512:  return pool_meanl2_from_normed<T, 512>(q, normed, off, out, batch);
+    case 768:  return pool_meanl2_from_normed<T, 768>(q, normed, off, out, batch);
+    default:   return pool_meanl2_from_normed<T, 1024>(q, normed, off, out, batch);
+  }
+}
+
+// Baseline for the glu_gelu_f16 A/B: GEGLU (tanh-gelu gate x value) writing the
+// storage dtype, matching the fused kernels math exactly so the only delta is
+// the [rows,d] scratch round-trip + f16 convert that the fusion folds away.
+inline float bench_gelu_tanh(float x) {
+  constexpr float a = 0.044715f, s = 0.79788456080286535587989211986876f;
+  return 0.5f * x * (1.0f + sycl::tanh(s * x * (1.0f + a * x * x)));
+}
+template <typename T>
+sycl::event glu_gelu_tanh_dt(sycl::queue& q, const T* x, T* out, std::size_t rows,
+                             std::size_t d) {
+  return q.parallel_for(sycl::range<2>(rows, d), [=](sycl::id<2> idx) {
+    const std::size_t row = idx[0], col = idx[1];
+    const T* gate = x + row * 2 * d;
+    const T* val = gate + d;
+    out[row * d + col] = static_cast<T>(
+        bench_gelu_tanh(static_cast<float>(gate[col])) * static_cast<float>(val[col]));
+  });
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -98,6 +180,7 @@ int main(int argc, char** argv) {
   std::size_t rows = 4096;   // row kernels: [rows, dim]
   std::size_t dim = 4096;
   std::size_t M = 1024, N = 1024, K = 1024;  // gemm dims
+  std::size_t window = 256;  // attn_swa symmetric sliding-window size
   int iters = 50;
   int warmup = 10;
   std::size_t device_index = 0;
@@ -118,6 +201,7 @@ int main(int argc, char** argv) {
     else if (a == "--M") M = std::stoull(next());
     else if (a == "--N") N = std::stoull(next());
     else if (a == "--K") K = std::stoull(next());
+    else if (a == "--window") window = std::stoull(next());
     else if (a == "--iters") iters = std::stoi(next());
     else if (a == "--warmup") warmup = std::stoi(next());
     else if (a == "--device") device_index = std::stoull(next());
@@ -135,6 +219,31 @@ int main(int argc, char** argv) {
     return 0;  // skip, not fail
   }
   sycl::queue q = make_gpu_queue(device_index, /*enable_profiling=*/true);
+
+  if (iters <= 0 || warmup < 0) {
+    throw std::invalid_argument("iters must be positive and warmup nonnegative");
+  }
+
+  auto time_device_batches = [&](auto &&submit_once) {
+    for (int i = 0; i < warmup; ++i)
+      submit_once();
+    q.wait();
+    std::vector<double> samples;
+    constexpr int kSamples = 5;
+    samples.reserve(kSamples);
+    for (int sample = 0; sample < kSamples; ++sample) {
+      sycl::event begin = q.single_task([] {});
+      for (int i = 0; i < iters; ++i)
+        submit_once();
+      sycl::event end = q.single_task([] {});
+      end.wait();
+      const auto start = begin.get_profiling_info<sycl::info::event_profiling::command_end>();
+      const auto stop = end.get_profiling_info<sycl::info::event_profiling::command_start>();
+      samples.push_back(static_cast<double>(stop - start) * 1e-6 / static_cast<double>(iters));
+    }
+    std::sort(samples.begin(), samples.end());
+    return DeviceTiming{samples[samples.size() / 2], samples.front(), samples.back()};
+  };
 
   const std::size_t elem = dtype_size(dt);
   const bool is_gemm = (kernel == "dense_gemm");
@@ -222,6 +331,229 @@ int main(int argc, char** argv) {
     sycl::free(A, q); sycl::free(B, q); sycl::free(C, q);
     return 0;
   }
+  if (kernel == "fp8_w8a16") {
+    void *activations = sycl::malloc_device(M * K * elem, q);
+    void *weight = sycl::malloc_device(N * K, q);
+    float *scales = sycl::malloc_device<float>(N, q);
+    void *output = sycl::malloc_device(M * N * elem, q);
+    q.memset(activations, 0, M * K * elem).wait();
+    q.memset(weight, 0, N * K).wait();
+    q.fill(scales, 1.0f, N).wait();
+    const int fp8_kind = approx_s == "e5m2" ? 1 : 0;
+    bool vendor_supported = true;
+    auto once = [&] {
+      if (variant == Variant::vendor) {
+#if defined(QUIXICORE_XPU_HAS_ONEDNN)
+        vendor_supported = kernels::fp8_gemm_w8a16_onednn(q, activations, weight, scales, true,
+                                                          output, M, N, K, fp8_kind, dt);
+        return;
+#endif
+      }
+      kernels::fp8_gemm_w8a16_sycl(q, activations, weight, scales, true, output, M, N, K, fp8_kind,
+                                   dt);
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    const double median = timing.median_ms;
+    if (!vendor_supported) {
+      throw std::runtime_error("oneDNN does not support the requested W8A16 shape");
+    }
+    const double weight_gbps = static_cast<double>(M) * N * K / (median * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"fp8_w8a16\","
+              << "\"variant\":\"" << variant_name(variant) << "\",\"fp8\":\""
+              << (fp8_kind ? "e5m2" : "e4m3") << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"M\":" << M << ",\"N\":" << N << ",\"K\":" << K << ",\"iters\":" << iters
+              << ",\"median_ms\":" << median << ",\"min_ms\":" << timing.min_ms
+              << ",\"max_ms\":" << timing.max_ms << ",\"weight_gbps\":" << weight_gbps
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}"
+              << std::endl;
+    sycl::free(activations, q);
+    sycl::free(weight, q);
+    sycl::free(scales, q);
+    sycl::free(output, q);
+    return 0;
+  }
+  if (kernel == "nvfp4_gemm") {
+    void *weight = sycl::malloc_device(N * K / 2, q);
+    void *scales = sycl::malloc_device(N * K / 16, q);
+    void *activations = sycl::malloc_device(M * K * elem, q);
+    void *output = sycl::malloc_device(M * N * elem, q);
+    q.memset(weight, 0, N * K / 2).wait();
+    q.memset(scales, 0x38, N * K / 16).wait();
+    q.memset(activations, 0, M * K * elem).wait();
+    const bool mtiled = approx_s == "mtiled";
+    auto once = [&] {
+      if (mtiled) {
+        kernels::nvfp4_gemm_mtiled_sycl(q, weight, scales, 1.0f, activations, output, M, N, K, dt);
+      } else {
+        kernels::nvfp4_gemm_sycl(q, weight, scales, 1.0f, activations, output, M, N, K, dt);
+      }
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    const double median = timing.median_ms;
+    const double weight_gbps = static_cast<double>(M) * N * K / 2.0 / (median * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"nvfp4_gemm\","
+              << "\"variant\":\"" << (mtiled ? "mtiled" : "row_loop") << "\",\"dtype\":\""
+              << dtype_name(dt) << "\",\"M\":" << M << ",\"N\":" << N << ",\"K\":" << K
+              << ",\"iters\":" << iters << ",\"median_ms\":" << median
+              << ",\"min_ms\":" << timing.min_ms << ",\"max_ms\":" << timing.max_ms
+              << ",\"weight_gbps\":" << weight_gbps << ",\"device\":\""
+              << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(weight, q);
+    sycl::free(scales, q);
+    sycl::free(activations, q);
+    sycl::free(output, q);
+    return 0;
+  }
+  if (kernel == "nvfp4_moe") {
+    const std::size_t experts = N;
+    const std::size_t top_k = rows;
+    const std::size_t intermediate = dim;
+    const std::size_t pairs = M * top_k;
+    void *hidden = sycl::malloc_device(M * K * elem, q);
+    int *expert_ids = sycl::malloc_device<int>(pairs, q);
+    float *router_weights = sycl::malloc_device<float>(pairs, q);
+    void *w13 = sycl::malloc_device(experts * 2 * intermediate * K / 2, q);
+    void *w13_scales = sycl::malloc_device(experts * 2 * intermediate * K / 16, q);
+    float *w13_global = sycl::malloc_device<float>(experts, q);
+    void *w2 = sycl::malloc_device(experts * K * intermediate / 2, q);
+    void *w2_scales = sycl::malloc_device(experts * K * intermediate / 16, q);
+    float *w2_global = sycl::malloc_device<float>(experts, q);
+    float *scratch = sycl::malloc_device<float>(pairs * 2 * intermediate, q);
+    float *output = sycl::malloc_device<float>(M * K, q);
+    q.memset(hidden, 0, M * K * elem).wait();
+    q.memset(expert_ids, 0, pairs * sizeof(int)).wait();
+    q.fill(router_weights, 1.0f / static_cast<float>(top_k), pairs).wait();
+    q.memset(w13, 0, experts * 2 * intermediate * K / 2).wait();
+    q.memset(w13_scales, 0x38, experts * 2 * intermediate * K / 16).wait();
+    q.fill(w13_global, 1.0f, experts).wait();
+    q.memset(w2, 0, experts * K * intermediate / 2).wait();
+    q.memset(w2_scales, 0x38, experts * K * intermediate / 16).wait();
+    q.fill(w2_global, 1.0f, experts).wait();
+    const bool split = approx_s == "split";
+    auto once = [&] {
+      const sycl::event zeroed = q.memset(output, 0, M * K * sizeof(float));
+      if (split) {
+        kernels::nvfp4_moe_split_sycl(q, hidden, expert_ids, router_weights, w13, w13_scales,
+                                      w13_global, w2, w2_scales, w2_global, scratch, output, M,
+                                      experts, top_k, K, intermediate, true, dt, zeroed);
+      } else {
+        kernels::nvfp4_moe_fused_sycl(q, hidden, expert_ids, router_weights, w13, w13_scales,
+                                      w13_global, w2, w2_scales, w2_global, output, M, experts,
+                                      top_k, K, intermediate, true, dt, zeroed);
+      }
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    const double median = timing.median_ms;
+    const double fp4_weight_bytes =
+        static_cast<double>(pairs) * (2.0 * intermediate * K / 2.0 + K * intermediate / 2.0);
+    const double weight_gbps = fp4_weight_bytes / (median * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"nvfp4_moe\","
+              << "\"variant\":\"" << (split ? "split" : "fused") << "\",\"dtype\":\""
+              << dtype_name(dt) << "\",\"M\":" << M << ",\"experts\":" << experts
+              << ",\"top_k\":" << top_k << ",\"K\":" << K << ",\"I\":" << intermediate
+              << ",\"iters\":" << iters << ",\"median_ms\":" << median
+              << ",\"min_ms\":" << timing.min_ms << ",\"max_ms\":" << timing.max_ms
+              << ",\"weight_gbps\":" << weight_gbps << ",\"device\":\""
+              << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(hidden, q);
+    sycl::free(expert_ids, q);
+    sycl::free(router_weights, q);
+    sycl::free(w13, q);
+    sycl::free(w13_scales, q);
+    sycl::free(w13_global, q);
+    sycl::free(w2, q);
+    sycl::free(w2_scales, q);
+    sycl::free(w2_global, q);
+    sycl::free(scratch, q);
+    sycl::free(output, q);
+    return 0;
+  }
+  if (kernel == "qwen_gdn_decode") {
+    if (M == 0 || N < 2) {
+      throw std::invalid_argument("qwen_gdn_decode requires M > 0 and at least two state slots");
+    }
+    constexpr std::size_t conv_dim = 8192;
+    constexpr std::size_t qkvz_dim = 12288;
+    constexpr std::size_t value_dim = 4096;
+    const std::size_t batch = M;
+    const std::size_t slots = N;
+    void *projected_qkvz = sycl::malloc_device(batch * qkvz_dim * elem, q);
+    void *projected_ba = sycl::malloc_device(batch * 64 * elem, q);
+    void *conv_state = sycl::malloc_device(slots * 3 * conv_dim * elem, q);
+    float *ssm_state = sycl::malloc_device<float>(slots * 32 * 128 * 128, q);
+    void *conv_weight = sycl::malloc_device(conv_dim * 4 * elem, q);
+    void *conv_bias = sycl::malloc_device(conv_dim * elem, q);
+    float *A_log = sycl::malloc_device<float>(32, q);
+    void *dt_bias = sycl::malloc_device(32 * elem, q);
+    int *state_indices = sycl::malloc_shared<int>(batch, q);
+    void *mixed_qkv = sycl::malloc_device(batch * conv_dim * elem, q);
+    void *core = sycl::malloc_device(batch * value_dim * elem, q);
+    void *z = sycl::malloc_device(batch * value_dim * elem, q);
+    q.memset(projected_qkvz, 0, batch * qkvz_dim * elem).wait();
+    q.memset(projected_ba, 0, batch * 64 * elem).wait();
+    q.memset(conv_state, 0, slots * 3 * conv_dim * elem).wait();
+    q.memset(ssm_state, 0, slots * 32 * 128 * 128 * sizeof(float)).wait();
+    q.memset(conv_weight, 0, conv_dim * 4 * elem).wait();
+    q.memset(conv_bias, 0, conv_dim * elem).wait();
+    q.memset(A_log, 0, 32 * sizeof(float)).wait();
+    q.memset(dt_bias, 0, 32 * elem).wait();
+    for (std::size_t i = 0; i < batch; ++i)
+      state_indices[i] = static_cast<int>(i % slots);
+    auto once = [&] {
+      kernels::qwen_gdn_decode_sycl(q, projected_qkvz, projected_ba, conv_state, ssm_state,
+                                    conv_weight, conv_bias, A_log, dt_bias, state_indices,
+                                    mixed_qkv, core, z, batch, slots, false, dt, DType::f32, dt);
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    const double median = timing.median_ms;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"qwen_gdn_decode\","
+              << "\"variant\":\"sycl\",\"dtype\":\"" << dtype_name(dt) << "\",\"batch\":" << batch
+              << ",\"slots\":" << slots << ",\"iters\":" << iters << ",\"median_ms\":" << median
+              << ",\"min_ms\":" << timing.min_ms << ",\"max_ms\":" << timing.max_ms
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}"
+              << std::endl;
+    sycl::free(projected_qkvz, q);
+    sycl::free(projected_ba, q);
+    sycl::free(conv_state, q);
+    sycl::free(ssm_state, q);
+    sycl::free(conv_weight, q);
+    sycl::free(conv_bias, q);
+    sycl::free(A_log, q);
+    sycl::free(dt_bias, q);
+    sycl::free(state_indices, q);
+    sycl::free(mixed_qkv, q);
+    sycl::free(core, q);
+    sycl::free(z, q);
+    return 0;
+  }
+  if (kernel == "fused_add_rms_norm") {
+    void *input = sycl::malloc_device(rows * dim * elem, q);
+    void *residual = sycl::malloc_device(rows * dim * elem, q);
+    void *weight = sycl::malloc_device(dim * elem, q);
+    void *output = sycl::malloc_device(rows * dim * elem, q);
+    q.memset(input, 0, rows * dim * elem).wait();
+    q.memset(residual, 0, rows * dim * elem).wait();
+    q.memset(weight, 0, dim * elem).wait();
+    auto once = [&] {
+      kernels::fused_add_rms_norm_sycl(q, input, residual, weight, output, rows, dim, 1e-6f, dt);
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    const double median = timing.median_ms;
+    const double bytes = (4.0 * static_cast<double>(rows * dim) + dim) * elem;
+    const double gbps = bytes / (median * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,"
+              << "\"kernel\":\"fused_add_rms_norm\","
+              << "\"variant\":\"sycl\",\"dtype\":\"" << dtype_name(dt) << "\",\"rows\":" << rows
+              << ",\"dim\":" << dim << ",\"iters\":" << iters << ",\"median_ms\":" << median
+              << ",\"min_ms\":" << timing.min_ms << ",\"max_ms\":" << timing.max_ms
+              << ",\"gbps\":" << gbps << ",\"device\":\""
+              << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(input, q);
+    sycl::free(residual, q);
+    sycl::free(weight, q);
+    sycl::free(output, q);
+    return 0;
+  }
   if (kernel == "qgemm_int8") {
     std::int8_t* A = sycl::malloc_device<std::int8_t>(M * K, q);
     std::int8_t* B = sycl::malloc_device<std::int8_t>(K * N, q);
@@ -251,6 +583,69 @@ int main(int argc, char** argv) {
               << ",\"gops\":" << gops << ",\"device\":\""
               << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
     sycl::free(A, q); sycl::free(B, q); sycl::free(as, q); sycl::free(bs, q); sycl::free(C, q);
+    return 0;
+  }
+
+  if (kernel == "w4a16_gemm") {
+    // int4-weight x 16-bit-activation DPAS GEMM vs the existing int4/int8 paths.
+    // --approx dpas (default): the new w4a16_gemm_sycl (joint_matrix). --approx
+    // gemv: the current int4 path applied per-row -- M sequential qgemv_int4
+    // launches (summed device time), i.e. how int4-weight GEMM is done today.
+    // --approx int8: qgemm_int8_sycl (the existing int8 w8a8 GEMM native tile) at
+    // the same M/N/K. Same M,N,K; group=128 (or K). Activation dtype must be
+    // 16-bit; f32 is remapped to bf16 for this kernel.
+    DType adt = (dt == DType::f32) ? DType::bf16 : dt;
+    const std::size_t elem16 = dtype_size(adt);
+    const std::size_t group = (K % 128 == 0) ? 128 : K;
+    void* w = sycl::malloc_device(N * (K / 2), q);            // int4 packed [N,K/2]
+    void* sc = sycl::malloc_device(N * (K / group) * 2, q);   // f16 scales [N,K/group]
+    void* A = sycl::malloc_device(M * K * elem16, q);         // [M,K] act
+    void* C = sycl::malloc_device(M * N * elem16, q);         // [M,N] out
+    q.memset(w, 1, N * (K / 2)).wait();
+    q.memset(sc, 0, N * (K / group) * 2).wait();
+    q.memset(A, 0, M * K * elem16).wait();
+    // int8 comparison operands
+    std::int8_t* iA = sycl::malloc_device<std::int8_t>(M * K, q);
+    std::int8_t* iB = sycl::malloc_device<std::int8_t>(K * N, q);
+    float* ias = sycl::malloc_device<float>(M, q);
+    float* ibs = sycl::malloc_device<float>(N, q);
+    void* iC = sycl::malloc_device(M * N * elem16, q);
+    q.memset(iA, 0, M * K).wait(); q.memset(iB, 0, K * N).wait();
+    q.memset(ias, 0, M * 4).wait(); q.memset(ibs, 0, N * 4).wait();
+
+    const std::string mode = approx_s;  // dpas | gemv | int8
+    auto once = [&]() -> double {
+      if (mode == "gemv") {
+        double t = 0.0;
+        for (std::size_t m = 0; m < M; ++m) {
+          const char* xrow = static_cast<const char*>(A) + m * K * elem16;
+          char* yrow = static_cast<char*>(C) + m * N * elem16;
+          sycl::event e = kernels::qgemv_int4_sycl(q, w, sc, xrow, yrow, N, K, group, adt);
+          e.wait(); t += event_ms(e);
+        }
+        return t;
+      }
+      if (mode == "int8") {
+        sycl::event e = kernels::qgemm_int8_sycl(q, iA, iB, ias, ibs, iC, M, N, K, adt);
+        e.wait(); return event_ms(e);
+      }
+      sycl::event e = kernels::w4a16_gemm_sycl(q, A, w, sc, C, M, N, K, group, adt);
+      e.wait(); return event_ms(e);
+    };
+    for (int i = 0; i < warmup; ++i) once();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) s.push_back(once());
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    const double gops = 2.0 * (double)M * (double)N * (double)K / (med * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"w4a16_gemm\",\"variant\":\"sycl\",\"approx\":\""
+              << (mode == "gemv" ? "gemv" : (mode == "int8" ? "int8" : "dpas"))
+              << "\",\"dtype\":\"" << dtype_name(adt) << "\",\"M\":" << M << ",\"N\":" << N
+              << ",\"K\":" << K << ",\"group\":" << group << ",\"iters\":" << iters
+              << ",\"median_ms\":" << med << ",\"min_ms\":" << s.front() << ",\"gops\":" << gops
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(w, q); sycl::free(sc, q); sycl::free(A, q); sycl::free(C, q);
+    sycl::free(iA, q); sycl::free(iB, q); sycl::free(ias, q); sycl::free(ibs, q); sycl::free(iC, q);
     return 0;
   }
 
@@ -391,6 +786,318 @@ int main(int argc, char** argv) {
               << ",\"causal\":true,\"iters\":" << iters << ",\"median_ms\":" << med << ",\"gflops\":" << gflop
               << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
     sycl::free(Q, q); sycl::free(K, q); sycl::free(V, q); sycl::free(O, q);
+    return 0;
+  }
+  if (kernel == "attention_f16ctx") {
+    // A/B for the fused ctx->f16 store. --approx fused (default): time the single
+    // attention_f16ctx kernel (writes O + O_f16). --approx unfused: baseline of
+    // attention_sycl (writes O) followed by a standalone O->O_f16 convert kernel
+    // -- the exact pass the fused epilogue folds away -- timed as the sum of both
+    // device events. Same shapes; the delta is the eliminated convert traffic.
+    const std::size_t nh = rows, seq = dim, d = 64;
+    const std::size_t ne = nh * seq * d;
+    void* Q = sycl::malloc_device(ne * elem, q);
+    void* K = sycl::malloc_device(ne * elem, q);
+    void* V = sycl::malloc_device(ne * elem, q);
+    void* O = sycl::malloc_device(ne * elem, q);
+    half_t* O16 = sycl::malloc_device<half_t>(ne, q);
+    q.memset(Q, 0, ne * elem).wait(); q.memset(K, 0, ne * elem).wait(); q.memset(V, 0, ne * elem).wait();
+    const bool unfused = (approx_s == "unfused");
+    auto convert = [&]() -> sycl::event {
+      switch (dt) {
+        case DType::f16: { const half_t* o = static_cast<const half_t*>(O);
+          return q.parallel_for(sycl::range<1>(ne), [=](sycl::id<1> i) { O16[i[0]] = o[i[0]]; }); }
+        case DType::bf16: { const bf16_t* o = static_cast<const bf16_t*>(O);
+          return q.parallel_for(sycl::range<1>(ne), [=](sycl::id<1> i) { O16[i[0]] = static_cast<half_t>(static_cast<float>(o[i[0]])); }); }
+        default: { const float* o = static_cast<const float*>(O);
+          return q.parallel_for(sycl::range<1>(ne), [=](sycl::id<1> i) { O16[i[0]] = static_cast<half_t>(o[i[0]]); }); }
+      }
+    };
+    auto once = [&]() -> double {
+      if (unfused) {
+        sycl::event ea = kernels::attention_sycl(q, Q, K, V, O, nh, nh, seq, seq, d, true, dt);
+        ea.wait();
+        sycl::event ec = convert();
+        ec.wait();
+        return event_ms(ea) + event_ms(ec);
+      }
+      sycl::event ef = kernels::attention_f16ctx_sycl(q, Q, K, V, O, O16, nh, nh, seq, seq, d, true, dt);
+      ef.wait();
+      return event_ms(ef);
+    };
+    for (int i = 0; i < warmup; ++i) once();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) s.push_back(once());
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    std::cout << "{\"schema_version\":2,\"kernel\":\"attention_f16ctx\",\"variant\":\"sycl\",\"approx\":\""
+              << (unfused ? "unfused" : "fused") << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"heads\":" << nh << ",\"seq\":" << seq << ",\"d\":" << d
+              << ",\"causal\":true,\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"min_ms\":" << s.front() << ",\"max_ms\":" << s.back()
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(Q, q); sycl::free(K, q); sycl::free(V, q); sycl::free(O, q); sycl::free(O16, q);
+    return 0;
+  }
+  if (kernel == "attn_swa") {
+    // A/B for the symmetric sliding-window band. --approx banded (default):
+    // attn_swa with the requested --window W, so each query streams only the
+    // ~W keys in its symmetric band. --approx dense: the SAME kernel with
+    // window=0, which streams all `seq` keys -- i.e. the dense flash SDPA
+    // baseline (identical math to attention_sycl non-causal). The only
+    // difference between the two is the banded key range, so at long seq with
+    // W << seq the banded pass does O(W) work per query instead of O(seq).
+    // d = 64 (matches the attention harness); nh kv heads == nh (MHA).
+    const std::size_t nh = rows, seq = dim, d = 64;
+    const std::size_t ne = nh * seq * d;
+    void* Q = sycl::malloc_device(ne * elem, q);
+    void* K = sycl::malloc_device(ne * elem, q);
+    void* V = sycl::malloc_device(ne * elem, q);
+    void* O = sycl::malloc_device(ne * elem, q);
+    q.memset(Q, 0, ne * elem).wait(); q.memset(K, 0, ne * elem).wait(); q.memset(V, 0, ne * elem).wait();
+    const bool dense = (approx_s == "dense");
+    const std::size_t win = dense ? 0 : window;
+    const double med = time_median([&] { return kernels::attn_swa_sycl(q, Q, K, V, O, nh, nh, seq, seq, d, win, dt); });
+    std::cout << "{\"schema_version\":2,\"kernel\":\"attn_swa\",\"variant\":\"sycl\",\"approx\":\""
+              << (dense ? "dense" : "banded") << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"heads\":" << nh << ",\"seq\":" << seq << ",\"d\":" << d
+              << ",\"window\":" << win << ",\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(Q, q); sycl::free(K, q); sycl::free(V, q); sycl::free(O, q);
+    return 0;
+  }
+  if (kernel == "pool_mean_rms_l2") {
+    // Sentence-embedding pooling head. A/B for the RMSNorm -> masked-mean -> L2
+    // fusion. --approx fused (default): the single pool_mean_rms_l2_sycl kernel
+    // (reads x once, writes one vector per sequence). --approx unfused: the naive
+    // two-pass decomposition -- rms_norm over all [total,dim] token rows into
+    // scratch, then a masked-mean+L2 pass reading scratch -- timed as the sum of
+    // both device events. The delta is the eliminated [total,dim] scratch
+    // round-trip. --rows = batch (sequences), --M = tokens/sequence, --dim = the
+    // shape key (256/512/768/1024; other values fall back to 768).
+    const std::size_t D =
+        (dim == 256 || dim == 512 || dim == 768 || dim == 1024) ? dim : 768;
+    const std::size_t batch = rows;
+    const std::size_t tok = M;  // tokens per sequence (uniform for the benchmark)
+    const std::size_t total = batch * tok;
+    void* x = sycl::malloc_device(total * D * elem, q);
+    void* w = sycl::malloc_device(D * elem, q);
+    void* out = sycl::malloc_device(batch * D * elem, q);
+    void* scratch = sycl::malloc_device(total * D * elem, q);
+    int* off = sycl::malloc_shared<int>(batch + 1, q);
+    q.memset(x, 0, total * D * elem).wait();
+    q.memset(w, 0, D * elem).wait();
+    for (std::size_t s = 0; s <= batch; ++s) off[s] = static_cast<int>(s * tok);
+    const float eps = 1e-6f;
+    const bool unfused = (approx_s == "unfused");
+    auto once = [&]() -> double {
+      if (unfused) {
+        sycl::event er = kernels::rms_norm_sycl(q, x, w, scratch, total, D, eps, dt);
+        er.wait();
+        sycl::event em;
+        switch (dt) {
+          case DType::f16:
+            em = pool_meanl2_dispatch<half_t>(q, static_cast<const half_t*>(scratch), off, static_cast<half_t*>(out), batch, D);
+            break;
+          case DType::bf16:
+            em = pool_meanl2_dispatch<bf16_t>(q, static_cast<const bf16_t*>(scratch), off, static_cast<bf16_t*>(out), batch, D);
+            break;
+          default:
+            em = pool_meanl2_dispatch<float>(q, static_cast<const float*>(scratch), off, static_cast<float*>(out), batch, D);
+            break;
+        }
+        em.wait();
+        return event_ms(er) + event_ms(em);
+      }
+      sycl::event ef =
+          kernels::pool_mean_rms_l2_sycl(q, x, w, off, out, batch, D, eps, dt);
+      ef.wait();
+      return event_ms(ef);
+    };
+    for (int i = 0; i < warmup; ++i) once();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) s.push_back(once());
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    std::cout << "{\"schema_version\":2,\"kernel\":\"pool_mean_rms_l2\",\"variant\":\"sycl\",\"approx\":\""
+              << (unfused ? "unfused" : "fused") << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"batch\":" << batch << ",\"tokens\":" << tok << ",\"dim\":" << D
+              << ",\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"min_ms\":" << s.front() << ",\"max_ms\":" << s.back()
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(x, q); sycl::free(w, q); sycl::free(out, q); sycl::free(scratch, q); sycl::free(off, q);
+    return 0;
+  }
+  if (kernel == "rms_residual_next") {
+    // A/B for the fused residual-add + double RMSNorm -> f16. --approx fused
+    // (default): the single rms_residual_next_sycl kernel (sublayer post-norm +
+    // residual add + next pre-norm + f16 convert in one launch). --approx
+    // unfused: the composed separate-ops baseline --
+    // rms_norm(projection,post_weight)->scratch, residual += scratch,
+    // rms_norm(residual,next_weight)->scratch2, convert scratch2->f16 -- timed as
+    // the sum of the four device events. The delta is ~2 eliminated scratch
+    // round-trips and 3 launches. --rows, --dim.
+    const std::size_t R = rows, D = dim;
+    const std::size_t total = R * D;
+    void* proj = sycl::malloc_device(total * elem, q);
+    void* pw = sycl::malloc_device(D * elem, q);
+    void* res = sycl::malloc_device(total * elem, q);
+    void* nw = sycl::malloc_device(D * elem, q);
+    half_t* out = sycl::malloc_device<half_t>(total, q);
+    void* scratch = sycl::malloc_device(total * elem, q);
+    void* scratch2 = sycl::malloc_device(total * elem, q);
+    q.memset(proj, 0, total * elem).wait(); q.memset(pw, 0, D * elem).wait();
+    q.memset(res, 0, total * elem).wait(); q.memset(nw, 0, D * elem).wait();
+    const float eps = 1e-6f;
+    auto add_into = [&]() -> sycl::event {
+      switch (dt) {
+        case DType::f16: { half_t* r = static_cast<half_t*>(res); const half_t* s = static_cast<const half_t*>(scratch);
+          return q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i){ r[i[0]] = static_cast<half_t>(static_cast<float>(r[i[0]]) + static_cast<float>(s[i[0]])); }); }
+        case DType::bf16: { bf16_t* r = static_cast<bf16_t*>(res); const bf16_t* s = static_cast<const bf16_t*>(scratch);
+          return q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i){ r[i[0]] = static_cast<bf16_t>(static_cast<float>(r[i[0]]) + static_cast<float>(s[i[0]])); }); }
+        default: { float* r = static_cast<float*>(res); const float* s = static_cast<const float*>(scratch);
+          return q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i){ r[i[0]] += s[i[0]]; }); }
+      }
+    };
+    auto convert16 = [&]() -> sycl::event {
+      switch (dt) {
+        case DType::f16: { const half_t* s = static_cast<const half_t*>(scratch2);
+          return q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i){ out[i[0]] = s[i[0]]; }); }
+        case DType::bf16: { const bf16_t* s = static_cast<const bf16_t*>(scratch2);
+          return q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i){ out[i[0]] = static_cast<half_t>(static_cast<float>(s[i[0]])); }); }
+        default: { const float* s = static_cast<const float*>(scratch2);
+          return q.parallel_for(sycl::range<1>(total), [=](sycl::id<1> i){ out[i[0]] = static_cast<half_t>(s[i[0]]); }); }
+      }
+    };
+    const bool unfused = (approx_s == "unfused");
+    auto once = [&]() -> double {
+      if (unfused) {
+        sycl::event e1 = kernels::rms_norm_sycl(q, proj, pw, scratch, R, D, eps, dt); e1.wait();
+        sycl::event e2 = add_into(); e2.wait();
+        sycl::event e3 = kernels::rms_norm_sycl(q, res, nw, scratch2, R, D, eps, dt); e3.wait();
+        sycl::event e4 = convert16(); e4.wait();
+        return event_ms(e1) + event_ms(e2) + event_ms(e3) + event_ms(e4);
+      }
+      sycl::event ef = kernels::rms_residual_next_sycl(q, proj, pw, res, nw, out, R, D, eps, dt); ef.wait();
+      return event_ms(ef);
+    };
+    for (int i = 0; i < warmup; ++i) once();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) s.push_back(once());
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    std::cout << "{\"schema_version\":2,\"kernel\":\"rms_residual_next\",\"variant\":\"sycl\",\"approx\":\""
+              << (unfused ? "unfused" : "fused") << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"rows\":" << R << ",\"dim\":" << D
+              << ",\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"min_ms\":" << s.front() << ",\"max_ms\":" << s.back()
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(proj, q); sycl::free(pw, q); sycl::free(res, q); sycl::free(nw, q); sycl::free(out, q); sycl::free(scratch, q); sycl::free(scratch2, q);
+    return 0;
+  }
+  if (kernel == "qk_norm_rope") {
+    // A/B for the fused per-head QK-norm + query-scale + RoPE. --approx fused
+    // (default): the single qk_norm_rope_sycl kernel. --approx unfused: the
+    // composed separate-ops baseline -- rms_norm(Q,qw)->Q, scale Q by
+    // query_scale, rope(Q), rms_norm(K,kw)->K, rope(K) -- timed as the sum of
+    // the five device events. Same shapes; the delta is 4 eliminated launches
+    // (submission-bound). --rows = tokens; n_head/n_head_kv/head_dim fixed below
+    // (GQA: 32/8, head_dim 128).
+    const std::size_t tok = rows, NH = 32, NKV = 8, HD = 128;
+    const std::size_t nq = tok * NH * HD, nk = tok * NKV * HD;
+    void* Q = sycl::malloc_device(nq * elem, q);
+    void* K = sycl::malloc_device(nk * elem, q);
+    void* qw = sycl::malloc_device(HD * elem, q);
+    void* kw = sycl::malloc_device(HD * elem, q);
+    q.memset(Q, 0, nq * elem).wait(); q.memset(K, 0, nk * elem).wait();
+    q.memset(qw, 0, HD * elem).wait(); q.memset(kw, 0, HD * elem).wait();
+    const float eps = 1e-6f, base = 10000.0f, qscale = 0.0625f;
+    auto scaleQ = [&]() -> sycl::event {
+      switch (dt) {
+        case DType::f16: { half_t* p = static_cast<half_t*>(Q);
+          return q.parallel_for(sycl::range<1>(nq), [=](sycl::id<1> i){ p[i[0]] = static_cast<half_t>(static_cast<float>(p[i[0]]) * qscale); }); }
+        case DType::bf16: { bf16_t* p = static_cast<bf16_t*>(Q);
+          return q.parallel_for(sycl::range<1>(nq), [=](sycl::id<1> i){ p[i[0]] = static_cast<bf16_t>(static_cast<float>(p[i[0]]) * qscale); }); }
+        default: { float* p = static_cast<float*>(Q);
+          return q.parallel_for(sycl::range<1>(nq), [=](sycl::id<1> i){ p[i[0]] *= qscale; }); }
+      }
+    };
+    const bool unfused = (approx_s == "unfused");
+    auto once = [&]() -> double {
+      if (unfused) {
+        sycl::event e1 = kernels::rms_norm_sycl(q, Q, qw, Q, tok * NH, HD, eps, dt); e1.wait();
+        sycl::event e2 = scaleQ(); e2.wait();
+        sycl::event e3 = kernels::rope_sycl(q, Q, Q, tok, NH, HD, base, 0, dt); e3.wait();
+        sycl::event e4 = kernels::rms_norm_sycl(q, K, kw, K, tok * NKV, HD, eps, dt); e4.wait();
+        sycl::event e5 = kernels::rope_sycl(q, K, K, tok, NKV, HD, base, 0, dt); e5.wait();
+        return event_ms(e1) + event_ms(e2) + event_ms(e3) + event_ms(e4) + event_ms(e5);
+      }
+      sycl::event ef = kernels::qk_norm_rope_sycl(q, Q, K, qw, kw, nullptr, nullptr, tok, NH, NKV, HD, base, 0, qscale, eps, dt); ef.wait();
+      return event_ms(ef);
+    };
+    for (int i = 0; i < warmup; ++i) once();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) s.push_back(once());
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    std::cout << "{\"schema_version\":2,\"kernel\":\"qk_norm_rope\",\"variant\":\"sycl\",\"approx\":\""
+              << (unfused ? "unfused" : "fused") << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"tokens\":" << tok << ",\"n_head\":" << NH << ",\"n_head_kv\":" << NKV
+              << ",\"head_dim\":" << HD << ",\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"min_ms\":" << s.front() << ",\"max_ms\":" << s.back()
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(Q, q); sycl::free(K, q); sycl::free(qw, q); sycl::free(kw, q);
+    return 0;
+  }
+  if (kernel == "glu_gelu_f16") {
+    // A/B for the fused GEGLU -> f16. --approx fused (default): the single
+    // glu_gelu_f16_sycl kernel (dt in -> f16 out). --approx unfused: the composed
+    // baseline -- a tanh-gelu GLU writing dt into scratch, then a dt->f16 convert
+    // -- timed as the sum of both device events. Same math; the delta is the
+    // eliminated [rows,d] scratch round-trip and a launch. --rows, --dim = d.
+    const std::size_t R = rows, D = dim;
+    void* x = sycl::malloc_device(R * 2 * D * elem, q);
+    void* scratch = sycl::malloc_device(R * D * elem, q);
+    half_t* out = sycl::malloc_device<half_t>(R * D, q);
+    q.memset(x, 0, R * 2 * D * elem).wait();
+    auto convert16 = [&]() -> sycl::event {
+      switch (dt) {
+        case DType::f16: { const half_t* s = static_cast<const half_t*>(scratch);
+          return q.parallel_for(sycl::range<1>(R * D), [=](sycl::id<1> i){ out[i[0]] = s[i[0]]; }); }
+        case DType::bf16: { const bf16_t* s = static_cast<const bf16_t*>(scratch);
+          return q.parallel_for(sycl::range<1>(R * D), [=](sycl::id<1> i){ out[i[0]] = static_cast<half_t>(static_cast<float>(s[i[0]])); }); }
+        default: { const float* s = static_cast<const float*>(scratch);
+          return q.parallel_for(sycl::range<1>(R * D), [=](sycl::id<1> i){ out[i[0]] = static_cast<half_t>(s[i[0]]); }); }
+      }
+    };
+    const bool unfused = (approx_s == "unfused");
+    auto once = [&]() -> double {
+      if (unfused) {
+        sycl::event e1;
+        switch (dt) {
+          case DType::f16: e1 = glu_gelu_tanh_dt<half_t>(q, static_cast<const half_t*>(x), static_cast<half_t*>(scratch), R, D); break;
+          case DType::bf16: e1 = glu_gelu_tanh_dt<bf16_t>(q, static_cast<const bf16_t*>(x), static_cast<bf16_t*>(scratch), R, D); break;
+          default: e1 = glu_gelu_tanh_dt<float>(q, static_cast<const float*>(x), static_cast<float*>(scratch), R, D); break;
+        }
+        e1.wait();
+        sycl::event e2 = convert16(); e2.wait();
+        return event_ms(e1) + event_ms(e2);
+      }
+      sycl::event ef = kernels::glu_gelu_f16_sycl(q, x, out, R, D, dt); ef.wait();
+      return event_ms(ef);
+    };
+    for (int i = 0; i < warmup; ++i) once();
+    std::vector<double> s;
+    for (int i = 0; i < iters; ++i) s.push_back(once());
+    std::sort(s.begin(), s.end());
+    const double med = s[s.size() / 2];
+    std::cout << "{\"schema_version\":2,\"kernel\":\"glu_gelu_f16\",\"variant\":\"sycl\",\"approx\":\""
+              << (unfused ? "unfused" : "fused") << "\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"rows\":" << R << ",\"d\":" << D
+              << ",\"iters\":" << iters << ",\"median_ms\":" << med
+              << ",\"min_ms\":" << s.front() << ",\"max_ms\":" << s.back()
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(x, q); sycl::free(scratch, q); sycl::free(out, q);
     return 0;
   }
   if (kernel == "selective_scan") {

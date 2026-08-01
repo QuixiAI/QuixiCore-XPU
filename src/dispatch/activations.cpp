@@ -87,4 +87,12 @@ void glu(sycl::queue& q, const void* x, void* out, std::size_t rows,
   if (blocking) ev.wait();
 }
 
+
+void glu_gelu_f16(sycl::queue& q, const void* x, void* out, std::size_t rows,
+                  std::size_t d, DType dt, Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::glu_gelu_f16_sycl(q, x, out, rows, d, dt);
+  if (blocking) ev.wait();
+}
+
 }  // namespace quixicore::xpu::ops

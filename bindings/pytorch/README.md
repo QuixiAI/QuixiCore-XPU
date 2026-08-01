@@ -1,4 +1,4 @@
-# QuixiCore XPU — PyTorch binding (`tk_xpu`)
+# QuixiCore XPU - PyTorch binding (`tk_xpu`)
 
 A co-equal PyTorch binding (mirroring the Metal backend's PyTorch+MLX bindings):
 each op takes `torch.xpu` tensors, pulls the SYCL queue straight off the tensor's
@@ -10,9 +10,9 @@ current XPU stream (`c10::xpu::getCurrentXPUStream().queue()`), and calls the sa
 ```bash
 source /opt/intel/oneapi/setvars.sh
 source ../../.venv/bin/activate       # torch==2.14.dev+xpu
-pip install ninja                     # SyclExtension requires ninja
+uv pip install --python ../../.venv/bin/python ninja
 ./build.sh                            # shared ops lib + extension
-python test_parity.py                 # vs torch.xpu eager kernels
+../../.venv/bin/python test_parity.py # vs torch.xpu eager kernels
 ```
 
 `test_parity.py` compares `tk_xpu.<op>` against PyTorch's own XPU kernels
@@ -50,7 +50,24 @@ is sound; only the static-archive linkage was the problem.
 
 ## Ops exposed
 
-`gelu` (erf/tanh), `silu`, `softmax`, `rms_norm`, `layernorm`, `dense_gemm`,
-`attention` (flash, GQA, causal), `argmax`, plus `device_count`. Each routes
-`Variant::best` where both a native SYCL and a oneDNN variant exist. Extending to
-more ops is one wrapper function per op in `tk_xpu_ext.sycl`.
+`gelu` (erf/tanh), manual `gelu_backward`, `silu`, `softmax`, `rms_norm`,
+`fused_add_rms_norm`, `layernorm`, `dense_gemm`, `fp8_gemm_w8a16`,
+`nvfp4_gemm`, `nvfp4_moe`, `qwen_gdn_decode`, `attention` (flash, GQA,
+causal), `argmax`, plus `device_count`. Each routes `Variant::best` where both
+a native SYCL and a oneDNN variant exist.
+
+This binding is inference-first and does not register PyTorch autograd formulas
+for its forward operators. Passing a tensor with `requires_grad=True` therefore
+does not create a supported QuixiCore gradient path. Call `gelu_backward`
+explicitly when that primitive is needed; full training support would require
+registered autograd formulas and backward kernels for the remaining operations.
+
+`XPUGraph` captures and replays the current PyTorch XPU stream without a
+device-wide synchronization. Inputs and outputs retain their addresses across
+replay, so callers must mutate existing tensor storage rather than replace the
+tensors. Multi-device collectives remain outside each rank's captured graph.
+The wrapper exposes explicit `instantiate`, reset-safe stream lifetime, pool
+validation, and the underlying graph debug controls.
+Graph-captured split MoE also requires caller-owned persistent fp32 scratch with
+shape `[M * top_k, 2 * I]`; pass it as `split_scratch` and retain it for the
+graph's lifetime. Eager split MoE allocates scratch automatically when omitted.

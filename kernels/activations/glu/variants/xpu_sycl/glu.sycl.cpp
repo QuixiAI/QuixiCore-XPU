@@ -12,6 +12,14 @@ namespace {
 
 constexpr std::size_t kRowThreads = 256;
 
+// tanh GELU approximation (matches embeddinggemma.c ei_gelu_tanh); distinct from
+// detail::geluf, which is the erf form used by glu mode=geglu.
+inline float gelu_tanh(float x) {
+  constexpr float a = 0.044715f;
+  constexpr float s = 0.79788456080286535587989211986876f;
+  return 0.5f * x * (1.0f + sycl::tanh(s * x * (1.0f + a * x * x)));
+}
+
 inline float act(float x, int mode) {
   switch (mode) {
     case 0:
@@ -61,6 +69,24 @@ sycl::event glu_typed(sycl::queue& q, const T* x, T* out, std::size_t rows,
   });
 }
 
+// GEGLU -> f16: gelu_tanh(gate) * value, converted to f16. One work-item per
+// output element ([rows, d] range avoids the div/mod of a flat id); reads the
+// two dt input halves, computes in fp32, stores f16. Mirrors the
+// embeddinggemma.c launch_up_gate_gelu_half epilogue (following glus [gate,
+// value] half order rather than the source [up, gate]; the product is identical).
+template <typename T>
+sycl::event glu_gelu_f16_typed(sycl::queue& q, const T* x, half_t* out,
+                               std::size_t rows, std::size_t d) {
+  return q.parallel_for(sycl::range<2>(rows, d), [=](sycl::id<2> idx) {
+    const std::size_t row = idx[0];
+    const std::size_t col = idx[1];
+    const T* gate = x + row * 2 * d;
+    const T* val = gate + d;
+    out[row * d + col] = static_cast<half_t>(
+        gelu_tanh(static_cast<float>(gate[col])) * static_cast<float>(val[col]));
+  });
+}
+
 }  // namespace
 
 sycl::event glu_sycl(sycl::queue& q, const void* x, void* out, std::size_t rows,
@@ -75,6 +101,21 @@ sycl::event glu_sycl(sycl::queue& q, const void* x, void* out, std::size_t rows,
     case DType::bf16:
       return glu_typed(q, static_cast<const bf16_t*>(x), static_cast<bf16_t*>(out),
                        rows, d, mode);
+  }
+  return {};
+}
+
+
+sycl::event glu_gelu_f16_sycl(sycl::queue& q, const void* x, void* out,
+                              std::size_t rows, std::size_t d, DType dt) {
+  auto* o = static_cast<half_t*>(out);
+  switch (dt) {
+    case DType::f32:
+      return glu_gelu_f16_typed(q, static_cast<const float*>(x), o, rows, d);
+    case DType::f16:
+      return glu_gelu_f16_typed(q, static_cast<const half_t*>(x), o, rows, d);
+    case DType::bf16:
+      return glu_gelu_f16_typed(q, static_cast<const bf16_t*>(x), o, rows, d);
   }
   return {};
 }

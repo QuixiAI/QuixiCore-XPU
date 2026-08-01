@@ -12,6 +12,7 @@
 #include "quantization/nvfp4_gemv/nvfp4_kernel.hpp"
 #include "quantization/qgemm/qgemm_kernel.hpp"
 #include "quantization/qgemv/qgemv_kernel.hpp"
+#include "quantization/w4a16_gemm/w4a16_gemm_kernel.hpp"
 
 namespace quixicore::xpu::ops {
 
@@ -40,6 +41,16 @@ void nvfp4_gemv(sycl::queue& q, const void* w_packed, const void* block_scales,
   sycl::event ev = kernels::nvfp4_gemv_sycl(q, w_packed, block_scales,
                                             global_scale, x, y, N, K, act_dt);
   if (blocking) ev.wait();
+}
+
+void nvfp4_gemm(sycl::queue &q, const void *w_packed, const void *block_scales, float global_scale,
+                const void *x, void *y, std::size_t M, std::size_t N, std::size_t K, DType act_dt,
+                Variant variant, bool blocking) {
+  (void)variant;
+  sycl::event ev =
+      kernels::nvfp4_gemm_sycl(q, w_packed, block_scales, global_scale, x, y, M, N, K, act_dt);
+  if (blocking)
+    ev.wait();
 }
 
 void quantize_int4_group(sycl::queue& q, const void* w, void* w_packed,
@@ -84,6 +95,25 @@ void fp8_gemm(sycl::queue& q, const void* a_fp8, const void* b_fp8, void* c,
 #endif
 }
 
+void fp8_gemm_w8a16(sycl::queue &q, const void *activations, const void *weight_fp8,
+                    const float *weight_scale, void *out, std::size_t M, std::size_t N,
+                    std::size_t K, Fp8Kind kind, bool per_channel, DType act_dt, Variant variant,
+                    bool blocking) {
+  const int fp8_kind = static_cast<int>(kind);
+  if (variant == Variant::vendor || (variant == Variant::best && M > 1)) {
+#if defined(QUIXICORE_XPU_HAS_ONEDNN)
+    if (kernels::fp8_gemm_w8a16_onednn(q, activations, weight_fp8, weight_scale, per_channel, out,
+                                       M, N, K, fp8_kind, act_dt)) {
+      return;
+    }
+#endif
+  }
+  sycl::event ev = kernels::fp8_gemm_w8a16_sycl(q, activations, weight_fp8, weight_scale,
+                                                per_channel, out, M, N, K, fp8_kind, act_dt);
+  if (blocking)
+    ev.wait();
+}
+
 void fp8_encode(sycl::queue& q, const float* in, void* out_fp8, std::size_t n,
                 Fp8Kind kind, bool blocking) {
   (void)blocking;
@@ -112,6 +142,16 @@ void qgemv_int4(sycl::queue& q, const void* w_packed, const void* scales,
   (void)variant;  // native only
   sycl::event ev =
       kernels::qgemv_int4_sycl(q, w_packed, scales, x, y, N, K, group, act_dt);
+  if (blocking) ev.wait();
+}
+
+void w4a16_gemm(sycl::queue& q, const void* A, const void* w_packed,
+                const void* scales, void* C, std::size_t M, std::size_t N,
+                std::size_t K, std::size_t group, DType act_dt, Variant variant,
+                bool blocking) {
+  (void)variant;  // native DPAS joint_matrix only
+  sycl::event ev = kernels::w4a16_gemm_sycl(q, A, w_packed, scales, C, M, N, K,
+                                            group, act_dt);
   if (blocking) ev.wait();
 }
 

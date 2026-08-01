@@ -8,13 +8,21 @@
 #   2. The binding source must end in `.sycl` so torch's SyclExtension compiles it
 #      with -fsycl and performs the SYCL device link at the end.
 #
-# Prereqs: `source /opt/intel/oneapi/setvars.sh`, the .venv with torch+xpu active,
-# and `pip install ninja` (SyclExtension requires ninja).
+# Prereqs: `source /opt/intel/oneapi/setvars.sh` and ninja installed in the
+# repository `.venv` (SyclExtension requires ninja).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 BUILD="$REPO/build-sycl-shared"
+PYTHON="${PYTHON:-$REPO/.venv/bin/python}"
+
+if [[ ! -x "$PYTHON" ]]; then
+  echo "Missing Python environment: $PYTHON" >&2
+  echo "Set PYTHON=/path/to/python or create $REPO/.venv" >&2
+  exit 1
+fi
+export PATH="$(dirname "$PYTHON"):$PATH"
 
 echo ">> Building shared ops lib (icpx -fsycl) in $BUILD"
 cmake -S "$REPO" -B "$BUILD" -G "Unix Makefiles" \
@@ -25,6 +33,6 @@ cmake --build "$BUILD" -j"$(nproc)" --target quixicore_xpu_ops
 
 echo ">> Building the tk_xpu extension"
 cd "$HERE"
-python setup.py build_ext --inplace
+"$PYTHON" setup.py build_ext --inplace
 
-echo ">> Done. Run:  python test_parity.py"
+echo ">> Done. Run:  $PYTHON $HERE/test_parity.py"

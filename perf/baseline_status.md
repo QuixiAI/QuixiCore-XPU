@@ -58,6 +58,7 @@ the per-kernel history and the 2026-07-07 optimization pass (before → after).
 | sample_categorical | 0.87 ms | — | work-group-per-row (was 45.6 ms, 52x) |
 | quantize_int4 | 121 GB/s | 27% | vectorized (was 43 / 9.5%) |
 | qgemv_int4 / gguf / mxfp4 / nvfp4 | 60–116 GB/s weight-bw | 13–25% | decode coalescing = next pass |
+| nvfp4_moe split, M1–16/top8 | 256–313 GB/s weight-bw | 56–69% | 2026-07-11 vector loads + paired gate/up + output-row tiling (was 158–185) |
 
 ## Per-family status
 
