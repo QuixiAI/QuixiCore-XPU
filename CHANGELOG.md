@@ -12,6 +12,9 @@ All notable QuixiCore XPU changes should be recorded here.
 - causal_conv1d_decode: depthwise causal conv decode update (width <= 8)
   with in-place shift-append state, both serving layouts via strides, and
   null-slot semantics. Graph-capture-safe.
+- ssd_prefill: varlen Mamba-2 SSD prefill selective scan (sequential
+  xpu_sycl_seq variant, SLM-resident state rows, softplus + dt_limit clamp,
+  caller-owned state gather/scatter). Graph-capture-safe.
 
 ### Kernel families — breadth
 

@@ -362,6 +362,27 @@ operations:
     benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel ssd_decode --M batch --N slots"}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/ssm/ssd/variants/xpu_sycl}
+  ssd_prefill:
+    family: ssm
+    status: implemented
+    path: kernels/ssm/ssd
+    dtypes: [f32, f16, bf16]
+    shape: varlen Mamba-2 SSD prefill selective scan
+    note: >-
+      Sequential-over-tokens variant (xpu_sycl_seq): one work-group per
+      (seq, head), one lane per headdim row with its dstate state row in SLM;
+      fp32 recurrence with softplus + dt_limit clamp; cu_seqlens varlen with
+      empty sequences passing state through. Initial states are caller-
+      pre-gathered and final states caller-scattered (keeps the kernel free of
+      slot indirection and capture-safe). Requires headdim*dstate*4 B SLM and
+      headdim lanes per work-group; out-of-envelope shapes rejected without
+      launching. A chunked parallel-scan variant is the planned throughput
+      upgrade. Adapted from the QuixiAI MIT decode kernel set proven in vLLM
+      XPU serving (NemotronH prefill path).
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel ssd_prefill --M tokens --rows seqs"}
+    variants:
+      - {name: xpu_sycl_seq, status: implemented, path: kernels/ssm/ssd/variants/xpu_sycl}
   causal_conv1d_decode:
     family: ssm
     status: implemented

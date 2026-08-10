@@ -2341,3 +2341,47 @@ bf16 act / f32 state, median of 5 interleaved batches):
 At batch 96 the kernel moves ~13.8 MB in 45.5 us — ~66% of the ~456 GB/s
 roofline; adequate for a kernel this small (it is ~1.6% of the ssd_decode step
 cost at the same batch). Decision: **keep** — port baseline, correctness-first.
+
+## 2026-08-09: Port ssd_prefill (varlen Mamba-2 SSD prefill scan) from the vLLM XPU serving work
+
+Provenance: adapted from the QuixiAI MIT decode kernel set
+(`vllm-xpu-kernels csrc/xpu/sycl/decode/mamba2_ssd_prefill_kernel.hpp`, commit
+dffcab7) — the kernel that replaced ssd_torch.py's Python token/chunk loop in
+NemotronH prefill. MIT-to-MIT adaptation; deviations: `has_D`/`has_initial`
+bools became nullable pointers, and the SLM / work-group envelope
+(headdim*dstate*4 B, headdim lanes) is validated against the device at
+dispatch (reject, don't corrupt).
+
+Kernel + route: `ops::ssd_prefill` ->
+`kernels/ssm/ssd/variants/xpu_sycl/ssd_prefill.sycl.cpp` (variant
+xpu_sycl_seq). One work-group per (seq, head); each lane's dstate state row
+lives in SLM, the token loop is sequential (the recurrence is serial in t);
+softplus + dt_limit clamp; caller-owned initial/varlen state gather/scatter.
+Graph-capture-safe.
+
+Correctness: `check_ssd_prefill` in tests/xpu_ops_smoke.cpp. fp64 oracle for
+per-token outputs (rtol scaled by sqrt(dstate)); the final-state expectation
+replicates the kernel's fp32 SLM chain exactly (only the final store rounds to
+StateT). Ragged lengths {5, 0, 9} — the empty sequence passes its initial
+state through untouched — init vs zero-init, dt_limit clamp engaged, GQA group
+broadcast. act x state {f32,bf16} x {f32,bf16}: all worst_out = worst_state = 0.
+Full smoke suite: PASS.
+
+Measurement (Arc Pro B60 device 0, oneAPI icpx, Level Zero; harness
+`--kernel ssd_prefill --iters 20 --warmup 5`, NemotronH TP2 slice nheads=64
+headdim=64 dstate=128 ngroups=4, bf16 act / f32 state):
+
+| tokens | seqs | median ms | us/token |
+|---:|---:|---:|---:|
+| 512  | 1  | 5.38  | 10.5 |
+| 2048 | 1  | 22.67 | 11.1 |
+| 8192 | 1  | 90.59 | 11.1 |
+| 8192 | 16 | 68.57 | 8.4  |
+
+Single-sequence occupancy is only nheads (64) work-groups, so per-token cost
+is nearly flat in T; 16 parallel sequences recover ~24%. This is the expected
+profile for the sequential variant — the baseline the torch path could never
+reach (per-token Python-loop kernel launches), and the yardstick the planned
+chunked parallel-scan variant (ssd_torch._prefill_chunked tiling) must beat.
+Decision: **keep** — port baseline, correctness-first; chunked variant is the
+follow-up throughput lever with a cross-variant equality gate.

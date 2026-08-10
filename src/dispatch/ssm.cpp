@@ -35,6 +35,22 @@ void ssd_decode(sycl::queue& q, void* state, const void* x, const float* dt_raw,
   if (blocking) ev.wait();
 }
 
+void ssd_prefill(sycl::queue& q, const void* x, const float* dt_raw,
+                 const float* A, const void* B, const void* C, const float* D,
+                 const float* dt_bias, const std::int32_t* cu_seqlens,
+                 const void* initial_states, void* out, void* varlen_states,
+                 bool dt_softplus, float dt_lo, float dt_hi, std::size_t batch,
+                 std::size_t nheads, std::size_t headdim, std::size_t dstate,
+                 std::size_t ngroups, DType act_dt, DType state_dt,
+                 Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::ssd_prefill_sycl(
+      q, x, dt_raw, A, B, C, D, dt_bias, cu_seqlens, initial_states, out,
+      varlen_states, dt_softplus, dt_lo, dt_hi, batch, nheads, headdim, dstate,
+      ngroups, act_dt, state_dt);
+  if (blocking) ev.wait();
+}
+
 void causal_conv1d_decode(sycl::queue& q, void* conv_state, const void* x,
                           const void* weight, const void* bias,
                           const std::int32_t* indices, void* out, bool silu,

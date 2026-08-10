@@ -764,6 +764,136 @@ bool check_causal_conv1d_decode(sycl::queue& q, DType act_dt, DType state_dt,
   return ok;
 }
 
+// Varlen Mamba-2 SSD prefill. fp64 oracle for the per-token output reduction;
+// the final-state expectation replicates the kernel's fp32 SLM chain exactly
+// (only the final store rounds to StateT). Covers ragged lengths including an
+// empty sequence (state passes through), initial-state seeding vs zero init,
+// dt_limit clamping, and the GQA group broadcast.
+template <typename T, typename StateT>
+bool check_ssd_prefill(sycl::queue& q, DType act_dt, DType state_dt,
+                       bool with_init) {
+  const std::size_t batch = 3, nheads = 8, headdim = 32, dstate = 64,
+                    ngroups = 2;
+  const std::int32_t lens[batch] = {5, 0, 9};
+  std::int32_t qsl_h[batch + 1] = {0};
+  for (std::size_t s = 0; s < batch; ++s) qsl_h[s + 1] = qsl_h[s] + lens[s];
+  const std::size_t T_total = static_cast<std::size_t>(qsl_h[batch]);
+  const float dt_lo = 0.0f, dt_hi = 0.25f;  // exercises the clamp
+  const std::size_t st_elems = batch * nheads * headdim * dstate;
+
+  T* x = sycl::malloc_shared<T>(T_total * nheads * headdim, q);
+  T* B = sycl::malloc_shared<T>(T_total * ngroups * dstate, q);
+  T* C = sycl::malloc_shared<T>(T_total * ngroups * dstate, q);
+  T* out = sycl::malloc_shared<T>(T_total * nheads * headdim, q);
+  float* dt_raw = sycl::malloc_shared<float>(T_total * nheads, q);
+  float* A = sycl::malloc_shared<float>(nheads, q);
+  float* dt_bias = sycl::malloc_shared<float>(nheads, q);
+  float* D = sycl::malloc_shared<float>(nheads * headdim, q);
+  std::int32_t* qsl = sycl::malloc_shared<std::int32_t>(batch + 1, q);
+  StateT* init = sycl::malloc_shared<StateT>(st_elems, q);
+  StateT* vstates = sycl::malloc_shared<StateT>(st_elems, q);
+
+  for (std::size_t i = 0; i < T_total * nheads * headdim; ++i) {
+    x[i] = static_cast<T>(sample(i + 3));
+    out[i] = static_cast<T>(-99.0f);  // sentinel: empty seq writes nothing
+  }
+  for (std::size_t i = 0; i < T_total * ngroups * dstate; ++i) {
+    B[i] = static_cast<T>(sample(i + 5));
+    C[i] = static_cast<T>(sample(i + 7));
+  }
+  for (std::size_t i = 0; i < T_total * nheads; ++i)
+    dt_raw[i] = 0.6f * sample(i + 11);  // some exceed dt_hi after softplus
+  for (std::size_t h = 0; h < nheads; ++h) {
+    A[h] = -0.5f - 0.5f * std::abs(sample(h + 13));
+    dt_bias[h] = 0.2f * sample(h + 17);
+  }
+  for (std::size_t i = 0; i < nheads * headdim; ++i) D[i] = sample(i + 19);
+  for (std::size_t s = 0; s <= batch; ++s) qsl[s] = qsl_h[s];
+  for (std::size_t i = 0; i < st_elems; ++i) {
+    init[i] = static_cast<StateT>(0.25f * sample(i + 23));
+    vstates[i] = static_cast<StateT>(0.0f);
+  }
+
+  ops::ssd_prefill(q, x, dt_raw, A, B, C, D, dt_bias, qsl,
+                   with_init ? init : nullptr, out, vstates,
+                   /*dt_softplus=*/true, dt_lo, dt_hi, batch, nheads, headdim,
+                   dstate, ngroups, act_dt, state_dt, Variant::sycl,
+                   /*blocking=*/true);
+
+  const Tol tol = tol_for(act_dt);
+  const Tol stol = tol_for(state_dt);
+  const double rtol = tol.rtol * std::sqrt(static_cast<double>(dstate)) + 5e-3;
+  const std::size_t hpg = nheads / ngroups;
+  double worst_out = 0.0, worst_state = 0.0;
+  std::vector<double> srow_d(dstate);
+  std::vector<float> srow_f(dstate);
+  for (std::size_t s = 0; s < batch; ++s) {
+    for (std::size_t h = 0; h < nheads; ++h) {
+      const std::size_t g = h / hpg;
+      for (std::size_t d = 0; d < headdim; ++d) {
+        const std::size_t st_base =
+            ((s * nheads + h) * headdim + d) * dstate;
+        for (std::size_t n = 0; n < dstate; ++n) {
+          const double iv =
+              with_init ? static_cast<double>(init[st_base + n]) : 0.0;
+          srow_d[n] = iv;
+          srow_f[n] = static_cast<float>(iv);
+        }
+        for (std::int32_t t = qsl_h[s]; t < qsl_h[s + 1]; ++t) {
+          const std::size_t ti = static_cast<std::size_t>(t);
+          double dt_h = static_cast<double>(dt_raw[ti * nheads + h]) +
+                        static_cast<double>(dt_bias[h]);
+          dt_h = dt_h <= 20.0 ? std::log(1.0 + std::exp(dt_h)) : dt_h;
+          dt_h = std::min(std::max(dt_h, (double)dt_lo), (double)dt_hi);
+          const double dA = std::exp(dt_h * static_cast<double>(A[h]));
+          float dt_f = dt_raw[ti * nheads + h] + dt_bias[h];
+          dt_f = dt_f <= 20.0f ? std::log(1.0f + std::exp(dt_f)) : dt_f;
+          dt_f = std::min(std::max(dt_f, dt_lo), dt_hi);
+          const float dA_f = std::exp(dt_f * A[h]);
+          const std::size_t xi = (ti * nheads + h) * headdim + d;
+          const double xv = static_cast<double>(x[xi]);
+          const float xv_f = static_cast<float>(x[xi]);
+          double y = 0.0;
+          for (std::size_t n = 0; n < dstate; ++n) {
+            const std::size_t bi = (ti * ngroups + g) * dstate + n;
+            srow_d[n] = srow_d[n] * dA +
+                        dt_h * xv * static_cast<double>(B[bi]);
+            srow_f[n] = srow_f[n] * dA_f +
+                        dt_f * xv_f * static_cast<float>(B[bi]);
+            y += srow_d[n] * static_cast<double>(C[bi]);
+          }
+          y += static_cast<double>(D[h * headdim + d]) * xv;
+          const double ref = static_cast<double>(static_cast<T>(y));
+          worst_out = std::max(worst_out,
+                               std::abs(static_cast<double>(out[xi]) - ref) -
+                                   (tol.atol + rtol * std::abs(ref)));
+        }
+        for (std::size_t n = 0; n < dstate; ++n) {
+          const double sref =
+              static_cast<double>(static_cast<StateT>(srow_f[n]));
+          const double got = static_cast<double>(vstates[st_base + n]);
+          worst_state = std::max(worst_state,
+                                 std::abs(got - sref) -
+                                     (stol.atol + stol.rtol * std::abs(sref)));
+        }
+      }
+    }
+  }
+
+  sycl::free(x, q); sycl::free(B, q); sycl::free(C, q); sycl::free(out, q);
+  sycl::free(dt_raw, q); sycl::free(A, q); sycl::free(dt_bias, q);
+  sycl::free(D, q); sycl::free(qsl, q); sycl::free(init, q);
+  sycl::free(vstates, q);
+
+  const bool ok = worst_out <= 0.0 && worst_state <= 0.0;
+  std::cout << "  ssd_prefill act=" << dtype_name(act_dt)
+            << " state=" << dtype_name(state_dt)
+            << (with_init ? " init" : " zero-init")
+            << " worst_out=" << worst_out << " worst_state=" << worst_state
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 bool check_collectives() {
   const std::size_t count = 4096;
   std::vector<float> in(8 * count), out(count, 0.0f);
@@ -2992,6 +3122,12 @@ int main() {
   failures += check_ssd_decode<bf16_t, float>(q, DType::bf16, DType::f32) ? 0 : 1;
   failures += check_ssd_decode<bf16_t, bf16_t>(q, DType::bf16, DType::bf16) ? 0 : 1;
   failures += check_ssd_decode<half_t, float>(q, DType::f16, DType::f32) ? 0 : 1;
+
+  // ssm: varlen Mamba-2 SSD prefill (ragged lengths incl. an empty sequence).
+  failures += check_ssd_prefill<float, float>(q, DType::f32, DType::f32, true) ? 0 : 1;
+  failures += check_ssd_prefill<bf16_t, float>(q, DType::bf16, DType::f32, true) ? 0 : 1;
+  failures += check_ssd_prefill<bf16_t, float>(q, DType::bf16, DType::f32, false) ? 0 : 1;
+  failures += check_ssd_prefill<bf16_t, bf16_t>(q, DType::bf16, DType::bf16, true) ? 0 : 1;
 
   // ssm: depthwise causal conv1d decode (both serving layouts via strides).
   failures += check_causal_conv1d_decode<float, float>(q, DType::f32, DType::f32,

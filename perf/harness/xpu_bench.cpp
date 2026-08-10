@@ -576,6 +576,51 @@ int main(int argc, char** argv) {
     sycl::free(dt_bias, q); sycl::free(D, q); sycl::free(idx, q);
     return 0;
   }
+  if (kernel == "ssd_prefill") {
+    // Varlen SSD prefill: --M packed tokens split across --rows equal
+    // sequences, NemotronH TP2 slice (nheads 64, headdim 64, dstate 128,
+    // ngroups 4), f32 states, act dtype = --dtype.
+    const std::size_t tokens = M;
+    const std::size_t nseq = std::max<std::size_t>(1, std::min(rows, tokens));
+    const std::size_t nheads = 64, headdim = 64, dstate = 128, ngroups = 4;
+    void *x = sycl::malloc_device(tokens * nheads * headdim * elem, q);
+    void *B = sycl::malloc_device(tokens * ngroups * dstate * elem, q);
+    void *C = sycl::malloc_device(tokens * ngroups * dstate * elem, q);
+    void *out = sycl::malloc_device(tokens * nheads * headdim * elem, q);
+    float *dt_raw = sycl::malloc_device<float>(tokens * nheads, q);
+    float *A = sycl::malloc_shared<float>(nheads, q);
+    float *dt_bias = sycl::malloc_device<float>(nheads, q);
+    float *D = sycl::malloc_device<float>(nheads * headdim, q);
+    int *qsl = sycl::malloc_shared<int>(nseq + 1, q);
+    float *vstates = sycl::malloc_device<float>(nseq * nheads * headdim * dstate, q);
+    q.memset(x, 0, tokens * nheads * headdim * elem).wait();
+    q.memset(B, 0, tokens * ngroups * dstate * elem).wait();
+    q.memset(C, 0, tokens * ngroups * dstate * elem).wait();
+    q.memset(dt_raw, 0, tokens * nheads * sizeof(float)).wait();
+    q.memset(dt_bias, 0, nheads * sizeof(float)).wait();
+    q.memset(D, 0, nheads * headdim * sizeof(float)).wait();
+    for (std::size_t h = 0; h < nheads; ++h) A[h] = -1.0f;
+    for (std::size_t s = 0; s <= nseq; ++s)
+      qsl[s] = static_cast<int>(s * tokens / nseq);
+    auto once = [&] {
+      kernels::ssd_prefill_sycl(q, x, dt_raw, A, B, C, D, dt_bias, qsl,
+                                nullptr, out, vstates, true, 0.0f, 1e9f, nseq,
+                                nheads, headdim, dstate, ngroups, dt,
+                                DType::f32);
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    std::cout << "{\"schema_version\":2,\"kernel\":\"ssd_prefill\","
+              << "\"variant\":\"sycl\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"tokens\":" << tokens << ",\"seqs\":" << nseq
+              << ",\"iters\":" << iters << ",\"median_ms\":" << timing.median_ms
+              << ",\"min_ms\":" << timing.min_ms << ",\"max_ms\":" << timing.max_ms
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}"
+              << std::endl;
+    sycl::free(x, q); sycl::free(B, q); sycl::free(C, q); sycl::free(out, q);
+    sycl::free(dt_raw, q); sycl::free(A, q); sycl::free(dt_bias, q);
+    sycl::free(D, q); sycl::free(qsl, q); sycl::free(vstates, q);
+    return 0;
+  }
   if (kernel == "causal_conv1d_decode") {
     // Mamba-2 conv decode step: batch = --M rows, --dim channels, width-4
     // taps, --N state slots, f32 state, act dtype = --dtype.

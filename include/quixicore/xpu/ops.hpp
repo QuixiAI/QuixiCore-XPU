@@ -361,6 +361,28 @@ void ssd_decode(sycl::queue& q, void* state, const void* x, const float* dt_raw,
                 std::int64_t s3, DType act_dt, DType state_dt,
                 Variant variant = Variant::sycl, bool blocking = true);
 
+// Varlen Mamba-2 SSD prefill selective scan (sequential-over-tokens variant).
+// x and out are [T, nheads, headdim] of dtype act_dt where T is the packed
+// token count; dt_raw [T, nheads], A and dt_bias [nheads], D [nheads, headdim]
+// (nullptr = skip) are f32; B and C are [T, ngroups, dstate] act_dt;
+// cu_seqlens is [batch+1] int32 packed token offsets. initial_states
+// [batch, nheads, headdim, dstate] of dtype state_dt seeds each sequence
+// (nullptr = zero); the final state per sequence is written to varlen_states
+// (same shape). The caller owns the cache gather/scatter of those states —
+// that split keeps the kernel free of slot indirection and capture-safe.
+// dt_h = clamp(softplus(dt_raw + dt_bias), dt_lo, dt_hi); recurrence in fp32
+// with each lane's state row of dstate held in shared local memory. Requires
+// headdim*dstate*4 bytes of SLM per work-group and headdim lanes; shapes
+// outside the device envelope are rejected without launching.
+void ssd_prefill(sycl::queue& q, const void* x, const float* dt_raw,
+                 const float* A, const void* B, const void* C, const float* D,
+                 const float* dt_bias, const std::int32_t* cu_seqlens,
+                 const void* initial_states, void* out, void* varlen_states,
+                 bool dt_softplus, float dt_lo, float dt_hi, std::size_t batch,
+                 std::size_t nheads, std::size_t headdim, std::size_t dstate,
+                 std::size_t ngroups, DType act_dt, DType state_dt,
+                 Variant variant = Variant::sycl, bool blocking = true);
+
 // Depthwise causal conv1d decode update (Mamba-2 conv stage), one token per
 // sequence. conv_state is [nslots, dim, state_len] of dtype state_dt with
 // element strides cs0..cs2 (both the dim-major and the len-major serving
