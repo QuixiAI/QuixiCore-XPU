@@ -591,6 +591,18 @@ void selective_scan(sycl::queue& q, const void* u, const void* delta,
                     std::size_t state, DType dt, Variant variant = Variant::sycl,
                     bool blocking = true);
 
+// DeepSeek-V4 manifold hyper-connections, post stage (contract
+// dsv4_hc_post): out[t,o,h] = sum_i comb_res_mix[t,i,o] * residual[t,i,h]
+// + post_mix[t,o] * x[t,h]. residual/out [tokens, n_streams, hidden] dtype
+// dt (n_streams <= 8; 4 for DSV4), x [tokens, hidden], mixes fp32. The pre
+// (Sinkhorn-gated) and comb stages are deferred pending a DSV4 bring-up —
+// see the D-wave ledger.
+void dsv4_hc_post(sycl::queue& q, const float* comb_res_mix,
+                  const void* residual, const float* post_mix, const void* x,
+                  void* out, std::size_t tokens, std::size_t n_streams,
+                  std::size_t hidden, DType dt,
+                  Variant variant = Variant::sycl, bool blocking = true);
+
 // Mamba-2 SSD decode (selective-state-update, scalar-A-per-head), one token per
 // sequence. state is [nslots, nheads, headdim, dstate] of dtype state_dt with
 // element strides s0..s3 (strided serving views are accepted); x and out are

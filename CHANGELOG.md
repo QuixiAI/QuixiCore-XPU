@@ -36,6 +36,8 @@ All notable QuixiCore XPU changes should be recorded here.
 - turboquant: KV-cache codec encode/decode implementing the format v2 ABI
   (rotated Lloyd-Max keys or e4m3 byte keys, per-group uniform values,
   LSB-first packing), byte-identical to the host-shared codec oracle.
+- dsv4_hc_post: DSV4 hyper-connections post-stage contraction; pre/comb
+  stay planned pending a DSV4 bring-up.
 - lora_apply (shrink + expand): batched-gather LoRA matvecs with slice and
   accumulate forms, -1 no-adapter skip.
 - top_k_renorm / top_p_renorm: sampling renormalization (pivot-tie top-k,

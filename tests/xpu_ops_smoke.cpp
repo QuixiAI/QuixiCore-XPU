@@ -1105,6 +1105,48 @@ bool check_causal_conv1d_prefill(sycl::queue& q, DType act_dt, DType state_dt,
   return ok;
 }
 
+// DSV4 hyper-connections post stage: fp64 oracle of the documented
+// contraction over the stream axis.
+template <typename T>
+bool check_dsv4_hc_post(sycl::queue& q, DType dt) {
+  const std::size_t Tk = 12, S = 4, H = 96;
+  float* comb = sycl::malloc_shared<float>(Tk * S * S, q);
+  T* res = sycl::malloc_shared<T>(Tk * S * H, q);
+  float* pm = sycl::malloc_shared<float>(Tk * S, q);
+  T* x = sycl::malloc_shared<T>(Tk * H, q);
+  T* out = sycl::malloc_shared<T>(Tk * S * H, q);
+  for (std::size_t i = 0; i < Tk * S * S; ++i) comb[i] = 0.3f * sample(i + 3);
+  for (std::size_t i = 0; i < Tk * S * H; ++i)
+    res[i] = static_cast<T>(sample(i + 5));
+  for (std::size_t i = 0; i < Tk * S; ++i) pm[i] = 0.3f * sample(i + 7);
+  for (std::size_t i = 0; i < Tk * H; ++i) x[i] = static_cast<T>(sample(i + 11));
+
+  ops::dsv4_hc_post(q, comb, res, pm, x, out, Tk, S, H, dt, Variant::sycl,
+                    true);
+
+  const Tol tol = tol_for(dt);
+  double worst = 0.0;
+  for (std::size_t t = 0; t < Tk; ++t)
+    for (std::size_t o = 0; o < S; ++o)
+      for (std::size_t h = 0; h < H; ++h) {
+        double acc = static_cast<double>(pm[t * S + o]) *
+                     static_cast<double>(x[t * H + h]);
+        for (std::size_t i = 0; i < S; ++i)
+          acc += static_cast<double>(comb[(t * S + i) * S + o]) *
+                 static_cast<double>(res[(t * S + i) * H + h]);
+        const double ref = static_cast<double>(static_cast<T>(acc));
+        const double got = static_cast<double>(out[(t * S + o) * H + h]);
+        worst = std::max(worst, std::abs(got - ref) -
+                                    (tol.atol + 3 * tol.rtol * std::abs(ref)));
+      }
+  sycl::free(comb, q); sycl::free(res, q); sycl::free(pm, q);
+  sycl::free(x, q); sycl::free(out, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  dsv4_hc_post dt=" << dtype_name(dt) << " worst=" << worst
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // LoRA BGMV. fp64 oracle of shrink -> expand (slice + accumulate) with
 // per-row adapter selection incl. -1 (shrink zeros; expand leaves the base
 // output untouched).
@@ -4987,6 +5029,10 @@ int main() {
                                                          false, false, false) ? 0 : 1;
   failures += check_causal_conv1d_decode<half_t, float>(q, DType::f16, DType::f32,
                                                         true, false, true) ? 0 : 1;
+
+  // ssm: DSV4 hyper-connections post stage.
+  failures += check_dsv4_hc_post<float>(q, DType::f32) ? 0 : 1;
+  failures += check_dsv4_hc_post<bf16_t>(q, DType::bf16) ? 0 : 1;
 
   // matmul: LoRA BGMV shrink + expand (slice + accumulate).
   failures += check_lora<float>(q, DType::f32) ? 0 : 1;

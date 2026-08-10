@@ -3,6 +3,7 @@
 #include "quixicore/xpu/ops.hpp"
 
 #include "ssm/causal_conv1d/causal_conv1d_kernel.hpp"
+#include "ssm/dsv4_hc/dsv4_hc_kernel.hpp"
 #include "ssm/selective_scan/selective_scan_kernel.hpp"
 #include "ssm/ssd/ssd_kernel.hpp"
 
@@ -83,6 +84,18 @@ void causal_conv1d_prefill(sycl::queue& q, void* conv_state, const void* x,
       q, conv_state, x, weight, bias, cu_seqlens, indices, has_init, out, silu,
       total_tokens, batch, dim, state_len, kernel, nslots, xs0, xs1, os0, os1,
       cs0, cs1, cs2, act_dt, state_dt);
+  if (blocking) ev.wait();
+}
+
+void dsv4_hc_post(sycl::queue& q, const float* comb_res_mix,
+                  const void* residual, const float* post_mix, const void* x,
+                  void* out, std::size_t tokens, std::size_t n_streams,
+                  std::size_t hidden, DType dt, Variant variant,
+                  bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::dsv4_hc_post_sycl(q, comb_res_mix, residual,
+                                              post_mix, x, out, tokens,
+                                              n_streams, hidden, dt);
   if (blocking) ev.wait();
 }
 

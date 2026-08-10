@@ -473,6 +473,22 @@ operations:
     benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel ssd_decode --M batch --N slots"}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/ssm/ssd/variants/xpu_sycl}
+  dsv4_hc_post:
+    family: ssm
+    status: implemented
+    path: kernels/ssm/dsv4_hc
+    dtypes: [f32, f16, bf16]
+    shape: DSV4 manifold hyper-connections, post stage
+    note: >-
+      out[t,o,h] = sum_i comb_res_mix[t,i,o] * residual[t,i,h] +
+      post_mix[t,o] * x[t,h] (n_streams <= 8; the documented contraction from
+      the vLLM mhc_post source, translated). dsv4_hc_pre (Sinkhorn-gated
+      projection) and dsv4_hc_comb remain planned: their algorithmic free
+      parameters cannot be validated without a DSV4 model — same
+      no-evidence-no-claim rule as the DeepSeek rope/indexer family.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/ssm/dsv4_hc/variants/xpu_sycl}
   ssd_prefill:
     family: ssm
     status: implemented

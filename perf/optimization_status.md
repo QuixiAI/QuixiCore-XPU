@@ -2888,3 +2888,15 @@ manifest, sources pinned in vllm-xpu-kernels (dffcab7 tree), to land as a
 coherent unit with a DeepSeek bring-up that can exercise real shapes and
 oracles. Mamba1 varlen selective_scan stays deferred for the same reason
 (superseded by native SSD for every model on the box).
+
+## 2026-08-10: Wave D — dsv4_hc_post landed; pre/comb deferred (ledger)
+
+dsv4_hc_post implements the mhc_post source's own documented formula (a pure
+stream-axis contraction, fp64-oracle-testable standalone); all green. The
+pre stage (RMS projection -> sigmoid -> SINKHORN gating -> weighted reduce,
+1051 lines with a split-K DPAS path) and the comb stage carry algorithmic
+free parameters (Sinkhorn iteration/normalization details) that only a real
+DSV4 model can validate — transliterating them would claim support without
+evidence. Both stay planned; sources pinned (vllm-xpu-kernels dffcab7); the
+D5 split-K rewrite design (bf16 joint_matrix on xmx_tile, caller scratch)
+is recorded in the plan for when the bring-up happens.
