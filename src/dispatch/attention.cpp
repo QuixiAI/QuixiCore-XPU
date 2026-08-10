@@ -3,6 +3,7 @@
 #include "quixicore/xpu/ops.hpp"
 
 #include "attention/attention/attention_kernel.hpp"
+#include "attention/mrope/mrope_kernel.hpp"
 #include "attention/paged_attention/paged_attention_kernel.hpp"
 #include "attention/rope/rope_kernel.hpp"
 
@@ -85,6 +86,32 @@ void paged_attention_prefill(
       is_prefill, total_q, batch, n_heads, n_kv_heads, d, page_size, max_pages,
       page_stride_elems, max_seqlen_k, sm_scale, causal, window_left,
       window_right, sinks, k_scale, v_scale, dt, static_cast<int>(kv_dt));
+  if (blocking) ev.wait();
+}
+
+void mrope(sycl::queue& q, void* query, void* key, const void* cos_sin_cache,
+           const std::int64_t* positions, const std::int32_t* sections,
+           std::size_t n_sections, std::size_t tokens, std::size_t n_heads,
+           std::size_t n_kv_heads, std::size_t head_size, std::size_t rot_dim,
+           bool neox, DType dt, Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::mrope_sycl(q, query, key, cos_sin_cache, positions,
+                                       sections, n_sections, tokens, n_heads,
+                                       n_kv_heads, head_size, rot_dim,
+                                       neox ? 1 : 0, dt);
+  if (blocking) ev.wait();
+}
+
+void rotary_positioned(sycl::queue& q, void* query, void* key,
+                       const void* cos_sin_cache,
+                       const std::int64_t* positions, std::size_t tokens,
+                       std::size_t n_heads, std::size_t n_kv_heads,
+                       std::size_t head_size, std::size_t rot_dim, bool neox,
+                       DType dt, Variant variant, bool blocking) {
+  (void)variant;  // single-section mrope
+  sycl::event ev = kernels::mrope_sycl(q, query, key, cos_sin_cache, positions,
+                                       nullptr, 1, tokens, n_heads, n_kv_heads,
+                                       head_size, rot_dim, neox ? 1 : 0, dt);
   if (blocking) ev.wait();
 }
 

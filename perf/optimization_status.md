@@ -2818,3 +2818,14 @@ all byte-identical. Suite PASS. No standalone bench (a memcpy-shaped
 scatter; covered by the serving family traffic numbers). With this, the
 paged KV story is closed end-to-end: write (this op), decode
 (paged_attention_decode), prefill (paged_attention_prefill).
+
+## 2026-08-10: mrope + rotary_positioned (C3 wave opens)
+
+Translated from vllm-xpu-kernels multimodal_rope.cpp (Apache): per-section
+position axes select the cos/sin row per rotary pair; rotary_positioned is
+the exact single-section degenerate form, so one kernel closes both
+contract names. fp64 oracle across NeoX/GPT-J with a rot_dim < head_size
+tail that must come back bit-equal; all zero excess, suite PASS.
+Correctness-first per-(token, head, pair) geometry; elementwise-bound, no
+standalone bench beyond the suite (RoPE-class ops are covered by the row
+kernels' vectorization pass when it lands).

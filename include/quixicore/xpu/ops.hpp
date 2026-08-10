@@ -132,6 +132,32 @@ void rope(sycl::queue& q, const void* x, void* out, std::size_t tokens,
           std::size_t pos0, DType dt, Variant variant = Variant::sycl,
           bool blocking = true);
 
+// Multimodal rotary embedding (M-RoPE, Qwen2-VL family). positions is
+// [n_sections, tokens] int64 — each rotary pair takes its cos/sin row from
+// the position axis owning it per the cumulative `sections` widths
+// ([n_sections] int32 device array summing to rot_dim/2, <= 4 sections).
+// cos_sin_cache is [max_pos, rot_dim] of dtype dt, cos half then sin half.
+// query [tokens, n_heads, head_size] and key [tokens, n_kv_heads, head_size]
+// rotate IN PLACE over rot_dim (NeoX half-split or GPT-J interleaved); the
+// tail past rot_dim is untouched. Graph-capture-safe.
+void mrope(sycl::queue& q, void* query, void* key, const void* cos_sin_cache,
+           const std::int64_t* positions, const std::int32_t* sections,
+           std::size_t n_sections, std::size_t tokens, std::size_t n_heads,
+           std::size_t n_kv_heads, std::size_t head_size, std::size_t rot_dim,
+           bool neox, DType dt, Variant variant = Variant::sycl,
+           bool blocking = true);
+
+// Positioned RoPE with an explicit per-token position array (contract
+// rotary_positioned): the single-section form of mrope — positions is
+// [tokens] int64, both mask conventions, same in-place layout rules.
+void rotary_positioned(sycl::queue& q, void* query, void* key,
+                       const void* cos_sin_cache,
+                       const std::int64_t* positions, std::size_t tokens,
+                       std::size_t n_heads, std::size_t n_kv_heads,
+                       std::size_t head_size, std::size_t rot_dim, bool neox,
+                       DType dt, Variant variant = Variant::sycl,
+                       bool blocking = true);
+
 // Flash-style scaled dot-product attention (online softmax; no materialized
 // score matrix). Q is [n_heads, seq_q, d]; K, V are [n_kv_heads, seq_k, d]
 // (GQA: q head h uses kv head h / (n_heads/n_kv_heads)); O is [n_heads, seq_q,

@@ -774,6 +774,22 @@ operations:
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/attention/rope/variants/xpu_sycl}
 
+  mrope:
+    family: attention
+    status: implemented
+    path: kernels/attention/mrope
+    dtypes: [f32, f16, bf16]
+    shape: multimodal rotary embedding (M-RoPE) + positioned RoPE
+    note: >-
+      Per-section position axes ([n_sections, tokens] int64, cumulative
+      section widths <= 4 summing to rot_dim/2), vLLM cos_sin_cache layout,
+      NeoX and GPT-J conventions, in-place q/k with an untouched tail past
+      rot_dim. The single-section form is exposed as rotary_positioned
+      (explicit per-token positions) — one kernel serves both contract
+      names. Translated from vllm-xpu-kernels multimodal_rope.cpp.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/attention/mrope/variants/xpu_sycl}
   paged_attention_decode:
     family: attention
     status: experimental

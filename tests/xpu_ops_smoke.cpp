@@ -1102,6 +1102,90 @@ bool check_causal_conv1d_prefill(sycl::queue& q, DType act_dt, DType state_dt,
   return ok;
 }
 
+// M-RoPE / positioned RoPE. fp64 oracle over the section-owned cos/sin
+// rows; both NeoX and GPT-J pair conventions, a rot_dim < head_size tail
+// (must stay untouched), and the single-section rotary_positioned form
+// cross-checked against mrope with one section.
+template <typename T>
+bool check_mrope(sycl::queue& q, DType dt, bool neox) {
+  const std::size_t tokens = 6, Hq = 3, Hkv = 1, hs = 48, rd = 32,
+                    embed = rd / 2, S = 3, max_pos = 64;
+  T* qy = sycl::malloc_shared<T>(tokens * Hq * hs, q);
+  T* ky = sycl::malloc_shared<T>(tokens * Hkv * hs, q);
+  T* cache = sycl::malloc_shared<T>(max_pos * rd, q);
+  std::int64_t* pos = sycl::malloc_shared<std::int64_t>(S * tokens, q);
+  std::int32_t* sec = sycl::malloc_shared<std::int32_t>(S, q);
+  sec[0] = 6; sec[1] = 4; sec[2] = 6;  // sums to embed = 16
+  for (std::size_t i = 0; i < S * tokens; ++i)
+    pos[i] = static_cast<std::int64_t>((i * 7 + 3) % max_pos);
+  for (std::size_t i = 0; i < max_pos * rd; ++i)
+    cache[i] = static_cast<T>(sample(i + 3) * 0.7f);
+  std::vector<double> q0(tokens * Hq * hs), k0(tokens * Hkv * hs);
+  for (std::size_t i = 0; i < tokens * Hq * hs; ++i) {
+    qy[i] = static_cast<T>(sample(i + 7));
+    q0[i] = static_cast<double>(qy[i]);
+  }
+  for (std::size_t i = 0; i < tokens * Hkv * hs; ++i) {
+    ky[i] = static_cast<T>(sample(i + 11));
+    k0[i] = static_cast<double>(ky[i]);
+  }
+
+  ops::mrope(q, qy, ky, cache, pos, sec, S, tokens, Hq, Hkv, hs, rd, neox, dt,
+             Variant::sycl, true);
+
+  const Tol tol = tol_for(dt);
+  double worst = 0.0;
+  int tail_bad = 0;
+  auto rotate_ref = [&](std::vector<double>& v, std::size_t heads) {
+    for (std::size_t t = 0; t < tokens; ++t)
+      for (std::size_t h = 0; h < heads; ++h)
+        for (std::size_t i = 0; i < embed; ++i) {
+          std::size_t s2 = 0, hi2 = 0;
+          for (std::size_t ss = 0; ss < S; ++ss) {
+            hi2 += static_cast<std::size_t>(sec[ss]);
+            if (i < hi2) { s2 = ss; break; }
+          }
+          const std::size_t p = static_cast<std::size_t>(pos[s2 * tokens + t]);
+          const double c = static_cast<double>(cache[p * rd + i]);
+          const double sn = static_cast<double>(cache[p * rd + embed + i]);
+          const std::size_t base = (t * heads + h) * hs;
+          const std::size_t i1 = neox ? i : 2 * i;
+          const std::size_t i2 = neox ? i + embed : 2 * i + 1;
+          const double x1 = v[base + i1], x2 = v[base + i2];
+          v[base + i1] = x1 * c - x2 * sn;
+          v[base + i2] = x2 * c + x1 * sn;
+        }
+  };
+  rotate_ref(q0, Hq);
+  rotate_ref(k0, Hkv);
+  for (std::size_t i = 0; i < tokens * Hq * hs; ++i) {
+    const std::size_t within = i % hs;
+    const double got = static_cast<double>(qy[i]);
+    if (within >= rd) {
+      if (got != q0[i]) ++tail_bad;  // untouched tail must be bit-equal
+      continue;
+    }
+    const double ref = static_cast<double>(static_cast<T>(q0[i]));
+    worst = std::max(worst, std::abs(got - ref) -
+                                (tol.atol + tol.rtol * std::abs(ref)));
+  }
+  for (std::size_t i = 0; i < tokens * Hkv * hs; ++i) {
+    const std::size_t within = i % hs;
+    const double got = static_cast<double>(ky[i]);
+    if (within >= rd) { if (got != k0[i]) ++tail_bad; continue; }
+    const double ref = static_cast<double>(static_cast<T>(k0[i]));
+    worst = std::max(worst, std::abs(got - ref) -
+                                (tol.atol + tol.rtol * std::abs(ref)));
+  }
+  sycl::free(qy, q); sycl::free(ky, q); sycl::free(cache, q);
+  sycl::free(pos, q); sycl::free(sec, q);
+  const bool ok = worst <= 0.0 && tail_bad == 0;
+  std::cout << "  mrope dt=" << dtype_name(dt) << (neox ? " neox" : " gptj")
+            << " worst_excess=" << worst << " tail_bad=" << tail_bad
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // Paged KV-cache write. Byte/element-exact expectation: the write is a pure
 // scatter (fp8 mode = shared-codec e4m3 encode of v/scale), so device and
 // host replica must agree exactly; skipped slots leave the sentinel fill.
@@ -4483,6 +4567,11 @@ int main() {
                                                          false, false, false) ? 0 : 1;
   failures += check_causal_conv1d_decode<half_t, float>(q, DType::f16, DType::f32,
                                                         true, false, true) ? 0 : 1;
+
+  // attention: multimodal / positioned RoPE.
+  failures += check_mrope<float>(q, DType::f32, true) ? 0 : 1;
+  failures += check_mrope<bf16_t>(q, DType::bf16, true) ? 0 : 1;
+  failures += check_mrope<bf16_t>(q, DType::bf16, false) ? 0 : 1;
 
   // serving: paged KV-cache write (exact scatter).
   failures += check_kv_cache_scatter_paged<bf16_t>(q, DType::bf16, false) ? 0 : 1;
