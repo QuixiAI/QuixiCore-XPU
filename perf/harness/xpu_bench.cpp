@@ -43,6 +43,7 @@
 
 #include "norms/qk_norm_rope/qk_norm_rope_kernel.hpp"
 #include "activations/glu_quant/glu_quant_kernel.hpp"
+#include "attention/paged_attention/paged_attention_kernel.hpp"
 #include "serving/mqa_logits/mqa_logits_kernel.hpp"
 #include "norms/norm_quant/norm_quant_kernel.hpp"
 #include "quantization/turboquant/turboquant_kernel.hpp"
@@ -646,6 +647,54 @@ int main(int argc, char** argv) {
     sycl::free(state, q); sycl::free(x, q); sycl::free(B, q); sycl::free(C, q);
     sycl::free(out, q); sycl::free(dt_raw, q); sycl::free(A, q);
     sycl::free(dt_bias, q); sycl::free(D, q); sycl::free(idx, q);
+    return 0;
+  }
+  if (kernel == "paged_attention_decode") {
+    // --M batch, --N context, --dim head_dim, --rows heads (kv heads = /4),
+    // --K splits, page 64.
+    const std::size_t B = M, ctx = N, hd = dim, H = rows ? rows : 32;
+    const std::size_t Hkv = H >= 4 ? H / 4 : 1;
+    const int splits = K >= 1 && K <= 64 ? static_cast<int>(K) : 4;
+    const std::size_t page = 64;
+    const std::size_t mp = (ctx + page - 1) / page;
+    const std::size_t pe = page * Hkv * hd;
+    const std::size_t np = B * mp;
+    void *Q = sycl::malloc_device(B * H * hd * elem, q);
+    void *O = sycl::malloc_device(B * H * hd * elem, q);
+    void *kc = sycl::malloc_device(np * pe * elem, q);
+    void *vc = sycl::malloc_device(np * pe * elem, q);
+    float *tmp = sycl::malloc_device<float>(B * H * splits * hd, q);
+    float *es = sycl::malloc_device<float>(B * H * splits, q);
+    float *ml = sycl::malloc_device<float>(B * H * splits, q);
+    auto *bt = sycl::malloc_shared<std::int32_t>(B * mp, q);
+    auto *sl = sycl::malloc_shared<std::int32_t>(B, q);
+    q.memset(Q, 0, B * H * hd * elem).wait();
+    q.memset(kc, 0, np * pe * elem).wait();
+    q.memset(vc, 0, np * pe * elem).wait();
+    for (std::size_t b = 0; b < B; ++b) {
+      sl[b] = static_cast<std::int32_t>(ctx);
+      for (std::size_t p2 = 0; p2 < mp; ++p2)
+        bt[b * mp + p2] = static_cast<std::int32_t>(b * mp + p2);
+    }
+    auto once = [&] {
+      kernels::paged_attention_decode_sycl(q, Q, kc, vc, O, tmp, es, ml, bt,
+                                           sl, B, H, Hkv, hd, page, mp, pe,
+                                           splits, 0.088f, -1, nullptr,
+                                           nullptr, nullptr, dt, 0);
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    const double kv_gb = 2.0 * B * ctx * Hkv * hd * elem / 1e9;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"paged_attention_decode\","
+              << "\"dtype\":\"" << dtype_name(dt) << "\",\"batch\":" << B
+              << ",\"ctx\":" << ctx << ",\"heads\":" << H << ",\"d\":" << hd
+              << ",\"splits\":" << splits << ",\"iters\":" << iters
+              << ",\"median_ms\":" << timing.median_ms
+              << ",\"kv_gbps\":" << kv_gb / (timing.median_ms * 1e-3)
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}"
+              << std::endl;
+    sycl::free(Q, q); sycl::free(O, q); sycl::free(kc, q); sycl::free(vc, q);
+    sycl::free(tmp, q); sycl::free(es, q); sycl::free(ml, q); sycl::free(bt, q);
+    sycl::free(sl, q);
     return 0;
   }
   if (kernel == "mqa_logits") {

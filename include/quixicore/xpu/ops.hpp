@@ -470,6 +470,60 @@ void causal_conv1d_prefill(sycl::queue& q, void* conv_state, const void* x,
                            Variant variant = Variant::sycl,
                            bool blocking = true);
 
+// KV-cache element encoding for the paged attention ops.
+enum class KvCacheDType {
+  same,      // cache elements are the activation dtype
+  fp8_e4m3,  // u8 e4m3 with device-scalar k/v scales
+  fp8_e5m2,
+};
+
+// Split-KV paged attention decode (one query token per sequence; contract
+// decode_cache_attention). Q and O are [batch, n_heads, d] of dtype dt; the
+// KV caches are [n_pages, page_size, n_kv_heads, d] with page_stride_elems
+// the element pitch between pages (>= page_size*n_kv_heads*d); block_table
+// [batch, max_pages] int32 with -1 pages skipped; seq_lens [batch] context
+// lengths. tmp_out [batch, n_heads, splits, d], exp_sums and max_logits
+// [batch, n_heads, splits] are CALLER-OWNED fp32 workspaces sized for the
+// maximum shapes (no allocation — graph-capture-safe); two chained
+// submissions (partials, then an LSE merge that also folds the optional
+// per-head attention sinks into the denominator; empty splits are -inf
+// guarded). window_left >= 0 keeps only the trailing window_left+1 keys.
+// fp8 KV decodes through exact codecs with device-scalar k/v scales
+// (nullptr = 1). d <= 256. Correctness-first per-work-item shape; the
+// DPAS-tiled variant is the recorded throughput lever.
+void paged_attention_decode(
+    sycl::queue& q, const void* Q, const void* k_cache, const void* v_cache,
+    void* O, float* tmp_out, float* exp_sums, float* max_logits,
+    const std::int32_t* block_table, const std::int32_t* seq_lens,
+    std::size_t batch, std::size_t n_heads, std::size_t n_kv_heads,
+    std::size_t d, std::size_t page_size, std::size_t max_pages,
+    std::size_t page_stride_elems, int num_kv_splits, float sm_scale,
+    int window_left, const float* sinks, const float* k_scale,
+    const float* v_scale, DType dt, KvCacheDType kv_dt,
+    Variant variant = Variant::sycl, bool blocking = true);
+
+// Varlen paged/dense prefill FMHA forward (contract paged_attention_advanced
+// + mixed_prefill_decode_attention). Q and O are [total_q, n_heads, d]
+// packed by cu_seqlens_q [batch+1]; cu_seqlens_k gives per-sequence context
+// lengths. block_table as in decode; a null block_table reads a contiguous
+// dense cache [batch, max_seqlen_k, n_kv_heads, d]. Causal masking is
+// end-aligned; window_left/right bound the band (-1 unbounded; with
+// causal=false this expresses the symmetric window). A null-able per-batch
+// is_prefill u8 mask skips decode rows so mixed batches share the launch.
+// Optional lse [total_q, n_heads] stores m + log(l) with sinks included.
+// d <= 256; total_q is the packed token count (host-known).
+void paged_attention_prefill(
+    sycl::queue& q, const void* Q, const void* k_cache, const void* v_cache,
+    void* O, float* lse, const std::int32_t* block_table,
+    const std::int32_t* cu_seqlens_q, const std::int32_t* cu_seqlens_k,
+    const std::uint8_t* is_prefill, std::size_t total_q, std::size_t batch,
+    std::size_t n_heads, std::size_t n_kv_heads, std::size_t d,
+    std::size_t page_size, std::size_t max_pages,
+    std::size_t page_stride_elems, std::size_t max_seqlen_k, float sm_scale,
+    bool causal, int window_left, int window_right, const float* sinks,
+    const float* k_scale, const float* v_scale, DType dt, KvCacheDType kv_dt,
+    Variant variant = Variant::sycl, bool blocking = true);
+
 // DeepSeek-style fp8 MQA indexer logits (sparse-attention index scoring):
 // logits[s,kv] = sum_h head_weights[s,h] * relu((q[s,h,:] . kv[kv,:]) *
 // kv_scales[kv]), masked to -inf outside [ks[s], ke[s]). q_fp8 [S,H,D] and

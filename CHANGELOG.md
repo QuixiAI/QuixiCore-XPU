@@ -36,6 +36,10 @@ All notable QuixiCore XPU changes should be recorded here.
 - turboquant: KV-cache codec encode/decode implementing the format v2 ABI
   (rotated Lloyd-Max keys or e4m3 byte keys, per-group uniform values,
   LSB-first packing), byte-identical to the host-shared codec oracle.
+- paged_attention_decode / paged_attention_prefill: native paged KV-cache
+  attention (runtime page size, split-KV decode with caller workspaces and
+  LSE merge, varlen prefill with causal/window/sinks/LSE/mixed-batch mask,
+  fp8 KV) — the backend's biggest contract gap closed, cutlass-free.
 - mqa_logits: fp8 MQA indexer logits on the new native joint_matrix
   building block (kernels/common/xmx_tile.hpp + quant_codecs.hpp) — the
   first cutlass-free DPAS rewrite consumer.

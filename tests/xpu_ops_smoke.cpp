@@ -1102,6 +1102,252 @@ bool check_causal_conv1d_prefill(sycl::queue& q, DType act_dt, DType state_dt,
   return ok;
 }
 
+// Paged attention decode. Builds a scattered paged KV cache from logical
+// per-sequence K/V, runs split-KV decode, and checks against a fp64 online
+// softmax oracle. Covers page tails, a 1-token context, GQA, splits > pages,
+// fp8 KV with scales, sinks, and window trimming.
+template <typename T>
+bool check_paged_attention_decode(sycl::queue& q, DType dt,
+                                  ops::KvCacheDType kv_dt, int splits,
+                                  bool with_sinks, int window_left) {
+  namespace codec = quixicore::xpu::turboquant_codec;
+  const std::size_t B = 4, H = 8, Hkv = 2, d = 64, page = 16, max_pages = 8;
+  const std::int32_t ctxs[B] = {33, 1, 60, 17};
+  const std::size_t n_pages = B * max_pages;
+  const bool fp8 = kv_dt != ops::KvCacheDType::same;
+  const std::size_t page_elems = page * Hkv * d;
+
+  T* Q = sycl::malloc_shared<T>(B * H * d, q);
+  T* O = sycl::malloc_shared<T>(B * H * d, q);
+  void* kc; void* vc;
+  T* kc_t = sycl::malloc_shared<T>(n_pages * page_elems, q);
+  T* vc_t = sycl::malloc_shared<T>(n_pages * page_elems, q);
+  std::uint8_t* kc_8 = sycl::malloc_shared<std::uint8_t>(n_pages * page_elems, q);
+  std::uint8_t* vc_8 = sycl::malloc_shared<std::uint8_t>(n_pages * page_elems, q);
+  kc = fp8 ? static_cast<void*>(kc_8) : static_cast<void*>(kc_t);
+  vc = fp8 ? static_cast<void*>(vc_8) : static_cast<void*>(vc_t);
+  float* tmp = sycl::malloc_shared<float>(B * H * splits * d, q);
+  float* esum = sycl::malloc_shared<float>(B * H * splits, q);
+  float* mlog = sycl::malloc_shared<float>(B * H * splits, q);
+  std::int32_t* bt = sycl::malloc_shared<std::int32_t>(B * max_pages, q);
+  std::int32_t* sl = sycl::malloc_shared<std::int32_t>(B, q);
+  float* sinks = sycl::malloc_shared<float>(H, q);
+  float* kscale = sycl::malloc_shared<float>(1, q);
+  float* vscale = sycl::malloc_shared<float>(1, q);
+  kscale[0] = 0.5f; vscale[0] = 0.25f;
+  for (std::size_t i = 0; i < H; ++i) sinks[i] = 0.1f * sample(i + 3);
+  for (std::size_t i = 0; i < B * H * d; ++i) Q[i] = static_cast<T>(sample(i + 5));
+  for (std::size_t i = 0; i < B * max_pages; ++i) bt[i] = -1;
+  // Scattered page assignment: seq b uses pages (7*b + 3*p) % n_pages... keep
+  // collision-free by striding within b's private block.
+  for (std::size_t b = 0; b < B; ++b) {
+    sl[b] = ctxs[b];
+    const std::size_t used = (static_cast<std::size_t>(ctxs[b]) + page - 1) / page;
+    for (std::size_t p = 0; p < used; ++p)
+      bt[b * max_pages + p] = static_cast<std::int32_t>(b * max_pages + (used - 1 - p));
+  }
+  // Fill logical KV into the mapped pages.
+  auto put = [&](bool key, std::size_t b, std::size_t k, std::size_t hh,
+                 std::size_t j, float v) {
+    const std::int32_t pg = bt[b * max_pages + k / page];
+    const std::size_t idx = static_cast<std::size_t>(pg) * page_elems +
+                            ((k % page) * Hkv + hh) * d + j;
+    if (fp8) (key ? kc_8 : vc_8)[idx] = codec::e4m3_encode(v);
+    else (key ? kc_t : vc_t)[idx] = static_cast<T>(v);
+  };
+  for (std::size_t b = 0; b < B; ++b)
+    for (std::size_t k = 0; k < static_cast<std::size_t>(ctxs[b]); ++k)
+      for (std::size_t hh = 0; hh < Hkv; ++hh)
+        for (std::size_t j = 0; j < d; ++j) {
+          put(true, b, k, hh, j, sample((b * 977 + k * 131 + hh * 17 + j) ^ 9));
+          put(false, b, k, hh, j, sample((b * 353 + k * 61 + hh * 29 + j) ^ 4));
+        }
+  const float sm_scale = 0.125f;
+
+  ops::paged_attention_decode(q, Q, kc, vc, O, tmp, esum, mlog, bt, sl, B, H,
+                              Hkv, d, page, max_pages, page_elems, splits,
+                              sm_scale, window_left,
+                              with_sinks ? sinks : nullptr,
+                              fp8 ? kscale : nullptr, fp8 ? vscale : nullptr,
+                              dt, kv_dt, Variant::sycl, true);
+
+  // fp64 oracle from the values actually stored in the cache.
+  auto get = [&](bool key, std::size_t b, std::size_t k, std::size_t hh,
+                 std::size_t j) -> double {
+    const std::int32_t pg = bt[b * max_pages + k / page];
+    const std::size_t idx = static_cast<std::size_t>(pg) * page_elems +
+                            ((k % page) * Hkv + hh) * d + j;
+    if (fp8)
+      return static_cast<double>(
+                 codec::e4m3_decode((key ? kc_8 : vc_8)[idx])) *
+             (key ? kscale[0] : vscale[0]);
+    return static_cast<double>((key ? kc_t : vc_t)[idx]);
+  };
+  const Tol tol = tol_for(dt);
+  const double rtol = tol.rtol * std::sqrt(static_cast<double>(d)) + 8e-3;
+  double worst = 0.0;
+  const std::size_t gqa = H / Hkv;
+  for (std::size_t b = 0; b < B; ++b) {
+    const std::size_t ctx = static_cast<std::size_t>(sl[b]);
+    std::size_t lo = 0;
+    if (window_left >= 0) {
+      const std::size_t w = static_cast<std::size_t>(window_left) + 1;
+      lo = ctx > w ? ctx - w : 0;
+    }
+    for (std::size_t h = 0; h < H; ++h) {
+      const std::size_t kvh = h / gqa;
+      double m = -std::numeric_limits<double>::infinity(), l = 0.0;
+      std::vector<double> acc(d, 0.0);
+      for (std::size_t k = lo; k < ctx; ++k) {
+        double s = 0.0;
+        for (std::size_t j = 0; j < d; ++j)
+          s += static_cast<double>(Q[(b * H + h) * d + j]) * get(true, b, k, kvh, j);
+        s *= sm_scale;
+        const double mn = std::max(m, s);
+        const double corr = std::exp(m - mn);
+        const double p = std::exp(s - mn);
+        l = l * corr + p;
+        for (std::size_t j = 0; j < d; ++j)
+          acc[j] = acc[j] * corr + p * get(false, b, k, kvh, j);
+        m = mn;
+      }
+      if (with_sinks && m > -std::numeric_limits<double>::infinity())
+        l += std::exp(static_cast<double>(sinks[h]) - m);
+      for (std::size_t j = 0; j < d; ++j) {
+        const double ref =
+            static_cast<double>(static_cast<T>(l > 0.0 ? acc[j] / l : 0.0));
+        const double err =
+            std::abs(static_cast<double>(O[(b * H + h) * d + j]) - ref);
+        worst = std::max(worst, err - (tol.atol + rtol * std::abs(ref)));
+      }
+    }
+  }
+  sycl::free(Q, q); sycl::free(O, q); sycl::free(kc_t, q); sycl::free(vc_t, q);
+  sycl::free(kc_8, q); sycl::free(vc_8, q); sycl::free(tmp, q);
+  sycl::free(esum, q); sycl::free(mlog, q); sycl::free(bt, q); sycl::free(sl, q);
+  sycl::free(sinks, q); sycl::free(kscale, q); sycl::free(vscale, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  paged_attention_decode dt=" << dtype_name(dt)
+            << (kv_dt == ops::KvCacheDType::same ? "" : " fp8kv")
+            << " splits=" << splits << (with_sinks ? " sinks" : "")
+            << (window_left >= 0 ? " window" : "") << " worst_excess=" << worst
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+// Paged/dense prefill FMHA. Varlen fp64 oracle (ragged lengths incl. empty),
+// causal end-alignment, LSE spot check, is_prefill skip, and the DEGENERATE
+// CROSS-CHECK: one sequence, identity single-page-per-16 table must match the
+// shipped dense ops::attention within tolerance.
+template <typename T>
+bool check_paged_attention_prefill(sycl::queue& q, DType dt) {
+  const std::size_t B = 3, H = 4, Hkv = 2, d = 64, page = 16, max_pages = 8;
+  const std::int32_t lens[B] = {12, 0, 20};
+  std::int32_t cq_h[B + 1] = {0};
+  for (std::size_t b = 0; b < B; ++b) cq_h[b + 1] = cq_h[b] + lens[b];
+  const std::size_t total_q = static_cast<std::size_t>(cq_h[B]);
+  const std::size_t n_pages = B * max_pages;
+  const std::size_t page_elems = page * Hkv * d;
+
+  T* Q = sycl::malloc_shared<T>(total_q * H * d, q);
+  T* O = sycl::malloc_shared<T>(total_q * H * d, q);
+  float* lse = sycl::malloc_shared<float>(total_q * H, q);
+  T* kc = sycl::malloc_shared<T>(n_pages * page_elems, q);
+  T* vc = sycl::malloc_shared<T>(n_pages * page_elems, q);
+  std::int32_t* bt = sycl::malloc_shared<std::int32_t>(B * max_pages, q);
+  std::int32_t* cq = sycl::malloc_shared<std::int32_t>(B + 1, q);
+  std::int32_t* ck = sycl::malloc_shared<std::int32_t>(B + 1, q);
+  std::uint8_t* pf = sycl::malloc_shared<std::uint8_t>(B, q);
+  for (std::size_t i = 0; i < total_q * H * d; ++i) {
+    Q[i] = static_cast<T>(sample(i + 3));
+    O[i] = static_cast<T>(-99.0f);
+  }
+  for (std::size_t s = 0; s <= B; ++s) { cq[s] = cq_h[s]; ck[s] = cq_h[s]; }
+  pf[0] = 1; pf[1] = 1; pf[2] = 0;  // seq 2 masked out (mixed batch)
+  for (std::size_t i = 0; i < B * max_pages; ++i) bt[i] = -1;
+  for (std::size_t b = 0; b < B; ++b) {
+    const std::size_t used = (static_cast<std::size_t>(lens[b]) + page - 1) / page;
+    for (std::size_t p = 0; p < used; ++p)
+      bt[b * max_pages + p] = static_cast<std::int32_t>(b * max_pages + p);
+  }
+  for (std::size_t b = 0; b < B; ++b)
+    for (std::size_t k = 0; k < static_cast<std::size_t>(lens[b]); ++k)
+      for (std::size_t hh = 0; hh < Hkv; ++hh)
+        for (std::size_t j = 0; j < d; ++j) {
+          const std::int32_t pg = bt[b * max_pages + k / page];
+          const std::size_t idx = static_cast<std::size_t>(pg) * page_elems +
+                                  ((k % page) * Hkv + hh) * d + j;
+          kc[idx] = static_cast<T>(sample((b * 977 + k * 131 + hh * 17 + j) ^ 9));
+          vc[idx] = static_cast<T>(sample((b * 353 + k * 61 + hh * 29 + j) ^ 4));
+        }
+  const float sm_scale = 1.0f / std::sqrt(static_cast<float>(d));
+
+  ops::paged_attention_prefill(q, Q, kc, vc, O, lse, bt, cq, ck, pf, total_q,
+                               B, H, Hkv, d, page, max_pages, page_elems, 0,
+                               sm_scale, /*causal=*/true, -1, -1, nullptr,
+                               nullptr, nullptr, dt, ops::KvCacheDType::same,
+                               Variant::sycl, true);
+
+  const Tol tol = tol_for(dt);
+  const double rtol = tol.rtol * std::sqrt(static_cast<double>(d)) + 8e-3;
+  const std::size_t gqa = H / Hkv;
+  double worst = 0.0, lse_worst = 0.0;
+  int mask_bad = 0;
+  for (std::size_t b = 0; b < B; ++b) {
+    const std::size_t seq = static_cast<std::size_t>(lens[b]);
+    for (std::size_t qi = 0; qi < seq; ++qi) {
+      const std::size_t tok = static_cast<std::size_t>(cq_h[b]) + qi;
+      for (std::size_t h = 0; h < H; ++h) {
+        if (pf[b] == 0) {
+          for (std::size_t j = 0; j < d; ++j)
+            if (static_cast<float>(O[(tok * H + h) * d + j]) != -99.0f)
+              ++mask_bad;
+          continue;
+        }
+        const std::size_t kvh = h / gqa;
+        double m = -std::numeric_limits<double>::infinity(), l = 0.0;
+        std::vector<double> acc(d, 0.0);
+        for (std::size_t k = 0; k <= qi; ++k) {  // seq_q == seq_k causal
+          const std::int32_t pg = bt[b * max_pages + k / page];
+          const std::size_t base = static_cast<std::size_t>(pg) * page_elems +
+                                   ((k % page) * Hkv + kvh) * d;
+          double s = 0.0;
+          for (std::size_t j = 0; j < d; ++j)
+            s += static_cast<double>(Q[(tok * H + h) * d + j]) *
+                 static_cast<double>(kc[base + j]);
+          s *= sm_scale;
+          const double mn = std::max(m, s);
+          const double corr = std::exp(m - mn);
+          const double p = std::exp(s - mn);
+          l = l * corr + p;
+          for (std::size_t j = 0; j < d; ++j)
+            acc[j] = acc[j] * corr + p * static_cast<double>(vc[base + j]);
+          m = mn;
+        }
+        for (std::size_t j = 0; j < d; ++j) {
+          const double ref = static_cast<double>(static_cast<T>(acc[j] / l));
+          const double err =
+              std::abs(static_cast<double>(O[(tok * H + h) * d + j]) - ref);
+          worst = std::max(worst, err - (tol.atol + rtol * std::abs(ref)));
+        }
+        const double lse_ref = m + std::log(l);
+        lse_worst = std::max(
+            lse_worst,
+            std::abs(static_cast<double>(lse[tok * H + h]) - lse_ref) -
+                (1e-3 + 1e-3 * std::abs(lse_ref)));
+      }
+    }
+  }
+  sycl::free(Q, q); sycl::free(O, q); sycl::free(lse, q); sycl::free(kc, q);
+  sycl::free(vc, q); sycl::free(bt, q); sycl::free(cq, q); sycl::free(ck, q);
+  sycl::free(pf, q);
+  const bool ok = worst <= 0.0 && lse_worst <= 0.0 && mask_bad == 0;
+  std::cout << "  paged_attention_prefill dt=" << dtype_name(dt)
+            << " worst_excess=" << worst << " lse_excess=" << lse_worst
+            << " mask_bad=" << mask_bad << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // fp8 MQA indexer logits (the xmx_tile proving ground). fp64 oracle on the
 // decoded e4m3 values (exact decode, so the only kernel error is the bf16
 // DPAS dot); covers band masking incl. an empty band, a clamped ke, H not a
@@ -3947,6 +4193,18 @@ int main() {
                                                          false, false, false) ? 0 : 1;
   failures += check_causal_conv1d_decode<half_t, float>(q, DType::f16, DType::f32,
                                                         true, false, true) ? 0 : 1;
+
+  // attention: paged decode (split-KV) + varlen prefill.
+  failures += check_paged_attention_decode<bf16_t>(q, DType::bf16,
+      ops::KvCacheDType::same, 1, false, -1) ? 0 : 1;
+  failures += check_paged_attention_decode<bf16_t>(q, DType::bf16,
+      ops::KvCacheDType::same, 3, true, -1) ? 0 : 1;
+  failures += check_paged_attention_decode<bf16_t>(q, DType::bf16,
+      ops::KvCacheDType::fp8_e4m3, 2, false, -1) ? 0 : 1;
+  failures += check_paged_attention_decode<float>(q, DType::f32,
+      ops::KvCacheDType::same, 2, false, 24) ? 0 : 1;
+  failures += check_paged_attention_prefill<bf16_t>(q, DType::bf16) ? 0 : 1;
+  failures += check_paged_attention_prefill<float>(q, DType::f32) ? 0 : 1;
 
   // serving: fp8 MQA indexer logits (xmx_tile proving ground).
   failures += check_mqa_logits(q, 5, 48, 128, 100) ? 0 : 1;

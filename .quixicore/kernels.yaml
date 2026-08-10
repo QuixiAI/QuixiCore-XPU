@@ -707,6 +707,44 @@ operations:
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/attention/rope/variants/xpu_sycl}
 
+  paged_attention_decode:
+    family: attention
+    status: experimental
+    path: kernels/attention/paged_attention
+    dtypes: [f32, f16, bf16]
+    shape: split-KV paged KV-cache decode (contract decode_cache_attention)
+    note: >-
+      Subgroup-cooperative online softmax per (sequence, head, split) with
+      lane-interleaved coalesced KV rows; RUNTIME page size (any value, tuned
+      64) through the block table with -1 pages skipped; caller-owned
+      max-shaped fp32 split workspaces + a chained LSE-merge reduction with
+      optional attention sinks; window_left trailing-window trim; fp8
+      e4m3/e5m2 KV via exact codecs with device-scalar scales. d <= 256,
+      d % 16 == 0. Graph-capture-safe. Semantics from the cutlass
+      vllm-xpu-kernels paged_decode (translated); DPAS tiling and multi-key
+      unrolling are the recorded levers.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel paged_attention_decode --M B --N ctx --K splits --rows H --dim d"}
+    variants:
+      - {name: xpu_sycl, status: experimental, path: kernels/attention/paged_attention/variants/xpu_sycl}
+  paged_attention_prefill:
+    family: attention
+    status: experimental
+    path: kernels/attention/paged_attention
+    dtypes: [f32, f16, bf16]
+    shape: varlen paged/dense prefill FMHA fwd (paged_attention_advanced + mixed_prefill_decode_attention)
+    note: >-
+      One work-item per (packed token, head) flash recurrence; cu_seqlens
+      varlen, end-aligned causal, window_left/right banding (symmetric shape
+      with causal=false), per-batch is_prefill mask for mixed batches,
+      optional LSE (sinks included), dense fallback when block_table is null,
+      fp8 KV. Correctness-first shape — prefill is compute-bound, so the
+      q-block/DPAS tiling on kernels/common/xmx_tile.hpp is the priority
+      lever. d <= 256. Graph-capture-safe.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel paged_attention_decode (decode); prefill sweep recorded in optimization_status"}
+    variants:
+      - {name: xpu_sycl, status: experimental, path: kernels/attention/paged_attention/variants/xpu_sycl}
   qk_norm_rope:
     family: norms
     status: implemented

@@ -3,6 +3,7 @@
 #include "quixicore/xpu/ops.hpp"
 
 #include "attention/attention/attention_kernel.hpp"
+#include "attention/paged_attention/paged_attention_kernel.hpp"
 #include "attention/rope/rope_kernel.hpp"
 
 namespace quixicore::xpu::ops {
@@ -45,6 +46,45 @@ void rope(sycl::queue& q, const void* x, void* out, std::size_t tokens,
   (void)variant;  // native only
   sycl::event ev =
       kernels::rope_sycl(q, x, out, tokens, n_heads, head_dim, base, pos0, dt);
+  if (blocking) ev.wait();
+}
+
+void paged_attention_decode(
+    sycl::queue& q, const void* Q, const void* k_cache, const void* v_cache,
+    void* O, float* tmp_out, float* exp_sums, float* max_logits,
+    const std::int32_t* block_table, const std::int32_t* seq_lens,
+    std::size_t batch, std::size_t n_heads, std::size_t n_kv_heads,
+    std::size_t d, std::size_t page_size, std::size_t max_pages,
+    std::size_t page_stride_elems, int num_kv_splits, float sm_scale,
+    int window_left, const float* sinks, const float* k_scale,
+    const float* v_scale, DType dt, KvCacheDType kv_dt, Variant variant,
+    bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::paged_attention_decode_sycl(
+      q, Q, k_cache, v_cache, O, tmp_out, exp_sums, max_logits, block_table,
+      seq_lens, batch, n_heads, n_kv_heads, d, page_size, max_pages,
+      page_stride_elems, num_kv_splits, sm_scale, window_left, sinks, k_scale,
+      v_scale, dt, static_cast<int>(kv_dt));
+  if (blocking) ev.wait();
+}
+
+void paged_attention_prefill(
+    sycl::queue& q, const void* Q, const void* k_cache, const void* v_cache,
+    void* O, float* lse, const std::int32_t* block_table,
+    const std::int32_t* cu_seqlens_q, const std::int32_t* cu_seqlens_k,
+    const std::uint8_t* is_prefill, std::size_t total_q, std::size_t batch,
+    std::size_t n_heads, std::size_t n_kv_heads, std::size_t d,
+    std::size_t page_size, std::size_t max_pages,
+    std::size_t page_stride_elems, std::size_t max_seqlen_k, float sm_scale,
+    bool causal, int window_left, int window_right, const float* sinks,
+    const float* k_scale, const float* v_scale, DType dt, KvCacheDType kv_dt,
+    Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::paged_attention_prefill_sycl(
+      q, Q, k_cache, v_cache, O, lse, block_table, cu_seqlens_q, cu_seqlens_k,
+      is_prefill, total_q, batch, n_heads, n_kv_heads, d, page_size, max_pages,
+      page_stride_elems, max_seqlen_k, sm_scale, causal, window_left,
+      window_right, sinks, k_scale, v_scale, dt, static_cast<int>(kv_dt));
   if (blocking) ev.wait();
 }
 

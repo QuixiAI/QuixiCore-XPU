@@ -2693,3 +2693,55 @@ lambdas, and register-blocked multi-tile accumulators (AccTile). Decision:
 the shared infra). Throughput pass scheduled with the paged-attention work,
 which shares every lever. The paged variant (block_tables) follows with that
 same work.
+
+## 2026-08-09: Native paged attention (decode split-KV + varlen prefill) — the big contract gap
+
+Semantics from vllm-xpu-kernels csrc/xpu/attn/xe_2 chunk_prefill +
+paged_decode (Apache, cutlass-sycl; translated to pure SYCL — house policy
+forbids the cutlass dependency). The structural win over the source: the
+page walk resolves block_table per key at RUNTIME, so page size is a
+parameter, not a template axis — the source's 216/384 build-time kernel
+tuple matrix collapses to one kernel per (dtype, kv-encoding).
+
+paged_attention_decode: subgroup-cooperative online softmax per (sequence,
+head, split) — lanes own interleaved d-slices so KV row reads coalesce, the
+score is a subgroup reduction, and softmax scalars replicate per lane.
+Split partials land in caller-owned max-shaped fp32 workspaces; a chained
+reduction LSE-merges splits (-inf-guarded empty splits), folds optional
+attention sinks into the denominator, and stores O. fp8 e4m3/e5m2 KV via
+the shared exact codecs with device-scalar scales; window_left trims the
+range; graph-capture-safe throughout.
+
+paged_attention_prefill: per-(token, head) flash recurrence with cu_seqlens
+varlen, end-aligned causal, window banding, per-batch is_prefill mask (mixed
+batches share the launch), optional LSE with sinks, and a dense fallback
+when block_table is null.
+
+Correctness (tests/xpu_ops_smoke.cpp): fp64 oracles built from the values
+actually stored in the paged cache. Decode: page tails (ctx 33/1/60/17 at
+page 16), scattered reversed page assignment, GQA 4:1, splits {1,2,3} incl.
+splits > pages, fp8 KV with scales, sinks, window. Prefill: ragged
+{12, 0, 20} with causal + LSE and the is_prefill mask leaving sentinel
+output untouched. All worst_excess = 0. Full suite PASS.
+
+Measurement (B60 device 0; H=32/Hkv=8/d=128, page 64, bf16, iters 30).
+The first cut (one work-item per (b,h,split), the dense-kernel shape) was
+honest-but-unshippable: 56.95 ms at batch 1 / ctx 16384 (1.2 GB/s of KV
+traffic). The subgroup-cooperative rewrite in the same session:
+
+| batch | ctx | splits | median ms | KV GB/s | vs naive |
+|---:|---:|---:|---:|---:|---:|
+| 1  | 16384 | 8  | 4.444 | 15.1 | 12.8x |
+| 1  | 16384 | 32 | 1.443 | 46.5 | 39.5x |
+| 8  | 16384 | 8  | 8.929 | 60.1 | 8.3x |
+| 32 | 4096  | 4  | 8.911 | 60.2 | — |
+
+Split-count matters at low batch (occupancy): 32 splits is the batch-1
+sweet spot at 16k ctx. Standing: ~13% of the ~456 GB/s roofline at load —
+usable, not yet winning; levers in priority order: multi-key unrolling per
+subgroup (amortize the softmax scalar chain), 32-wide subgroups at d>=256,
+several subgroups per work-group sharing Q via SLM, and the DPAS q-block
+prefill tiling on xmx_tile (prefill is compute-bound and still scalar).
+Decision: **keep, experimental** — the contract's biggest gap is closed
+correctness-first with an honest perf ledger; the throughput pass is the
+attention depth wave.
