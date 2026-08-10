@@ -42,6 +42,8 @@
 #include "attention/rope/rope_kernel.hpp"
 
 #include "norms/qk_norm_rope/qk_norm_rope_kernel.hpp"
+#include "quantization/turboquant/turboquant_kernel.hpp"
+#include "quantization/turboquant/turboquant_tables.hpp"
 #include "ssm/causal_conv1d/causal_conv1d_kernel.hpp"
 #include "ssm/ssd/ssd_kernel.hpp"
 #include "matmul/dense_gemm/dense_gemm_kernel.hpp"
@@ -641,6 +643,61 @@ int main(int argc, char** argv) {
     sycl::free(state, q); sycl::free(x, q); sycl::free(B, q); sycl::free(C, q);
     sycl::free(out, q); sycl::free(dt_raw, q); sycl::free(A, q);
     sycl::free(dt_bias, q); sycl::free(D, q); sycl::free(idx, q);
+    return 0;
+  }
+  if (kernel == "turboquant") {
+    // KV codec: --M tokens, 8 kv heads, --dim head_size, key/value bits from
+    // --K (packed as kb*10+vb, default 44 => kb=4 vb=4). Encode + decode
+    // timings per call.
+    const std::size_t tokens = M, heads = 8, hs = dim;
+    const int kb = K >= 22 && K <= 88 ? static_cast<int>(K / 10) : 4;
+    const int vb = K >= 22 && K <= 88 ? static_cast<int>(K % 10) : 4;
+    const std::size_t groups = hs / 32;
+    const std::size_t kbytes = (hs * kb + 7) / 8, vbytes = (hs * vb + 7) / 8;
+    const std::size_t rows = tokens * heads;
+    void *key = sycl::malloc_device(tokens * heads * hs * elem, q);
+    void *value = sycl::malloc_device(tokens * heads * hs * elem, q);
+    auto *kc = sycl::malloc_device<std::uint8_t>(rows * kbytes, q);
+    auto *vc = sycl::malloc_device<std::uint8_t>(rows * vbytes, q);
+    auto *ks = sycl::malloc_device<sycl::half>(rows * groups, q);
+    auto *vs = sycl::malloc_device<sycl::half>(rows * groups, q);
+    auto *vz = sycl::malloc_device<sycl::half>(rows * groups, q);
+    auto *slots = sycl::malloc_shared<std::int64_t>(tokens, q);
+    float *cent = sycl::malloc_shared<float>(1u << kb, q);
+    float *signs = sycl::malloc_shared<float>(hs, q);
+    float *kout = sycl::malloc_device<float>(tokens * heads * hs, q);
+    float *vout = sycl::malloc_device<float>(tokens * heads * hs, q);
+    q.memset(key, 0, tokens * heads * hs * elem).wait();
+    q.memset(value, 0, tokens * heads * hs * elem).wait();
+    for (std::size_t i = 0; i < tokens; ++i) slots[i] = static_cast<std::int64_t>(i);
+    const auto cv = quixicore::xpu::turboquant::lloyd_max_centroids(hs, kb);
+    for (std::size_t i = 0; i < cv.size(); ++i) cent[i] = cv[i];
+    for (std::size_t i = 0; i < hs; ++i) signs[i] = (i & 1) ? -1.0f : 1.0f;
+    auto enc = [&] {
+      kernels::turboquant_encode_sycl(q, key, value, kc, vc, ks, vs, vz, slots,
+                                      cent, signs, tokens, heads, hs, kb, vb,
+                                      0, dt);
+    };
+    auto dec = [&] {
+      kernels::turboquant_decode_sycl(q, kc, vc, ks, vs, vz, slots, cent,
+                                      signs, kout, vout, tokens, heads, hs, kb,
+                                      vb, 0);
+    };
+    const DeviceTiming te = time_device_batches(enc);
+    const DeviceTiming td = time_device_batches(dec);
+    std::cout << "{\"schema_version\":2,\"kernel\":\"turboquant\","
+              << "\"variant\":\"sycl\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"tokens\":" << tokens << ",\"heads\":" << heads
+              << ",\"head_size\":" << hs << ",\"key_bits\":" << kb
+              << ",\"value_bits\":" << vb << ",\"iters\":" << iters
+              << ",\"encode_median_ms\":" << te.median_ms
+              << ",\"decode_median_ms\":" << td.median_ms << ",\"device\":\""
+              << q.get_device().get_info<sycl::info::device::name>() << "\"}"
+              << std::endl;
+    sycl::free(key, q); sycl::free(value, q); sycl::free(kc, q);
+    sycl::free(vc, q); sycl::free(ks, q); sycl::free(vs, q); sycl::free(vz, q);
+    sycl::free(slots, q); sycl::free(cent, q); sycl::free(signs, q);
+    sycl::free(kout, q); sycl::free(vout, q);
     return 0;
   }
   if (kernel == "all_reduce") {

@@ -567,6 +567,43 @@ void fp8_gemm_w8a16(sycl::queue &q, const void *activations, const void *weight_
 // fp8 codecs: f32 -> fp8 (out is 1 byte/elem) and fp8 -> f32, both over `n`
 // contiguous elements. Vendor-backed (oneDNN reorder). Useful for quantizing
 // activations/weights and for exact round-trip references.
+// TurboQuant KV-cache codec, format version 2 (specs/formats/turboquant.md).
+// key/value are [num_tokens, num_kv_heads, head_size] of dtype dt; caches are
+// slot-indexed: key_cache [slot, heads, ceil(head_size*key_bits/8)] u8,
+// value_cache likewise with value_bits, and the three scale caches
+// [slot, heads, head_size/32] fp16. slot_mapping[token] < 0 skips the token.
+// Keys (key_bits < 8) take the rotated Lloyd-Max path (caller-supplied
+// ascending centroids [2^key_bits] and +-1 signs [head_size]); key_bits == 8
+// selects the unrotated saturating e4m3 byte path (no scales/table). Values
+// are per-group uniform with fp16 scale and zero; decode is
+// (code + zero) * scale, and value_signed applies two's-complement at 8 bits.
+// The fp16 rounding chain is load-bearing: the codec is shared verbatim with
+// the host oracle and codes must match bit for bit. head_size in {64,128,256};
+// bits in [2,8]; out-of-envelope shapes are rejected without launching.
+void turboquant_encode(sycl::queue& q, const void* key, const void* value,
+                       std::uint8_t* key_cache, std::uint8_t* value_cache,
+                       void* key_scale_cache, void* value_scale_cache,
+                       void* value_zero_cache,
+                       const std::int64_t* slot_mapping, const float* centroids,
+                       const float* signs, std::size_t num_tokens,
+                       std::size_t num_kv_heads, std::size_t head_size,
+                       int key_bits, int value_bits, bool value_signed,
+                       DType dt, Variant variant = Variant::sycl,
+                       bool blocking = true);
+
+// Inverse of turboquant_encode for a gathered slot list; k_out/v_out are
+// [num_slots, heads, head_size] fp32. A negative slot decodes to zeros.
+void turboquant_decode(sycl::queue& q, const std::uint8_t* key_cache,
+                       const std::uint8_t* value_cache,
+                       const void* key_scale_cache,
+                       const void* value_scale_cache,
+                       const void* value_zero_cache, const std::int64_t* slots,
+                       const float* centroids, const float* signs, float* k_out,
+                       float* v_out, std::size_t num_slots,
+                       std::size_t num_kv_heads, std::size_t head_size,
+                       int key_bits, int value_bits, bool value_signed,
+                       Variant variant = Variant::sycl, bool blocking = true);
+
 void fp8_encode(sycl::queue& q, const float* in, void* out_fp8, std::size_t n,
                 Fp8Kind kind, bool blocking = true);
 void fp8_decode(sycl::queue& q, const void* in_fp8, float* out, std::size_t n,

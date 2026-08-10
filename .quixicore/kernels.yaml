@@ -341,6 +341,27 @@ operations:
     variants:
       - {name: xpu_sycl, status: experimental, path: kernels/quantization/fp8_gemm/variants/xpu_sycl}
       - {name: xpu_onednn, status: experimental, path: kernels/quantization/fp8_gemm/variants/xpu_onednn}
+  turboquant:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/turboquant
+    dtypes: [f32, f16, bf16]
+    quant_format: turboquant
+    shape: KV-cache codec (encode + decode), format version 2
+    note: >-
+      One work-item per (token, head) row — the LSB-first bit stream and the
+      sequential fp32 group reductions make row ownership the exactness
+      contract. The per-row codec (turboquant_codec.hpp) is shared verbatim
+      with the host oracle, with manual integer fp32<->fp16 conversions (the
+      device optimizer elides compiler half round-trips). Caller-supplied
+      Lloyd-Max centroids (turboquant_tables.hpp) and sign vector; slot < 0
+      skips (encode) / zeros (decode). head_size {64,128,256}, bits [2,8];
+      out-of-envelope shapes rejected without launching. Graph-capture-safe.
+      Norm correction is not yet exposed (ABI addition when needed).
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel turboquant --M tokens --dim head_size --K kb*10+vb"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/quantization/turboquant/variants/xpu_sycl}
   selective_scan:
     family: ssm
     status: implemented

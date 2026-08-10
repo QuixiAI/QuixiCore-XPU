@@ -2530,3 +2530,58 @@ of the library (integration-owned, per the qwen-serving-port boundary);
 socketpair, two processes on two B60s, fd exchange, `ops::all_reduce`, both
 ranks verify the fixed-order reference bitwise. Verified on this box:
 `quixicore_xpu_p2p_all_reduce_mp` -> both ranks bitwise OK, PASS.
+
+## 2026-08-09: TurboQuant KV-cache codec (turboquant) — SYCL implementation of the declared ABI
+
+Completes the ABI declared at 53a9f87 (kernels/quantization/turboquant/
+turboquant_kernel.hpp) against QuixiCore specs/formats/turboquant.md (format
+version 2). References read, not imported: the vLLM Triton store/decode
+kernels (Apache) and the reference Lloyd-Max solver; note the vLLM MSE path
+normalizes keys by full-vector norm while the frozen v2 spec uses per-32-group
+fp16 RMS — the spec wins.
+
+Architecture: the per-row codec (turboquant_codec.hpp) is a set of inline
+functions COMPILED FOR BOTH device and host — the smoke oracle runs the same
+code, so "codes match the reference bit for bit" is structural. One work-item
+owns a whole (token, head) row: the LSB-first stream lets 3/5/6/7-bit codes
+cross byte boundaries (no byte may be shared between work-items) and the
+sequential fp32 group reductions pin the accumulation order. Keys: sign flip
+-> unnormalized FWHT -> 1/sqrt(hs) -> per-group fp16 RMS -> Lloyd-Max
+midpoint bucketize (lower wins ties); key_bits == 8 is the unrotated
+saturating-RTNE e4m3 path (integer-exact codec, shared). Values: per-group
+uniform, fp16 scale/zero, decode (code + zero) * scale, two's-complement at
+signed 8-bit. Host-side Lloyd-Max table generator in turboquant_tables.hpp
+(caller-owned, centroid identity is cache metadata).
+
+Two determinism findings, both load-bearing for any future bit-exact op:
+1. icpx defaults to a fast fp model whose device division is ~1 ULP off the
+   host (Level Zero permits ~2.5 ULP). Fixed build-wide:
+   `-fp-model=precise -foffload-fp32-prec-div -foffload-fp32-prec-sqrt`
+   (probe: 305680/1M host/device division mismatches without, 0 with).
+2. The device optimizer ELIDES float->half->float round-trips: the
+   fp16-rounded value scale reached the divide unrounded (~1000 ULP off).
+   The codec therefore performs every fp16 grid step through manual integer
+   fp32<->fp16 conversions (f32_to_f16_bits / f16_bits_to_f32), immune to
+   fp optimization on either side.
+
+Correctness: `check_turboquant` — device caches memcmp'd against the host run
+of the shared codec (codes, scales, zeros), decode outputs memcmp'd fp32,
+slot-skip sentinel preservation, -1 decode zeros, and a round-trip value
+bound. Sweep: (hs, kb, vb, signed) = (64,2,2), (128,3,4), (256,4,8,signed),
+(128, fp8-keys, 5), (128,4,4) x {f32, bf16, f16}. All byte-identical. Full
+smoke suite: PASS.
+
+Measurement (Arc Pro B60 device 0; harness `--kernel turboquant --M 4096
+--iters 50 --warmup 10`, bf16, 8 kv heads):
+
+| head_size | kb/vb | encode ms | decode ms |
+|---:|---|---:|---:|
+| 128 | 3/4 | 1.367 | 0.954 |
+| 128 | 4/4 | 1.431 | 0.951 |
+| 64  | 8/4 | 0.261 | 0.191 |
+
+~0.33 us/token at the 128-head-size shape — negligible against a decode step.
+The one-row-per-work-item geometry serializes the FWHT and packing per lane;
+a subgroup-cooperative variant is the obvious throughput lever if KV codec
+time ever matters. Decision: **keep** — correctness-first implementation of
+the declared codec ABI; quant-formats.yaml turboquant is now `implemented`.

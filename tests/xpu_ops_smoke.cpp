@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -21,6 +22,8 @@
 #include "quixicore/xpu/runtime.hpp"
 
 #include "quantization/gguf_gemv/gguf_iq_tables.hpp"  // ggml i-quant grids for references
+#include "quantization/turboquant/turboquant_codec.hpp"   // shared codec = the oracle
+#include "quantization/turboquant/turboquant_tables.hpp"  // Lloyd-Max centroid tables
 
 namespace {
 
@@ -1095,6 +1098,151 @@ bool check_causal_conv1d_prefill(sycl::queue& q, DType act_dt, DType state_dt,
             << (strided_tokens ? " strided" : " packed")
             << " worst_out=" << worst_out << " state_bad=" << state_bad
             << " zero_bad=" << zero_bad << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+// TurboQuant codec. The per-row codec is shared verbatim between kernel and
+// oracle (turboquant_codec.hpp), so the contract here is BYTE IDENTITY: the
+// host runs the same functions and every cache byte, scale, zero, and decoded
+// fp32 output must memcmp-match. Also checks slot skip (encode leaves the
+// sentinel fill; decode of -1 emits zeros) and a round-trip quality bound for
+// values (|v_dec - v| <= scale). Requires exact fp32/fp16 rounding parity
+// between host and device, which is precisely what it verifies.
+template <typename T>
+bool check_turboquant(sycl::queue& q, DType dt, std::size_t head_size,
+                      int key_bits, int value_bits, bool value_signed) {
+  namespace codec = quixicore::xpu::turboquant_codec;
+  const std::size_t tokens = 5, heads = 4, nslots = 8;
+  const std::size_t groups = head_size / codec::kGroup;
+  const std::size_t kbytes = codec::row_bytes(head_size, key_bits);
+  const std::size_t vbytes = codec::row_bytes(head_size, value_bits);
+  const std::size_t n = tokens * heads * head_size;
+  const std::size_t rows = nslots * heads;
+
+  T* key = sycl::malloc_shared<T>(n, q);
+  T* value = sycl::malloc_shared<T>(n, q);
+  std::uint8_t* kc = sycl::malloc_shared<std::uint8_t>(rows * kbytes, q);
+  std::uint8_t* vc = sycl::malloc_shared<std::uint8_t>(rows * vbytes, q);
+  sycl::half* ks = sycl::malloc_shared<sycl::half>(rows * groups, q);
+  sycl::half* vs = sycl::malloc_shared<sycl::half>(rows * groups, q);
+  sycl::half* vz = sycl::malloc_shared<sycl::half>(rows * groups, q);
+  std::int64_t* slot_map = sycl::malloc_shared<std::int64_t>(tokens, q);
+  const std::vector<float> centroids_v =
+      quixicore::xpu::turboquant::lloyd_max_centroids(head_size, key_bits);
+  float* centroids = sycl::malloc_shared<float>(centroids_v.size(), q);
+  float* signs = sycl::malloc_shared<float>(head_size, q);
+  for (std::size_t i = 0; i < centroids_v.size(); ++i)
+    centroids[i] = centroids_v[i];
+  for (std::size_t i = 0; i < head_size; ++i)
+    signs[i] = sample(i + 5) >= 0.0f ? 1.0f : -1.0f;
+  for (std::size_t i = 0; i < n; ++i) {
+    key[i] = static_cast<T>(0.15f * sample(i + 11));
+    value[i] = static_cast<T>(sample(i + 13));
+  }
+  slot_map[0] = 2; slot_map[1] = 5; slot_map[2] = -1; slot_map[3] = 0;
+  slot_map[4] = 7;
+
+  // Sentinel fill (device caches and host expectation identically).
+  std::vector<std::uint8_t> ekc(rows * kbytes, 0xAB), evc(rows * vbytes, 0xAB);
+  std::vector<sycl::half> eks(rows * groups, sycl::half(-1.0f)),
+      evs(rows * groups, sycl::half(-1.0f)), evz(rows * groups, sycl::half(-1.0f));
+  std::memcpy(kc, ekc.data(), ekc.size());
+  std::memcpy(vc, evc.data(), evc.size());
+  std::memcpy(ks, eks.data(), eks.size() * sizeof(sycl::half));
+  std::memcpy(vs, evs.data(), evs.size() * sizeof(sycl::half));
+  std::memcpy(vz, evz.data(), evz.size() * sizeof(sycl::half));
+
+  ops::turboquant_encode(q, key, value, kc, vc, ks, vs, vz, slot_map,
+                         centroids, signs, tokens, heads, head_size, key_bits,
+                         value_bits, value_signed, dt, Variant::sycl, true);
+
+  // Host oracle: the same shared codec, per routed row.
+  std::vector<float> scratch(head_size);
+  for (std::size_t t = 0; t < tokens; ++t) {
+    if (slot_map[t] < 0) continue;
+    for (std::size_t h = 0; h < heads; ++h) {
+      const std::size_t src = (t * heads + h) * head_size;
+      const std::size_t dst = static_cast<std::size_t>(slot_map[t]) * heads + h;
+      codec::encode_key_row(key + src, ekc.data() + dst * kbytes,
+                            eks.data() + dst * groups, centroids, signs,
+                            head_size, key_bits, scratch.data());
+      codec::encode_value_row(value + src, evc.data() + dst * vbytes,
+                              evs.data() + dst * groups,
+                              evz.data() + dst * groups, head_size, value_bits,
+                              value_signed);
+    }
+  }
+  int enc_bad = 0;
+  if (std::memcmp(kc, ekc.data(), ekc.size()) != 0) { ++enc_bad; std::cout << "    [kc differs]\n"; }
+  if (std::memcmp(vc, evc.data(), evc.size()) != 0) { ++enc_bad; std::cout << "    [vc differs]\n"; }
+  if (std::memcmp(ks, eks.data(), eks.size() * sizeof(sycl::half)) != 0) { ++enc_bad; std::cout << "    [ks differs]\n"; }
+  if (std::memcmp(vs, evs.data(), evs.size() * sizeof(sycl::half)) != 0) { ++enc_bad; std::cout << "    [vs differs]\n"; }
+  if (std::memcmp(vz, evz.data(), evz.size() * sizeof(sycl::half)) != 0) { ++enc_bad; std::cout << "    [vz differs]\n"; }
+
+  // Decode: gathered slots incl. a -1 (zeros) — byte-identical to the host
+  // decode of the host-encoded caches.
+  const std::size_t dslots = 4;
+  std::int64_t* slots = sycl::malloc_shared<std::int64_t>(dslots, q);
+  slots[0] = 2; slots[1] = 0; slots[2] = -1; slots[3] = 7;
+  float* k_out = sycl::malloc_shared<float>(dslots * heads * head_size, q);
+  float* v_out = sycl::malloc_shared<float>(dslots * heads * head_size, q);
+  ops::turboquant_decode(q, kc, vc, ks, vs, vz, slots, centroids, signs, k_out,
+                         v_out, dslots, heads, head_size, key_bits, value_bits,
+                         value_signed, Variant::sycl, true);
+  std::vector<float> ek(dslots * heads * head_size, 0.0f),
+      ev(dslots * heads * head_size, 0.0f);
+  for (std::size_t s = 0; s < dslots; ++s) {
+    if (slots[s] < 0) continue;
+    for (std::size_t h = 0; h < heads; ++h) {
+      const std::size_t src = static_cast<std::size_t>(slots[s]) * heads + h;
+      const std::size_t out = (s * heads + h) * head_size;
+      codec::decode_key_row(ekc.data() + src * kbytes, eks.data() + src * groups,
+                            centroids, signs, head_size, key_bits,
+                            ek.data() + out, scratch.data());
+      codec::decode_value_row(evc.data() + src * vbytes,
+                              evs.data() + src * groups,
+                              evz.data() + src * groups, head_size, value_bits,
+                              value_signed, ev.data() + out);
+    }
+  }
+  int dec_bad = 0;
+  if (std::memcmp(k_out, ek.data(), ek.size() * sizeof(float)) != 0) ++dec_bad;
+  if (std::memcmp(v_out, ev.data(), ev.size() * sizeof(float)) != 0) ++dec_bad;
+
+  // Round-trip quality: every decoded value within one scale step.
+  int rt_bad = 0;
+  for (std::size_t s = 0; s < dslots; ++s) {
+    if (slots[s] < 0) continue;
+    std::size_t t_of_slot = tokens;
+    for (std::size_t t = 0; t < tokens; ++t)
+      if (slot_map[t] == slots[s]) t_of_slot = t;
+    if (t_of_slot == tokens) continue;
+    for (std::size_t h = 0; h < heads; ++h) {
+      for (std::size_t g = 0; g < groups; ++g) {
+        const float step = static_cast<float>(
+            evs[(static_cast<std::size_t>(slots[s]) * heads + h) * groups + g]);
+        for (std::size_t j = 0; j < codec::kGroup; ++j) {
+          const std::size_t i = g * codec::kGroup + j;
+          const float orig = static_cast<float>(
+              value[(t_of_slot * heads + h) * head_size + i]);
+          const float dec = v_out[(s * heads + h) * head_size + i];
+          if (std::abs(dec - orig) > step + 1e-3f) ++rt_bad;
+        }
+      }
+    }
+  }
+
+  sycl::free(key, q); sycl::free(value, q); sycl::free(kc, q);
+  sycl::free(vc, q); sycl::free(ks, q); sycl::free(vs, q); sycl::free(vz, q);
+  sycl::free(slot_map, q); sycl::free(centroids, q); sycl::free(signs, q);
+  sycl::free(slots, q); sycl::free(k_out, q); sycl::free(v_out, q);
+
+  const bool ok = enc_bad == 0 && dec_bad == 0 && rt_bad == 0;
+  std::cout << "  turboquant dt=" << dtype_name(dt) << " hs=" << head_size
+            << " kb=" << key_bits << " vb=" << value_bits
+            << (value_signed ? " signed" : "") << " enc_bad=" << enc_bad
+            << " dec_bad=" << dec_bad << " rt_bad=" << rt_bad
+            << (ok ? "  ok (byte-identical)" : "  FAIL") << '\n';
   return ok;
 }
 
@@ -3471,6 +3619,14 @@ int main() {
                                                          false, false, false) ? 0 : 1;
   failures += check_causal_conv1d_decode<half_t, float>(q, DType::f16, DType::f32,
                                                         true, false, true) ? 0 : 1;
+
+  // quantization: TurboQuant KV-cache codec (byte-identical shared-codec
+  // oracle; bit-width x head-size x signedness x fp8-key sweep).
+  failures += check_turboquant<float>(q, DType::f32, 64, 2, 2, false) ? 0 : 1;
+  failures += check_turboquant<bf16_t>(q, DType::bf16, 128, 3, 4, false) ? 0 : 1;
+  failures += check_turboquant<float>(q, DType::f32, 256, 4, 8, true) ? 0 : 1;
+  failures += check_turboquant<bf16_t>(q, DType::bf16, 128, 8, 5, false) ? 0 : 1;
+  failures += check_turboquant<half_t>(q, DType::f16, 128, 4, 4, false) ? 0 : 1;
 
   // collectives: multi-GPU sum all-reduce across the visible B60s.
   failures += check_collectives() ? 0 : 1;

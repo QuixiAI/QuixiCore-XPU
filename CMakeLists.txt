@@ -60,7 +60,14 @@ if(QUIXICORE_XPU_ENABLE_SYCL)
   set(QUIXICORE_XPU_SYCL_TARGETS "" CACHE STRING
       "SYCL AoT device target(s) passed to -fsycl-targets (empty = JIT).")
 
-  set(QX_SYCL_FLAGS -fsycl)
+  # Deterministic fp32 arithmetic. icpx defaults to -fp-model=fast, which lets
+  # the device substitute reciprocal-multiply for division (and reassociate);
+  # combined with Level Zero's ~2.5 ULP native division this broke the
+  # bit-exact codec contracts (TurboQuant's host-shared oracle caught 1-ULP
+  # fp16 zero-point flips). precise + prec-div/prec-sqrt restores IEEE
+  # divide/sqrt on both host and device.
+  set(QX_SYCL_FLAGS -fsycl -fp-model=precise -foffload-fp32-prec-div
+      -foffload-fp32-prec-sqrt)
   if(QUIXICORE_XPU_SYCL_TARGETS)
     list(APPEND QX_SYCL_FLAGS -fsycl-targets=${QUIXICORE_XPU_SYCL_TARGETS})
   endif()

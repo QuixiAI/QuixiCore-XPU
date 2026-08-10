@@ -10,6 +10,7 @@
 #include "quantization/gguf_gemv/gguf_kernel.hpp"
 #include "quantization/mxfp4_gemv/mxfp4_kernel.hpp"
 #include "quantization/nvfp4_gemv/nvfp4_kernel.hpp"
+#include "quantization/turboquant/turboquant_kernel.hpp"
 #include "quantization/qgemm/qgemm_kernel.hpp"
 #include "quantization/qgemv/qgemv_kernel.hpp"
 #include "quantization/w4a16_gemm/w4a16_gemm_kernel.hpp"
@@ -176,6 +177,42 @@ void qgemm_int8(sycl::queue& q, const void* a_int8, const void* b_int8,
       ev = kernels::qgemm_int8_sycl(q, a_int8, b_int8, a_scale, b_scale, c, M, N, K, out_dt);
       break;
   }
+  if (blocking) ev.wait();
+}
+
+void turboquant_encode(sycl::queue& q, const void* key, const void* value,
+                       std::uint8_t* key_cache, std::uint8_t* value_cache,
+                       void* key_scale_cache, void* value_scale_cache,
+                       void* value_zero_cache,
+                       const std::int64_t* slot_mapping, const float* centroids,
+                       const float* signs, std::size_t num_tokens,
+                       std::size_t num_kv_heads, std::size_t head_size,
+                       int key_bits, int value_bits, bool value_signed,
+                       DType dt, Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::turboquant_encode_sycl(
+      q, key, value, key_cache, value_cache, key_scale_cache,
+      value_scale_cache, value_zero_cache, slot_mapping, centroids, signs,
+      num_tokens, num_kv_heads, head_size, key_bits, value_bits,
+      value_signed ? 1 : 0, dt);
+  if (blocking) ev.wait();
+}
+
+void turboquant_decode(sycl::queue& q, const std::uint8_t* key_cache,
+                       const std::uint8_t* value_cache,
+                       const void* key_scale_cache,
+                       const void* value_scale_cache,
+                       const void* value_zero_cache, const std::int64_t* slots,
+                       const float* centroids, const float* signs, float* k_out,
+                       float* v_out, std::size_t num_slots,
+                       std::size_t num_kv_heads, std::size_t head_size,
+                       int key_bits, int value_bits, bool value_signed,
+                       Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::turboquant_decode_sycl(
+      q, key_cache, value_cache, key_scale_cache, value_scale_cache,
+      value_zero_cache, slots, centroids, signs, k_out, v_out, num_slots,
+      num_kv_heads, head_size, key_bits, value_bits, value_signed ? 1 : 0);
   if (blocking) ev.wait();
 }
 

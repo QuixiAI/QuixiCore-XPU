@@ -21,6 +21,20 @@ formats:
   mxfp8:
     status: planned
     note: OCP microscaling FP8 (e4m3/e5m2 elements, e8m0 block scale).
+  turboquant:
+    status: implemented
+    note: >-
+      TurboQuant KV-cache codec, format version 2 (QuixiCore
+      specs/formats/turboquant.md; Zandieh et al. arXiv:2504.19874). Keys:
+      sign flip + unnormalized FWHT + 1/sqrt(head_size) + per-32-group
+      fp16-rounded RMS + Lloyd-Max centroid codes (2..7 bits, midpoint
+      boundaries, lower wins ties), or an unrotated saturating-RTNE e4m3 byte
+      path at key_bits == 8. Values: per-group uniform with fp16 scale/zero,
+      decode (code + zero) * scale, two's-complement at signed 8-bit. Codes
+      packed LSB-first. Landed as quantization/turboquant encode + decode with
+      the per-row codec shared VERBATIM between kernel and host oracle —
+      byte-identical by construction (manual integer fp16 conversions, immune
+      to compiler half-round-trip elision). Norm correction not yet exposed.
   mxfp6:
     status: planned
   mxfp4:
