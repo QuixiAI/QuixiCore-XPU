@@ -4,6 +4,12 @@ All notable QuixiCore XPU changes should be recorded here.
 
 ## Unreleased
 
+### Serving-port wave 2 (from the vLLM XPU optimization work)
+
+- ssd_decode: Mamba-2 SSD selective-state-update decode (scalar-A-per-head)
+  with independent act/state dtypes, strided state views, and copy-on-write
+  slot indices. Graph-capture-safe.
+
 ### Kernel families — breadth
 
 - Opened all thirteen families with native SYCL implementations: activations

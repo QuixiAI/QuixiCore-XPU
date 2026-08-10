@@ -542,6 +542,141 @@ bool check_selective_scan(sycl::queue& q, DType dt, std::size_t nc, std::size_t 
   return ok;
 }
 
+// Mamba-2 SSD decode. fp64 oracle over one selective-state-update step,
+// exercising copy-on-write slots (in-place, src!=dst, null src, null dst), a
+// GQA-style B/C group broadcast, and a padded slot stride (strided-view
+// contract). State snapshot is taken before the call; untouched slots must
+// come back unchanged and null-src rows must emit exactly zero.
+template <typename T, typename StateT>
+bool check_ssd_decode(sycl::queue& q, DType act_dt, DType state_dt) {
+  const std::size_t batch = 5, nheads = 8, headdim = 32, dstate = 64,
+                    ngroups = 2, nslots = 7;
+  const std::int64_t s3 = 1, s2 = dstate,
+                     s1 = static_cast<std::int64_t>(headdim) * dstate,
+                     s0 = static_cast<std::int64_t>(nheads) * headdim * dstate +
+                          128;  // padded slot pitch: strided view
+  const std::size_t state_elems = static_cast<std::size_t>(nslots * s0);
+
+  StateT* state = sycl::malloc_shared<StateT>(state_elems, q);
+  T* x = sycl::malloc_shared<T>(batch * nheads * headdim, q);
+  T* B = sycl::malloc_shared<T>(batch * ngroups * dstate, q);
+  T* C = sycl::malloc_shared<T>(batch * ngroups * dstate, q);
+  T* out = sycl::malloc_shared<T>(batch * nheads * headdim, q);
+  float* dt_raw = sycl::malloc_shared<float>(batch * nheads, q);
+  float* A = sycl::malloc_shared<float>(nheads, q);
+  float* dt_bias = sycl::malloc_shared<float>(nheads, q);
+  float* D = sycl::malloc_shared<float>(nheads * headdim, q);
+  std::int32_t* src = sycl::malloc_shared<std::int32_t>(batch, q);
+  std::int32_t* dst = sycl::malloc_shared<std::int32_t>(batch, q);
+
+  for (std::size_t i = 0; i < state_elems; ++i)
+    state[i] = static_cast<StateT>(0.25f * sample(i));
+  for (std::size_t i = 0; i < batch * nheads * headdim; ++i)
+    x[i] = static_cast<T>(sample(i + 17));
+  for (std::size_t i = 0; i < batch * ngroups * dstate; ++i) {
+    B[i] = static_cast<T>(sample(i + 29));
+    C[i] = static_cast<T>(sample(i + 31));
+  }
+  for (std::size_t i = 0; i < batch * nheads; ++i)
+    dt_raw[i] = 0.4f * sample(i + 37);
+  for (std::size_t h = 0; h < nheads; ++h) {
+    A[h] = -0.5f - 0.5f * std::abs(sample(h + 41));  // negative (stable)
+    dt_bias[h] = 0.2f * sample(h + 43);
+  }
+  for (std::size_t i = 0; i < nheads * headdim; ++i) D[i] = sample(i + 47);
+  // Slot plan: in-place, copy-on-write, null src, null dst, in-place again.
+  src[0] = 0; dst[0] = 0;
+  src[1] = 1; dst[1] = 2;
+  src[2] = -1; dst[2] = 3;
+  src[3] = 4; dst[3] = -1;
+  src[4] = 5; dst[4] = 5;
+
+  std::vector<double> snap(state_elems), expect(state_elems);
+  for (std::size_t i = 0; i < state_elems; ++i)
+    snap[i] = static_cast<double>(state[i]);
+  expect = snap;
+
+  ops::ssd_decode(q, state, x, dt_raw, A, B, C, D, dt_bias, src, dst, out,
+                  /*dt_softplus=*/true, batch, nheads, headdim, dstate, ngroups,
+                  nslots, s0, s1, s2, s3, act_dt, state_dt, Variant::sycl,
+                  /*blocking=*/true);
+
+  const Tol tol = tol_for(act_dt);
+  const Tol stol = tol_for(state_dt);
+  const double rtol = tol.rtol * std::sqrt(static_cast<double>(dstate)) + 5e-3;
+  const std::size_t hpg = nheads / ngroups;
+  double worst_out = 0.0;
+  int zero_bad = 0;
+  for (std::size_t b = 0; b < batch; ++b) {
+    for (std::size_t h = 0; h < nheads; ++h) {
+      const std::size_t g = h / hpg;
+      for (std::size_t d = 0; d < headdim; ++d) {
+        const std::size_t oi = (b * nheads + h) * headdim + d;
+        if (src[b] < 0) {
+          if (static_cast<double>(out[oi]) != 0.0) ++zero_bad;
+          continue;
+        }
+        double dt_h = static_cast<double>(dt_raw[b * nheads + h]) +
+                      static_cast<double>(dt_bias[h]);
+        dt_h = dt_h <= 20.0 ? std::log(1.0 + std::exp(dt_h)) : dt_h;
+        const double dA = std::exp(dt_h * static_cast<double>(A[h]));
+        const double xd = static_cast<double>(x[oi]);
+        // State expectation replicates the kernel's fp32 chain exactly: a
+        // per-element fp64 reference can round to the adjacent StateT value
+        // (1 ULP) at boundaries, which bf16's 2e-3 tolerance cannot absorb.
+        float dt_h_f = dt_raw[b * nheads + h] + dt_bias[h];
+        dt_h_f = dt_h_f <= 20.0f ? std::log(1.0f + std::exp(dt_h_f)) : dt_h_f;
+        const float dA_f = std::exp(dt_h_f * A[h]);
+        const float dtx_f = dt_h_f * static_cast<float>(x[oi]);
+        double y = 0.0;
+        for (std::size_t n = 0; n < dstate; ++n) {
+          const std::size_t si = static_cast<std::size_t>(
+              src[b] * s0 + static_cast<std::int64_t>(h) * s1 +
+              static_cast<std::int64_t>(d) * s2 +
+              static_cast<std::int64_t>(n) * s3);
+          const double Bv = static_cast<double>(B[(b * ngroups + g) * dstate + n]);
+          const double Cv = static_cast<double>(C[(b * ngroups + g) * dstate + n]);
+          const double s_new = snap[si] * dA + dt_h * xd * Bv;
+          if (dst[b] >= 0) {
+            const std::size_t di = static_cast<std::size_t>(
+                dst[b] * s0 + static_cast<std::int64_t>(h) * s1 +
+                static_cast<std::int64_t>(d) * s2 +
+                static_cast<std::int64_t>(n) * s3);
+            const float s_f = static_cast<float>(snap[si]) * dA_f +
+                              dtx_f * static_cast<float>(Bv);
+            expect[di] = static_cast<double>(static_cast<StateT>(s_f));
+          }
+          y += s_new * Cv;
+        }
+        y += static_cast<double>(D[h * headdim + d]) * xd;
+        const double ref = static_cast<double>(static_cast<T>(y));
+        worst_out = std::max(worst_out,
+                             std::abs(static_cast<double>(out[oi]) - ref) -
+                                 (tol.atol + rtol * std::abs(ref)));
+      }
+    }
+  }
+  double worst_state = 0.0;
+  for (std::size_t i = 0; i < state_elems; ++i) {
+    const double got = static_cast<double>(state[i]);
+    worst_state = std::max(worst_state,
+                           std::abs(got - expect[i]) -
+                               (stol.atol + stol.rtol * std::abs(expect[i])));
+  }
+
+  sycl::free(state, q); sycl::free(x, q); sycl::free(B, q); sycl::free(C, q);
+  sycl::free(out, q); sycl::free(dt_raw, q); sycl::free(A, q);
+  sycl::free(dt_bias, q); sycl::free(D, q); sycl::free(src, q);
+  sycl::free(dst, q);
+
+  const bool ok = worst_out <= 0.0 && worst_state <= 0.0 && zero_bad == 0;
+  std::cout << "  ssd_decode act=" << dtype_name(act_dt)
+            << " state=" << dtype_name(state_dt)
+            << " worst_out=" << worst_out << " worst_state=" << worst_state
+            << " zero_bad=" << zero_bad << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 bool check_collectives() {
   const std::size_t count = 4096;
   std::vector<float> in(8 * count), out(count, 0.0f);
@@ -2763,6 +2898,13 @@ int main() {
   // ssm: Mamba selective scan.
   failures += check_selective_scan<float>(q, DType::f32, 1024, 512, 16) ? 0 : 1;
   failures += check_selective_scan<bf16_t>(q, DType::bf16, 1024, 256, 16) ? 0 : 1;
+
+  // ssm: Mamba-2 SSD decode (act dtype x state dtype, incl. the serving
+  // bf16-act/f32-state configuration).
+  failures += check_ssd_decode<float, float>(q, DType::f32, DType::f32) ? 0 : 1;
+  failures += check_ssd_decode<bf16_t, float>(q, DType::bf16, DType::f32) ? 0 : 1;
+  failures += check_ssd_decode<bf16_t, bf16_t>(q, DType::bf16, DType::bf16) ? 0 : 1;
+  failures += check_ssd_decode<half_t, float>(q, DType::f16, DType::f32) ? 0 : 1;
 
   // collectives: multi-GPU sum all-reduce across the visible B60s.
   failures += check_collectives() ? 0 : 1;

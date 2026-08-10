@@ -42,6 +42,7 @@
 #include "attention/rope/rope_kernel.hpp"
 
 #include "norms/qk_norm_rope/qk_norm_rope_kernel.hpp"
+#include "ssm/ssd/ssd_kernel.hpp"
 #include "matmul/dense_gemm/dense_gemm_kernel.hpp"
 #include "norms/norms_kernel.hpp"
 #include "optimizers/adamw/adamw_kernel.hpp"
@@ -524,6 +525,54 @@ int main(int argc, char** argv) {
     sycl::free(mixed_qkv, q);
     sycl::free(core, q);
     sycl::free(z, q);
+    return 0;
+  }
+  if (kernel == "ssd_decode") {
+    // NemotronH-shaped Mamba-2 SSD decode step (TP2 slice by default):
+    // batch = --M sequences, --N state slots, nheads 64, headdim 64,
+    // dstate 128, ngroups 4, f32 state, act dtype = --dtype.
+    const std::size_t batch = M;
+    const std::size_t slots = std::max<std::size_t>(N, batch);
+    const std::size_t nheads = 64, headdim = 64, dstate = 128, ngroups = 4;
+    const std::int64_t ss3 = 1, ss2 = dstate,
+                       ss1 = static_cast<std::int64_t>(headdim) * dstate,
+                       ss0 = static_cast<std::int64_t>(nheads) * headdim * dstate;
+    float *state = sycl::malloc_device<float>(slots * nheads * headdim * dstate, q);
+    void *x = sycl::malloc_device(batch * nheads * headdim * elem, q);
+    void *B = sycl::malloc_device(batch * ngroups * dstate * elem, q);
+    void *C = sycl::malloc_device(batch * ngroups * dstate * elem, q);
+    void *out = sycl::malloc_device(batch * nheads * headdim * elem, q);
+    float *dt_raw = sycl::malloc_device<float>(batch * nheads, q);
+    float *A = sycl::malloc_shared<float>(nheads, q);
+    float *dt_bias = sycl::malloc_device<float>(nheads, q);
+    float *D = sycl::malloc_device<float>(nheads * headdim, q);
+    int *idx = sycl::malloc_shared<int>(batch, q);
+    q.memset(state, 0, slots * nheads * headdim * dstate * sizeof(float)).wait();
+    q.memset(x, 0, batch * nheads * headdim * elem).wait();
+    q.memset(B, 0, batch * ngroups * dstate * elem).wait();
+    q.memset(C, 0, batch * ngroups * dstate * elem).wait();
+    q.memset(dt_raw, 0, batch * nheads * sizeof(float)).wait();
+    q.memset(dt_bias, 0, nheads * sizeof(float)).wait();
+    q.memset(D, 0, nheads * headdim * sizeof(float)).wait();
+    for (std::size_t h = 0; h < nheads; ++h) A[h] = -1.0f;
+    for (std::size_t i = 0; i < batch; ++i) idx[i] = static_cast<int>(i % slots);
+    auto once = [&] {
+      kernels::ssd_decode_sycl(q, state, x, dt_raw, A, B, C, D, dt_bias, idx,
+                               idx, out, true, batch, nheads, headdim, dstate,
+                               ngroups, slots, ss0, ss1, ss2, ss3, dt,
+                               DType::f32);
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    std::cout << "{\"schema_version\":2,\"kernel\":\"ssd_decode\","
+              << "\"variant\":\"sycl\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"batch\":" << batch << ",\"slots\":" << slots
+              << ",\"iters\":" << iters << ",\"median_ms\":" << timing.median_ms
+              << ",\"min_ms\":" << timing.min_ms << ",\"max_ms\":" << timing.max_ms
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}"
+              << std::endl;
+    sycl::free(state, q); sycl::free(x, q); sycl::free(B, q); sycl::free(C, q);
+    sycl::free(out, q); sycl::free(dt_raw, q); sycl::free(A, q);
+    sycl::free(dt_bias, q); sycl::free(D, q); sycl::free(idx, q);
     return 0;
   }
   if (kernel == "fused_add_rms_norm") {

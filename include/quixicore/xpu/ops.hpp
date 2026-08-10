@@ -18,6 +18,7 @@
 // Requires a SYCL toolchain; only compiled under QUIXICORE_XPU_ENABLE_SYCL.
 
 #include <cstddef>
+#include <cstdint>
 
 #include <sycl/sycl.hpp>
 
@@ -338,6 +339,27 @@ void selective_scan(sycl::queue& q, const void* u, const void* delta,
                     void* y, std::size_t n_chan, std::size_t seq,
                     std::size_t state, DType dt, Variant variant = Variant::sycl,
                     bool blocking = true);
+
+// Mamba-2 SSD decode (selective-state-update, scalar-A-per-head), one token per
+// sequence. state is [nslots, nheads, headdim, dstate] of dtype state_dt with
+// element strides s0..s3 (strided serving views are accepted); x and out are
+// [batch, nheads, headdim] of dtype act_dt; dt_raw [batch, nheads], A and
+// dt_bias [nheads], D [nheads, headdim] (nullptr = skip) are f32; B and C are
+// [batch, ngroups, dstate] of dtype act_dt. Per sequence b the state is read
+// from slot src_indices[b] and written to dst_indices[b] (copy-on-write; equal
+// src/dst updates in place). A negative or out-of-range src emits zero output
+// and touches no state; a negative dst skips the state write (read-only step).
+// dt_softplus applies softplus(dt_raw + dt_bias). Recurrence in fp32.
+// Graph-capture-safe: no host sync, no allocation, fixed launch geometry.
+void ssd_decode(sycl::queue& q, void* state, const void* x, const float* dt_raw,
+                const float* A, const void* B, const void* C, const float* D,
+                const float* dt_bias, const std::int32_t* src_indices,
+                const std::int32_t* dst_indices, void* out, bool dt_softplus,
+                std::size_t batch, std::size_t nheads, std::size_t headdim,
+                std::size_t dstate, std::size_t ngroups, std::size_t nslots,
+                std::int64_t s0, std::int64_t s1, std::int64_t s2,
+                std::int64_t s3, DType act_dt, DType state_dt,
+                Variant variant = Variant::sycl, bool blocking = true);
 
 // ----------------------------------------------------------------------------
 // collectives (multi-GPU)

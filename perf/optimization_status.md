@@ -2260,3 +2260,48 @@ throughput pass.
 Raw results: interleaved best-of-7 min_ms above; feasibility probe
 /tmp/jm_probe.cpp (bf16 joint_matrix worst_abs=0); machine-specific JSON not
 archived (git-ignored perf/results/).
+
+## 2026-08-09: Port Mamba-2 SSD decode (ssd_decode) from the vLLM XPU serving work
+
+Provenance: adapted from the QuixiAI MIT decode kernel set
+(`vllm-xpu-kernels csrc/xpu/sycl/decode/mamba2_ssd_decode_kernel.hpp`, commit
+dffcab7) — the kernel that replaced the DEVICE_LOSTing Triton
+selective_state_update and serves NemotronH decode in production on this box.
+MIT-to-MIT adaptation (no external reference source imported); re-homed on the
+QuixiCore DType/ops ABI with two deviations: `has_D` bool became a nullable `D`
+pointer, and the `ActDType` shim was replaced by `DType`.
+
+Kernel + route: `ops::ssd_decode` -> `kernels/ssm/ssd/variants/xpu_sycl/`
+`ssd_decode.sycl.cpp`. One work-group per (batch, head), one lane per headdim
+state row, fp32 recurrence, independent act/state dtypes, strided state views,
+copy-on-write src/dst slots with -1 null semantics. Graph-capture-safe (no host
+sync, no allocation, fixed geometry).
+
+Correctness: `check_ssd_decode` in tests/xpu_ops_smoke.cpp. fp64 oracle for the
+output reduction (rtol scaled by sqrt(dstate)); the per-element state
+expectation replicates the kernel's fp32 chain exactly (a per-element fp64
+reference can land on the adjacent bf16 at rounding boundaries, which the 2e-3
+bf16 tolerance cannot absorb — same rule as the gelu oracle comment). Covers
+act x state dtype {f32,bf16,f16} x {f32,bf16}, GQA group broadcast, padded slot
+pitch (strided view), in-place / copy-on-write / null-src / null-dst slots,
+untouched-slot preservation, exact-zero null-src output. All combos
+worst_excess = 0. Full smoke suite: PASS.
+
+Measurement (Arc Pro B60 device 0, oneAPI icpx, Level Zero; harness
+`--kernel ssd_decode --N 128 --iters 100 --warmup 20`, NemotronH TP2 slice
+nheads=64 headdim=64 dstate=128 ngroups=4, f32 state, median of 5 interleaved
+batches):
+
+| act dtype | batch | median ms | state traffic GB/s |
+|---|---:|---:|---:|
+| bf16 | 1  | 0.0553 | 76 (launch-bound) |
+| bf16 | 32 | 0.998  | 135 |
+| bf16 | 96 | 2.845  | 142 |
+| f32  | 96 | 2.845  | 142 |
+
+State R+W is 4 MiB/sequence; at batch 96 the kernel sustains ~142 GB/s of the
+~456 GB/s roofline (~31%). Decision: **keep** — port baseline, correctness-first;
+identical kernel shape to the production vLLM path. Obvious untuned levers for a
+later ssm throughput pass: vectorized state row loads (sycl::vec on s3==1 fast
+path), multiple heads per work-group at small batch, and subgroup-cooperative
+dstate tiling. Raw JSON not archived (git-ignored perf/results/).

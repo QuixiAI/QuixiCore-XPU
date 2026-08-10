@@ -345,6 +345,23 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/ssm/selective_scan/variants/xpu_sycl}
+  ssd_decode:
+    family: ssm
+    status: implemented
+    path: kernels/ssm/ssd
+    dtypes: [f32, f16, bf16]
+    shape: Mamba-2 SSD selective-state-update decode (scalar-A-per-head)
+    note: >-
+      One work-group per (batch, head), one lane per headdim state row; fp32
+      recurrence, independent activation/state dtypes, strided state views
+      (element strides s0..s3), copy-on-write src/dst slot indices with -1
+      null-slot semantics (null src emits zeros and touches no state).
+      Graph-capture-safe. Adapted from the QuixiAI MIT decode kernel set
+      proven in vLLM XPU serving (NemotronH decode path).
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel ssd_decode --M batch --N slots"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/ssm/ssd/variants/xpu_sycl}
   linear_attn:
     family: linear_attention
     status: implemented
