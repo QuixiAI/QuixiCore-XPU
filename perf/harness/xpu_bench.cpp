@@ -406,6 +406,73 @@ int main(int argc, char** argv) {
     sycl::free(output, q);
     return 0;
   }
+  if (kernel == "nvfp4_moe_relu2") {
+    // NemotronH-style ungated ReLU2 experts: w1 is a single up-projection
+    // [E, I, K/2]. --M tokens, --N experts, --rows top_k, --dim intermediate,
+    // --K hidden. --approx {fused,split}.
+    const std::size_t experts = N;
+    const std::size_t top_k = rows;
+    const std::size_t intermediate = dim;
+    const std::size_t pairs = M * top_k;
+    void *hidden = sycl::malloc_device(M * K * elem, q);
+    int *expert_ids = sycl::malloc_device<int>(pairs, q);
+    float *router_weights = sycl::malloc_device<float>(pairs, q);
+    void *w1 = sycl::malloc_device(experts * intermediate * K / 2, q);
+    void *w1_scales = sycl::malloc_device(experts * intermediate * K / 16, q);
+    float *w1_global = sycl::malloc_device<float>(experts, q);
+    void *w2 = sycl::malloc_device(experts * K * intermediate / 2, q);
+    void *w2_scales = sycl::malloc_device(experts * K * intermediate / 16, q);
+    float *w2_global = sycl::malloc_device<float>(experts, q);
+    float *scratch = sycl::malloc_device<float>(pairs * intermediate, q);
+    float *output = sycl::malloc_device<float>(M * K, q);
+    q.memset(hidden, 0, M * K * elem).wait();
+    q.memset(expert_ids, 0, pairs * sizeof(int)).wait();
+    q.fill(router_weights, 1.0f / static_cast<float>(top_k), pairs).wait();
+    q.memset(w1, 0, experts * intermediate * K / 2).wait();
+    q.memset(w1_scales, 0x38, experts * intermediate * K / 16).wait();
+    q.fill(w1_global, 1.0f, experts).wait();
+    q.memset(w2, 0, experts * K * intermediate / 2).wait();
+    q.memset(w2_scales, 0x38, experts * K * intermediate / 16).wait();
+    q.fill(w2_global, 1.0f, experts).wait();
+    const bool split = approx_s == "split";
+    auto once = [&] {
+      const sycl::event zeroed = q.memset(output, 0, M * K * sizeof(float));
+      if (split) {
+        kernels::nvfp4_moe_relu2_split_sycl(q, hidden, expert_ids, router_weights, w1, w1_scales,
+                                            w1_global, w2, w2_scales, w2_global, scratch, output,
+                                            M, experts, top_k, K, intermediate, true, dt, zeroed);
+      } else {
+        kernels::nvfp4_moe_relu2_fused_sycl(q, hidden, expert_ids, router_weights, w1, w1_scales,
+                                            w1_global, w2, w2_scales, w2_global, output, M,
+                                            experts, top_k, K, intermediate, true, dt, zeroed);
+      }
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    const double median = timing.median_ms;
+    const double fp4_weight_bytes =
+        static_cast<double>(pairs) * (intermediate * K / 2.0 + K * intermediate / 2.0);
+    const double weight_gbps = fp4_weight_bytes / (median * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"nvfp4_moe_relu2\","
+              << "\"variant\":\"" << (split ? "split" : "fused") << "\",\"dtype\":\""
+              << dtype_name(dt) << "\",\"M\":" << M << ",\"experts\":" << experts
+              << ",\"top_k\":" << top_k << ",\"K\":" << K << ",\"I\":" << intermediate
+              << ",\"iters\":" << iters << ",\"median_ms\":" << median
+              << ",\"min_ms\":" << timing.min_ms << ",\"max_ms\":" << timing.max_ms
+              << ",\"weight_gbps\":" << weight_gbps << ",\"device\":\""
+              << q.get_device().get_info<sycl::info::device::name>() << "\"}" << std::endl;
+    sycl::free(hidden, q);
+    sycl::free(expert_ids, q);
+    sycl::free(router_weights, q);
+    sycl::free(w1, q);
+    sycl::free(w1_scales, q);
+    sycl::free(w1_global, q);
+    sycl::free(w2, q);
+    sycl::free(w2_scales, q);
+    sycl::free(w2_global, q);
+    sycl::free(scratch, q);
+    sycl::free(output, q);
+    return 0;
+  }
   if (kernel == "nvfp4_moe") {
     const std::size_t experts = N;
     const std::size_t top_k = rows;

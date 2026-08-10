@@ -2825,6 +2825,122 @@ template <typename T> bool check_nvfp4_moe(sycl::queue &q, DType act_dt) {
   return ok;
 }
 
+// ReLU²-ungated NVFP4 MoE (NemotronH experts): single up-projection w1
+// [E,I,K/2] and relu(g)^2 activation. Same oracle structure as
+// check_nvfp4_moe, plus the fused-vs-split cross-variant equality.
+template <typename T> bool check_nvfp4_moe_relu2(sycl::queue &q, DType act_dt) {
+  constexpr std::size_t M = 8;
+  constexpr std::size_t E = 8;
+  constexpr std::size_t top_k = 4;
+  constexpr std::size_t K = 256;
+  constexpr std::size_t I = 64;
+
+  T *hidden = sycl::malloc_shared<T>(M * K, q);
+  int *expert_ids = sycl::malloc_shared<int>(M * top_k, q);
+  float *router_weights = sycl::malloc_shared<float>(M * top_k, q);
+  std::uint8_t *w1 = sycl::malloc_shared<std::uint8_t>(E * I * K / 2, q);
+  std::uint8_t *w1_scales = sycl::malloc_shared<std::uint8_t>(E * I * K / 16, q);
+  float *w1_global = sycl::malloc_shared<float>(E, q);
+  std::uint8_t *w2 = sycl::malloc_shared<std::uint8_t>(E * K * I / 2, q);
+  std::uint8_t *w2_scales = sycl::malloc_shared<std::uint8_t>(E * K * I / 16, q);
+  float *w2_global = sycl::malloc_shared<float>(E, q);
+  float *scratch = sycl::malloc_shared<float>(M * top_k * I, q);
+  float *fused = sycl::malloc_shared<float>(M * K, q);
+  float *split = sycl::malloc_shared<float>(M * K, q);
+
+  for (std::size_t i = 0; i < M * K; ++i)
+    hidden[i] = static_cast<T>(sample(i + 401) * 0.1f);
+  for (std::size_t m = 0; m < M; ++m) {
+    for (std::size_t route = 0; route < top_k; ++route) {
+      const std::size_t pair = m * top_k + route;
+      expert_ids[pair] = static_cast<int>((m + 3 * route) % E);
+      router_weights[pair] = 1.0f / static_cast<float>(top_k);
+    }
+  }
+  expert_ids[M * top_k - 1] = -1;
+  fill_packed_fp4(w1, E * I * K);
+  fill_packed_fp4(w2, E * K * I);
+  for (std::size_t i = 0; i < E * I * K / 16; ++i)
+    w1_scales[i] = (i & 1) ? 0x38u : 0x30u;
+  for (std::size_t i = 0; i < E * K * I / 16; ++i)
+    w2_scales[i] = (i & 1) ? 0x30u : 0x38u;
+  for (std::size_t e = 0; e < E; ++e) {
+    w1_global[e] = 0.02f + 0.002f * static_cast<float>(e);
+    w2_global[e] = 0.03f + 0.002f * static_cast<float>(e);
+  }
+
+  ops::nvfp4_moe_relu2_fused(q, hidden, expert_ids, router_weights, w1, w1_scales, w1_global, w2,
+                             w2_scales, w2_global, fused, M, E, top_k, K, I, act_dt, true,
+                             Variant::sycl, true);
+  ops::nvfp4_moe_relu2_split(q, hidden, expert_ids, router_weights, w1, w1_scales, w1_global, w2,
+                             w2_scales, w2_global, scratch, split, M, E, top_k, K, I, act_dt, true,
+                             Variant::sycl, true);
+
+  std::vector<float> reference(M * K, 0.0f);
+  std::vector<float> up(I);
+  std::vector<float> activated(I);
+  for (std::size_t m = 0; m < M; ++m) {
+    for (std::size_t route = 0; route < top_k; ++route) {
+      const std::size_t pair = m * top_k + route;
+      const int expert_id = expert_ids[pair];
+      if (expert_id < 0 || static_cast<std::size_t>(expert_id) >= E)
+        continue;
+      const std::size_t expert = static_cast<std::size_t>(expert_id);
+      const std::size_t w1_row0 = expert * I;
+      const std::size_t w2_row0 = expert * K;
+      for (std::size_t row = 0; row < I; ++row) {
+        float accumulator = 0.0f;
+        for (std::size_t k = 0; k < K; ++k) {
+          accumulator += nvfp4_value(w1, w1_scales, w1_row0 + row, k, K, w1_global[expert]) *
+                         static_cast<float>(hidden[m * K + k]);
+        }
+        up[row] = accumulator;
+      }
+      for (std::size_t i = 0; i < I; ++i) {
+        const float rectified = std::max(up[i], 0.0f);
+        activated[i] = rectified * rectified;
+      }
+      for (std::size_t row = 0; row < K; ++row) {
+        float accumulator = 0.0f;
+        for (std::size_t i = 0; i < I; ++i) {
+          accumulator +=
+              nvfp4_value(w2, w2_scales, w2_row0 + row, i, I, w2_global[expert]) * activated[i];
+        }
+        reference[m * K + row] += router_weights[pair] * accumulator;
+      }
+    }
+  }
+
+  double fused_error = 0.0;
+  double split_error = 0.0;
+  double variants_error = 0.0;
+  for (std::size_t i = 0; i < M * K; ++i) {
+    fused_error = std::max(fused_error, std::abs(static_cast<double>(fused[i] - reference[i])));
+    split_error = std::max(split_error, std::abs(static_cast<double>(split[i] - reference[i])));
+    variants_error = std::max(variants_error, std::abs(static_cast<double>(split[i] - fused[i])));
+  }
+  const double tolerance = act_dt == DType::f32 ? 8e-4 : 3e-3;
+  const bool ok =
+      fused_error <= tolerance && split_error <= tolerance && variants_error <= tolerance;
+  std::cout << "  nvfp4_moe_relu2 act=" << dtype_name(act_dt) << " fused_max_abs=" << fused_error
+            << " split_max_abs=" << split_error << " variants_max_abs=" << variants_error
+            << (ok ? "  ok" : "  FAIL") << '\n';
+
+  sycl::free(hidden, q);
+  sycl::free(expert_ids, q);
+  sycl::free(router_weights, q);
+  sycl::free(w1, q);
+  sycl::free(w1_scales, q);
+  sycl::free(w1_global, q);
+  sycl::free(w2, q);
+  sycl::free(w2_scales, q);
+  sycl::free(w2_global, q);
+  sycl::free(scratch, q);
+  sycl::free(fused, q);
+  sycl::free(split, q);
+  return ok;
+}
+
 template <typename T> bool check_qwen_gdn_decode(sycl::queue &q, DType act_dt) {
   constexpr std::size_t batch = 1;
   constexpr std::size_t slots = 2;
@@ -3100,6 +3216,8 @@ int main() {
   failures += check_nvfp4_moe<float>(q, DType::f32) ? 0 : 1;
   failures += check_nvfp4_moe<half_t>(q, DType::f16) ? 0 : 1;
   failures += check_nvfp4_moe<bf16_t>(q, DType::bf16) ? 0 : 1;
+  failures += check_nvfp4_moe_relu2<float>(q, DType::f32) ? 0 : 1;
+  failures += check_nvfp4_moe_relu2<bf16_t>(q, DType::bf16) ? 0 : 1;
 
   // GGUF q8_0 / q4_0 GEMV (native block-layout decode).
   failures += check_gguf_gemv<float>(q, DType::f32, ops::GgufType::q8_0, "q8_0", 128, 4096) ? 0 : 1;

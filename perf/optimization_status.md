@@ -2426,3 +2426,40 @@ lanes on consecutive CHANNELS while the dim-major layout makes those reads
 consecutive lanes walk consecutive tokens within a channel row is the obvious
 lever for a later ssm throughput pass. Decision: **keep** — port baseline,
 correctness-first.
+
+## 2026-08-09: Port nvfp4_moe_relu2 (NemotronH ungated ReLU² experts) from the vLLM XPU serving work
+
+Provenance: ported back from the vLLM XPU serving prototype
+(`vllm-xpu-kernels csrc/xpu/sycl/decode/nvfp4_moe_kernel.hpp` relu2 section,
+commit dffcab7), which itself originated from this repository's SwiGLU
+nvfp4_moe kernels. MIT-to-MIT; re-expressed in this file's house style
+(output_ready event chain, dispatch-layer output zeroing) sharing
+nvfp4_row_dot and the e2m1/e4m3 decoders with the SwiGLU kernels.
+
+Kernels + route: `ops::nvfp4_moe_relu2_fused` / `ops::nvfp4_moe_relu2_split`
+-> relu2 kernels in `kernels/moe/nvfp4_moe/variants/xpu_sycl/nvfp4_moe.sycl.cpp`.
+w1 is a SINGLE up-projection [E,I,K/2] (not gate+up); activation relu(g)^2, no
+gate multiply; W4A16 (16-bit activations). Split form takes caller scratch
+[M*top_k, I]. EP-safe: expert ids outside [0,E) are skipped (the property the
+vLLM expert-parallel path depends on).
+
+Correctness: `check_nvfp4_moe_relu2` in tests/xpu_ops_smoke.cpp — same
+host-replica oracle structure as check_nvfp4_moe (exact e2m1/e4m3 decode,
+including a -1 routed pair) plus fused-vs-split cross-variant equality.
+f32/bf16: max_abs ~1e-9 on all three comparisons. Full smoke suite: PASS.
+
+Measurement (Arc Pro B60 device 0, oneAPI icpx, Level Zero; harness
+`--kernel nvfp4_moe_relu2 --M 1 --N 64 --rows 6 --dim 1856 --K 4480
+--approx {fused,split} --iters 50 --warmup 10`, bf16, NemotronH-shaped
+E=64/top_k=6/K=4480/I=1856):
+
+| variant | median ms | weight GB/s |
+|---|---:|---:|
+| fused | 1.252 | 40 |
+| split | 0.244 | 204 |
+
+Split wins 5.1x at M=1 — the same occupancy profile as the SwiGLU split
+(fused runs one work-group per routed pair; split spreads row tiles). Routing
+guidance mirrors nvfp4_moe: split for decode/graph-replay, fused only once
+M*top_k fills the device. Decision: **keep** both as co-equal experimental
+variants under the nvfp4_moe manifest entry.

@@ -460,6 +460,17 @@ operations:
     variants:
       - {name: xpu_sycl_fused, status: experimental, path: kernels/moe/nvfp4_moe/variants/xpu_sycl}
       - {name: xpu_sycl_split, status: experimental, path: kernels/moe/nvfp4_moe/variants/xpu_sycl}
+      - name: xpu_sycl_relu2_fused
+        status: experimental
+        path: kernels/moe/nvfp4_moe/variants/xpu_sycl
+        note: >-
+          ReLU²-ungated NemotronH experts: w1 is a single up-projection
+          [E,I,K/2] and the activation is relu(g)^2 with no gate multiply.
+          Ported back from the vLLM XPU serving prototype (dffcab7).
+      - name: xpu_sycl_relu2_split
+        status: experimental
+        path: kernels/moe/nvfp4_moe/variants/xpu_sycl
+        note: Two-stage relu2 form; caller scratch [M*top_k, I]. Preferred at decode.
   dropout:
     family: utils
     status: implemented

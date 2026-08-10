@@ -18,6 +18,9 @@ All notable QuixiCore XPU changes should be recorded here.
 - causal_conv1d_prefill: varlen depthwise causal conv prefill (dim-major
   layout, event-chained output + state write-back passes, has_init and
   null-slot semantics). Graph-capture-safe.
+- nvfp4_moe_relu2_fused / nvfp4_moe_relu2_split: ReLU²-ungated NVFP4 MoE
+  experts (NemotronH) — single up-projection w1 [E,I,K/2], relu(g)² with no
+  gate multiply, W4A16, EP-safe expert-id skip.
 
 ### Kernel families — breadth
 

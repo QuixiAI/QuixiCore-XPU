@@ -297,6 +297,28 @@ void nvfp4_moe_split(sycl::queue &q, const void *hidden, const int *topk_ids,
                      DType act_dt, bool multiply_router_weight = true,
                      Variant variant = Variant::sycl, bool blocking = true);
 
+// ReLU²-ungated NVFP4 MoE (NemotronH-style experts). Same contract as
+// `nvfp4_moe_fused` except w1 is a SINGLE up-projection [E,I,K/2] with scales
+// [E,I,K/16] (not gate+up), and the activation is relu(g)^2 with no gate
+// multiply. Output fp32 [M,K], zero-initialized by the call.
+void nvfp4_moe_relu2_fused(sycl::queue &q, const void *hidden, const int *topk_ids,
+                           const float *topk_weights, const void *w1, const void *w1_scales,
+                           const float *w1_global_scales, const void *w2, const void *w2_scales,
+                           const float *w2_global_scales, float *out_f32, std::size_t M,
+                           std::size_t E, std::size_t top_k, std::size_t K, std::size_t I,
+                           DType act_dt, bool multiply_router_weight = true,
+                           Variant variant = Variant::sycl, bool blocking = true);
+
+// Higher-occupancy two-stage form of `nvfp4_moe_relu2_fused`. The caller
+// supplies fp32 scratch [M*top_k, I] (the up-projection buffer).
+void nvfp4_moe_relu2_split(sycl::queue &q, const void *hidden, const int *topk_ids,
+                           const float *topk_weights, const void *w1, const void *w1_scales,
+                           const float *w1_global_scales, const void *w2, const void *w2_scales,
+                           const float *w2_global_scales, float *scratch_f32, float *out_f32,
+                           std::size_t M, std::size_t E, std::size_t top_k, std::size_t K,
+                           std::size_t I, DType act_dt, bool multiply_router_weight = true,
+                           Variant variant = Variant::sycl, bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // linear_attention
 // ----------------------------------------------------------------------------

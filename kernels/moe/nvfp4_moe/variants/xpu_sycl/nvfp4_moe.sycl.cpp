@@ -343,6 +343,192 @@ sycl::event dispatch_split(sycl::queue &q, const void *hidden, const int *topk_i
   return launch_output.template operator()<1>();
 }
 
+// ---- ReLU²-ungated MoE (NemotronH) ----
+// Mirrors the SwiGLU kernels but: w1 is a SINGLE up-projection [E, I, K/2]
+// (not gate+up [E, 2I, K/2]), and the activation is squared-ReLU with no gate
+// multiply: a[i] = relu(g[i])^2. Activations stay 16-bit (W4A16). Ported back
+// from the vLLM XPU serving prototype (vllm-xpu-kernels commit dffcab7),
+// which itself originated from this file's SwiGLU kernels.
+
+template <typename T> class Nvfp4MoeRelu2FusedKernel;
+
+template <typename T>
+sycl::event relu2_fused_typed(sycl::queue &q, const T *hidden, const int *topk_ids,
+                              const float *topk_weights, const std::uint8_t *w1,
+                              const std::uint8_t *w1_scales, const float *w1_global_scales,
+                              const std::uint8_t *w2, const std::uint8_t *w2_scales,
+                              const float *w2_global_scales, float *output, std::size_t M,
+                              std::size_t E, std::size_t top_k, std::size_t K, std::size_t I,
+                              bool multiply_router_weight, const sycl::event &output_ready) {
+  const std::size_t w1_expert_stride = I * (K / 2);
+  const std::size_t s1_expert_stride = I * (K / 16);
+  const std::size_t w2_expert_stride = K * (I / 2);
+  const std::size_t s2_expert_stride = K * (I / 16);
+  const sycl::nd_range<1> range(sycl::range<1>(M * top_k * kWG), sycl::range<1>(kWG));
+
+  return q.submit([&](sycl::handler &handler) {
+    handler.depends_on(output_ready);
+    sycl::local_accessor<float, 1> up(sycl::range<1>(I), handler);
+    sycl::local_accessor<float, 1> activated(sycl::range<1>(I), handler);
+    handler.parallel_for<Nvfp4MoeRelu2FusedKernel<T>>(
+        range, [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(kSG)]] {
+          const std::size_t pair = item.get_group(0);
+          const std::size_t token = pair / top_k;
+          const int expert = topk_ids[pair];
+          if (expert < 0 || static_cast<std::size_t>(expert) >= E)
+            return;
+
+          const sycl::sub_group subgroup = item.get_sub_group();
+          const int subgroup_id = static_cast<int>(subgroup.get_group_linear_id());
+          const int lane = static_cast<int>(subgroup.get_local_linear_id());
+          const int thread = static_cast<int>(item.get_local_linear_id());
+          const std::size_t expert_index = static_cast<std::size_t>(expert);
+          const float w1_global = w1_global_scales[expert_index] * 4194304.0f;
+          const std::uint8_t *expert_w1 = w1 + expert_index * w1_expert_stride;
+          const std::uint8_t *expert_s1 = w1_scales + expert_index * s1_expert_stride;
+
+          for (std::size_t row = subgroup_id; row < I; row += kSubgroups) {
+            const float value =
+                nvfp4_row_dot(subgroup, expert_w1 + row * (K / 2), expert_s1 + row * (K / 16),
+                              w1_global, hidden + token * K, K);
+            if (lane == 0)
+              up[row] = value;
+          }
+          sycl::group_barrier(item.get_group());
+
+          for (std::size_t i = thread; i < I; i += kWG) {
+            const float rectified = sycl::fmax(up[i], 0.0f);
+            activated[i] = rectified * rectified;
+          }
+          sycl::group_barrier(item.get_group());
+
+          const float router_weight = multiply_router_weight ? topk_weights[pair] : 1.0f;
+          const float w2_global = w2_global_scales[expert_index] * 4194304.0f;
+          const std::uint8_t *expert_w2 = w2 + expert_index * w2_expert_stride;
+          const std::uint8_t *expert_s2 = w2_scales + expert_index * s2_expert_stride;
+          const float *activation = &activated[0];
+          for (std::size_t row = subgroup_id; row < K; row += kSubgroups) {
+            const float value = nvfp4_row_dot(subgroup, expert_w2 + row * (I / 2),
+                                              expert_s2 + row * (I / 16), w2_global, activation, I);
+            if (lane == 0) {
+              sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                               sycl::access::address_space::global_space>
+                  accumulator(output[token * K + row]);
+              accumulator.fetch_add(router_weight * value);
+            }
+          }
+        });
+  });
+}
+
+template <typename T> class Nvfp4MoeRelu2UpKernel;
+class Nvfp4MoeRelu2OutputKernel;
+
+template <typename T>
+sycl::event relu2_up_typed(sycl::queue &q, const T *hidden, const int *topk_ids,
+                           const std::uint8_t *w1, const std::uint8_t *w1_scales,
+                           const float *w1_global_scales, float *scratch, std::size_t pairs,
+                           std::size_t top_k, std::size_t E, std::size_t K, std::size_t I) {
+  const std::size_t w1_expert_stride = I * (K / 2);
+  const std::size_t s1_expert_stride = I * (K / 16);
+  const std::size_t row_tiles = (I + kSubgroups - 1) / kSubgroups;
+  const sycl::nd_range<2> range(sycl::range<2>(pairs, row_tiles * kWG), sycl::range<2>(1, kWG));
+  return q.parallel_for<Nvfp4MoeRelu2UpKernel<T>>(
+      range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(kSG)]] {
+        const std::size_t pair = item.get_global_id(0);
+        const int expert = topk_ids[pair];
+        if (expert < 0 || static_cast<std::size_t>(expert) >= E)
+          return;
+        const std::size_t token = pair / top_k;
+        const sycl::sub_group subgroup = item.get_sub_group();
+        const int subgroup_id = static_cast<int>(subgroup.get_group_linear_id());
+        const int lane = static_cast<int>(subgroup.get_local_linear_id());
+        const std::size_t row = item.get_group(1) * kSubgroups + subgroup_id;
+        if (row >= I)
+          return;
+        const std::size_t expert_index = static_cast<std::size_t>(expert);
+        const float w1_global = w1_global_scales[expert_index] * 4194304.0f;
+        const float value = nvfp4_row_dot(
+            subgroup, w1 + expert_index * w1_expert_stride + row * (K / 2),
+            w1_scales + expert_index * s1_expert_stride + row * (K / 16), w1_global,
+            hidden + token * K, K);
+        if (lane == 0)
+          scratch[pair * I + row] = value;
+      });
+}
+
+inline sycl::event relu2_output_typed(sycl::queue &q, const int *topk_ids,
+                                      const float *topk_weights, const std::uint8_t *w2,
+                                      const std::uint8_t *w2_scales,
+                                      const float *w2_global_scales, const float *scratch,
+                                      float *output, std::size_t pairs, std::size_t top_k,
+                                      std::size_t E, std::size_t K, std::size_t I,
+                                      bool multiply_router_weight,
+                                      const sycl::event &up_ready,
+                                      const sycl::event &output_ready) {
+  const std::size_t w2_expert_stride = K * (I / 2);
+  const std::size_t s2_expert_stride = K * (I / 16);
+  const std::size_t row_tiles = (K + kSubgroups - 1) / kSubgroups;
+  const sycl::nd_range<2> range(sycl::range<2>(pairs, row_tiles * kWG), sycl::range<2>(1, kWG));
+  return q.submit([&](sycl::handler &handler) {
+    handler.depends_on(std::vector<sycl::event>{up_ready, output_ready});
+    sycl::local_accessor<float, 1> activated(sycl::range<1>(I), handler);
+    handler.parallel_for<Nvfp4MoeRelu2OutputKernel>(
+        range, [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(kSG)]] {
+          const std::size_t pair = item.get_global_id(0);
+          const int expert = topk_ids[pair];
+          if (expert < 0 || static_cast<std::size_t>(expert) >= E)
+            return;
+          const std::size_t token = pair / top_k;
+          const float router_weight = multiply_router_weight ? topk_weights[pair] : 1.0f;
+          const sycl::sub_group subgroup = item.get_sub_group();
+          const int subgroup_id = static_cast<int>(subgroup.get_group_linear_id());
+          const int lane = static_cast<int>(subgroup.get_local_linear_id());
+          const int thread = static_cast<int>(item.get_local_linear_id());
+          const float *up_row = scratch + pair * I;
+          for (std::size_t i = thread; i < I; i += kWG) {
+            const float rectified = sycl::fmax(up_row[i], 0.0f);
+            activated[i] = rectified * rectified;
+          }
+          sycl::group_barrier(item.get_group());
+          const std::size_t row = item.get_group(1) * kSubgroups + subgroup_id;
+          if (row >= K)
+            return;
+          const std::size_t expert_index = static_cast<std::size_t>(expert);
+          const float w2_global = w2_global_scales[expert_index] * 4194304.0f;
+          const float value = nvfp4_row_dot(
+              subgroup, w2 + expert_index * w2_expert_stride + row * (I / 2),
+              w2_scales + expert_index * s2_expert_stride + row * (I / 16), w2_global,
+              &activated[0], I);
+          if (lane == 0) {
+            sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::global_space>
+                accumulator(output[token * K + row]);
+            accumulator.fetch_add(router_weight * value);
+          }
+        });
+  });
+}
+
+template <typename T>
+sycl::event dispatch_relu2_split(sycl::queue &q, const void *hidden, const int *topk_ids,
+                                 const float *topk_weights, const void *w1, const void *w1_scales,
+                                 const float *w1_global_scales, const void *w2,
+                                 const void *w2_scales, const float *w2_global_scales,
+                                 float *scratch_f32, float *out_f32, std::size_t M, std::size_t E,
+                                 std::size_t top_k, std::size_t K, std::size_t I,
+                                 bool multiply_router_weight, const sycl::event &output_ready) {
+  const std::size_t pairs = M * top_k;
+  const sycl::event up_ready = relu2_up_typed(
+      q, static_cast<const T *>(hidden), topk_ids, static_cast<const std::uint8_t *>(w1),
+      static_cast<const std::uint8_t *>(w1_scales), w1_global_scales, scratch_f32, pairs, top_k, E,
+      K, I);
+  return relu2_output_typed(q, topk_ids, topk_weights, static_cast<const std::uint8_t *>(w2),
+                            static_cast<const std::uint8_t *>(w2_scales), w2_global_scales,
+                            scratch_f32, out_f32, pairs, top_k, E, K, I, multiply_router_weight,
+                            up_ready, output_ready);
+}
+
 } // namespace
 
 sycl::event nvfp4_moe_fused_sycl(sycl::queue &q, const void *hidden, const int *topk_ids,
@@ -390,6 +576,62 @@ sycl::event nvfp4_moe_split_sycl(sycl::queue &q, const void *hidden, const int *
     return dispatch_split<bf16_t>(q, hidden, topk_ids, topk_weights, w13, w13_scales,
                                   w13_global_scales, w2, w2_scales, w2_global_scales, scratch_f32,
                                   out_f32, M, E, top_k, K, I, multiply_router_weight, output_ready);
+  }
+  return {};
+}
+
+sycl::event nvfp4_moe_relu2_fused_sycl(sycl::queue &q, const void *hidden, const int *topk_ids,
+                                       const float *topk_weights, const void *w1,
+                                       const void *w1_scales, const float *w1_global_scales,
+                                       const void *w2, const void *w2_scales,
+                                       const float *w2_global_scales, float *out_f32,
+                                       std::size_t M, std::size_t E, std::size_t top_k,
+                                       std::size_t K, std::size_t I, bool multiply_router_weight,
+                                       DType act_dt, const sycl::event &output_ready) {
+#define QX_R2F(T)                                                                                  \
+  return relu2_fused_typed<T>(q, static_cast<const T *>(hidden), topk_ids, topk_weights,           \
+                              static_cast<const std::uint8_t *>(w1),                               \
+                              static_cast<const std::uint8_t *>(w1_scales), w1_global_scales,      \
+                              static_cast<const std::uint8_t *>(w2),                               \
+                              static_cast<const std::uint8_t *>(w2_scales), w2_global_scales,      \
+                              out_f32, M, E, top_k, K, I, multiply_router_weight, output_ready)
+  switch (act_dt) {
+  case DType::f32:
+    QX_R2F(float);
+  case DType::f16:
+    QX_R2F(half_t);
+  case DType::bf16:
+    QX_R2F(bf16_t);
+  }
+#undef QX_R2F
+  return {};
+}
+
+sycl::event nvfp4_moe_relu2_split_sycl(sycl::queue &q, const void *hidden, const int *topk_ids,
+                                       const float *topk_weights, const void *w1,
+                                       const void *w1_scales, const float *w1_global_scales,
+                                       const void *w2, const void *w2_scales,
+                                       const float *w2_global_scales, float *scratch_f32,
+                                       float *out_f32, std::size_t M, std::size_t E,
+                                       std::size_t top_k, std::size_t K, std::size_t I,
+                                       bool multiply_router_weight, DType act_dt,
+                                       const sycl::event &output_ready) {
+  switch (act_dt) {
+  case DType::f32:
+    return dispatch_relu2_split<float>(q, hidden, topk_ids, topk_weights, w1, w1_scales,
+                                       w1_global_scales, w2, w2_scales, w2_global_scales,
+                                       scratch_f32, out_f32, M, E, top_k, K, I,
+                                       multiply_router_weight, output_ready);
+  case DType::f16:
+    return dispatch_relu2_split<half_t>(q, hidden, topk_ids, topk_weights, w1, w1_scales,
+                                        w1_global_scales, w2, w2_scales, w2_global_scales,
+                                        scratch_f32, out_f32, M, E, top_k, K, I,
+                                        multiply_router_weight, output_ready);
+  case DType::bf16:
+    return dispatch_relu2_split<bf16_t>(q, hidden, topk_ids, topk_weights, w1, w1_scales,
+                                        w1_global_scales, w2, w2_scales, w2_global_scales,
+                                        scratch_f32, out_f32, M, E, top_k, K, I,
+                                        multiply_router_weight, output_ready);
   }
   return {};
 }
