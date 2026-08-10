@@ -42,6 +42,7 @@
 #include "attention/rope/rope_kernel.hpp"
 
 #include "norms/qk_norm_rope/qk_norm_rope_kernel.hpp"
+#include "activations/glu_quant/glu_quant_kernel.hpp"
 #include "norms/norm_quant/norm_quant_kernel.hpp"
 #include "quantization/turboquant/turboquant_kernel.hpp"
 #include "quantization/turboquant/turboquant_tables.hpp"
@@ -644,6 +645,27 @@ int main(int argc, char** argv) {
     sycl::free(state, q); sycl::free(x, q); sycl::free(B, q); sycl::free(C, q);
     sycl::free(out, q); sycl::free(dt_raw, q); sycl::free(A, q);
     sycl::free(dt_bias, q); sycl::free(D, q); sycl::free(idx, q);
+    return 0;
+  }
+  if (kernel == "glu_quant") {
+    // --rows x [rows, 2*--dim] input, --approx {fp8,mxfp4}, --window group.
+    const int mode = approx_s == "mxfp4" ? 1 : 0;
+    const std::size_t group = mode == 1 ? 32 : (window ? window : 128);
+    void *x = sycl::malloc_device(rows * 2 * dim * elem, q);
+    auto *outq = sycl::malloc_device<std::uint8_t>(rows * dim, q);
+    float *scales = sycl::malloc_device<float>(rows * (dim / group), q);
+    q.memset(x, 0, rows * 2 * dim * elem).wait();
+    auto once = [&] {
+      kernels::glu_quant_sycl(q, x, outq, scales, rows, dim, group, mode, dt);
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    std::cout << "{\"schema_version\":2,\"kernel\":\"glu_quant\",\"variant\":\"sycl\","
+              << "\"dtype\":\"" << dtype_name(dt) << "\",\"mode\":\"" << approx_s
+              << "\",\"rows\":" << rows << ",\"d\":" << dim << ",\"group\":" << group
+              << ",\"iters\":" << iters << ",\"median_ms\":" << timing.median_ms
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}"
+              << std::endl;
+    sycl::free(x, q); sycl::free(outq, q); sycl::free(scales, q);
     return 0;
   }
   if (kernel == "norm_quant") {

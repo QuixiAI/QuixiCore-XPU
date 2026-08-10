@@ -1101,6 +1101,77 @@ bool check_causal_conv1d_prefill(sycl::queue& q, DType act_dt, DType state_dt,
   return ok;
 }
 
+// Fused SwiGLU + quantization. Decoded-output oracle against the fp64
+// silu(gate)*value reference within the format quantization step; scale
+// sanity per mode.
+template <typename T>
+bool check_glu_quant(sycl::queue& q, DType dt, ops::GluQuantMode mode,
+                     std::size_t rows, std::size_t d, std::size_t group) {
+  namespace codec = quixicore::xpu::turboquant_codec;
+  const bool mx = mode == ops::GluQuantMode::mxfp4;
+  const std::size_t g = mx ? 32 : group;
+  const std::size_t qbytes = mx ? rows * d / 2 : rows * d;
+  T* x = sycl::malloc_shared<T>(rows * 2 * d, q);
+  std::uint8_t* out_q = sycl::malloc_shared<std::uint8_t>(qbytes, q);
+  float* scales = sycl::malloc_shared<float>(rows * (d / g), q);
+  for (std::size_t i = 0; i < rows * 2 * d; ++i)
+    x[i] = static_cast<T>(sample(i + 3));
+
+  ops::glu_quant(q, x, out_q, scales, rows, d, g, mode, dt, Variant::sycl,
+                 true);
+
+  const Tol tol = tol_for(dt);
+  double worst = 0.0;
+  int scale_bad = 0;
+  for (std::size_t r = 0; r < rows; ++r) {
+    for (std::size_t gi = 0; gi < d / g; ++gi) {
+      double gmax = 0.0;
+      std::vector<double> y(g);
+      for (std::size_t j = 0; j < g; ++j) {
+        const std::size_t i = gi * g + j;
+        const double gv = static_cast<double>(x[r * 2 * d + i]);
+        const double vv = static_cast<double>(x[r * 2 * d + d + i]);
+        y[j] = gv / (1.0 + std::exp(-gv)) * vv;
+        gmax = std::max(gmax, std::abs(y[j]));
+      }
+      const double s = scales[r * (d / g) + gi];
+      if (!mx) {
+        const double ref_s = std::max(gmax / 448.0, 1.0 / (448.0 * 512.0));
+        if (std::abs(s - ref_s) > 1e-3 * ref_s + 8 * tol.rtol * ref_s)
+          ++scale_bad;
+      } else {
+        const double l2 = std::log2(s);
+        if (l2 != std::floor(l2) || s * 6.0 < gmax * 0.999) ++scale_bad;
+      }
+      for (std::size_t j = 0; j < g; ++j) {
+        const std::size_t i = gi * g + j;
+        double dec;
+        double step;
+        if (!mx) {
+          dec = static_cast<double>(codec::e4m3_decode(out_q[r * d + i])) * s;
+          step = 0.0625 * std::abs(y[j]) + s * 0.002;
+        } else {
+          const std::uint8_t byte = out_q[(r * d + i) / 2];
+          const std::uint8_t nib = (i & 1) ? (byte >> 4) : (byte & 0x0f);
+          constexpr double kE2m1[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
+          const double mag = kE2m1[nib & 0x7];
+          dec = ((nib & 0x8) ? -mag : mag) * s;
+          step = 1.0 * s;
+        }
+        worst = std::max(worst, std::abs(dec - y[j]) -
+                                    (step + tol.atol + 4 * tol.rtol * gmax));
+      }
+    }
+  }
+  sycl::free(x, q); sycl::free(out_q, q); sycl::free(scales, q);
+  const bool ok = worst <= 0.0 && scale_bad == 0;
+  std::cout << "  glu_quant dt=" << dtype_name(dt)
+            << " mode=" << (mx ? "mxfp4" : "group_fp8") << " g=" << g
+            << " worst_excess=" << worst << " scale_bad=" << scale_bad
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // Fused RMSNorm + quantization. Oracle: fp64 residual-add (rounded read-back
 // exact-checked) + norm, then compare the DECODED quantized output against
 // the fp64 normed value within norm tolerance + the format's quantization
@@ -3808,6 +3879,14 @@ int main() {
                                                          false, false, false) ? 0 : 1;
   failures += check_causal_conv1d_decode<half_t, float>(q, DType::f16, DType::f32,
                                                         true, false, true) ? 0 : 1;
+
+  // activations: fused SwiGLU + quantization.
+  failures += check_glu_quant<bf16_t>(q, DType::bf16, ops::GluQuantMode::group_fp8,
+                                      32, 2048, 128) ? 0 : 1;
+  failures += check_glu_quant<float>(q, DType::f32, ops::GluQuantMode::group_fp8,
+                                     16, 1024, 32) ? 0 : 1;
+  failures += check_glu_quant<bf16_t>(q, DType::bf16, ops::GluQuantMode::mxfp4,
+                                      16, 2048, 32) ? 0 : 1;
 
   // norms: fused RMSNorm + quantization (fp8 static/dynamic, mxfp4;
   // +residual = residual_rms_norm_quant contract).

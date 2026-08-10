@@ -2653,3 +2653,14 @@ vectorized; the gap is scalar loads + the extra absmax pass). Decision:
 **keep** — correctness-first; vectorization shared with the norms tuning
 pass. Per-block fp8 (DeepSeek 128-group) deliberately deferred: planned in
 the manifest, needs its own layout decision.
+
+## 2026-08-09: Add glu_quant (fused SwiGLU + fp8/mxfp4 quant)
+
+Companion to norm_quant, sharing its scale rules and integer-exact encoders;
+chains translated from vllm-xpu-kernels fused_silu_mul_{block,mxfp4}_quant.
+One work-group per row, one subgroup per quant group; the gated value is
+recomputed after the absmax pass. Correctness: decoded-output oracle + scale
+sanity across group_fp8 (groups 32/128) and mxfp4, worst_excess = 0, full
+suite PASS. Measurement (B60; --rows 4096 --dim 4096, bf16): group_fp8
+0.444 ms, mxfp4 0.580 ms. Decision: **keep** (correctness-first; shares the
+future norms/activations vectorization pass).

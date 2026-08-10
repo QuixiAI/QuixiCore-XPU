@@ -49,6 +49,24 @@ void gelu(sycl::queue& q, const void* in, void* out, std::size_t n, DType dt,
           GeluApprox approx = GeluApprox::erf, Variant variant = Variant::sycl,
           bool blocking = true);
 
+// Fused SwiGLU + activation quantization modes.
+enum class GluQuantMode {
+  group_fp8,  // per-`group` dynamic e4m3 with fp32 scales [rows, d/group]
+  mxfp4,      // per-32-group fp32 power-of-two scale + packed e2m1 nibbles
+};
+
+// Fused SwiGLU + quantize. x is [rows, 2*d] (gate half then value half, the
+// glu layout) of dtype dt; y = silu(gate) * value in fp32. out_q is u8
+// [rows, d] (group_fp8) or [rows, d/2] (mxfp4, element 2i in the low
+// nibble); out_scales is fp32 [rows, d/group] (group must divide d; mxfp4
+// forces group 32). Scale rules match norm_quant's dynamic modes. Encode
+// steps are integer-exact. Out-of-envelope shapes are rejected without
+// launching.
+void glu_quant(sycl::queue& q, const void* x, std::uint8_t* out_q,
+               float* out_scales, std::size_t rows, std::size_t d,
+               std::size_t group, GluQuantMode mode, DType dt,
+               Variant variant = Variant::sycl, bool blocking = true);
+
 // Numerically stable softmax over the last axis of a [rows, dim] row-major
 // tensor: subtract the row max, exponentiate, normalize by the row sum. `x`,
 // `out` are device pointers of dtype `dt` ([rows*dim]); exp/sum accumulate in

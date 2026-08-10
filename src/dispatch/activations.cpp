@@ -7,6 +7,7 @@
 #include "activations/gelu/gelu_kernel.hpp"
 #include "activations/gelu_backward/gelu_backward_kernel.hpp"
 #include "activations/glu/glu_kernel.hpp"
+#include "activations/glu_quant/glu_quant_kernel.hpp"
 #include "activations/silu/silu_kernel.hpp"
 #include "activations/softmax/softmax_kernel.hpp"
 
@@ -92,6 +93,16 @@ void glu_gelu_f16(sycl::queue& q, const void* x, void* out, std::size_t rows,
                   std::size_t d, DType dt, Variant variant, bool blocking) {
   (void)variant;  // native only
   sycl::event ev = kernels::glu_gelu_f16_sycl(q, x, out, rows, d, dt);
+  if (blocking) ev.wait();
+}
+
+void glu_quant(sycl::queue& q, const void* x, std::uint8_t* out_q,
+               float* out_scales, std::size_t rows, std::size_t d,
+               std::size_t group, GluQuantMode mode, DType dt, Variant variant,
+               bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::glu_quant_sycl(q, x, out_q, out_scales, rows, d,
+                                           group, static_cast<int>(mode), dt);
   if (blocking) ev.wait();
 }
 

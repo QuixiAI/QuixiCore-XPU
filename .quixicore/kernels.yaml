@@ -176,6 +176,22 @@ operations:
     variants:
       - {name: xpu_sycl, status: experimental, path: kernels/norms/rms_norm/variants/xpu_sycl}
 
+  glu_quant:
+    family: activations
+    status: implemented
+    path: kernels/activations/glu_quant
+    dtypes: [f32, f16, bf16]
+    shape: fused SwiGLU + fp8/mxfp4 activation quantization
+    note: >-
+      y = silu(gate) * value in fp32 from the [rows, 2d] glu layout, then
+      per-group dynamic e4m3 (fp32 scales, group divides d) or mxfp4
+      (per-32-group power-of-two scale + packed e2m1). Scale rules shared
+      with norm_quant; encode steps integer-exact. Chains match
+      vllm-xpu-kernels fused_silu_mul_{block,mxfp4}_quant (translated).
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel glu_quant --rows R --dim D --approx {fp8,mxfp4}"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/activations/glu_quant/variants/xpu_sycl}
   norm_quant:
     family: norms
     status: implemented

@@ -28,6 +28,8 @@ All notable QuixiCore XPU changes should be recorded here.
 - group_rms_norm_gated: gated group-RMSNorm (Mamba-2 mixer norm, fp32
   gating, per-group variance, torch rounding order) — replaces the last
   eager-torch op in the XPU Mamba decode path.
+- glu_quant: fused SwiGLU + activation quant (per-group fp8 e4m3,
+  mxfp4), scale rules shared with norm_quant.
 - norm_quant: fused RMSNorm + activation quant (static/dynamic fp8 e4m3,
   mxfp4 with power-of-two group scales); in-place residual form covers the
   residual_rms_norm_quant contract.
