@@ -1102,6 +1102,65 @@ bool check_causal_conv1d_prefill(sycl::queue& q, DType act_dt, DType state_dt,
   return ok;
 }
 
+// Paged KV-cache write. Byte/element-exact expectation: the write is a pure
+// scatter (fp8 mode = shared-codec e4m3 encode of v/scale), so device and
+// host replica must agree exactly; skipped slots leave the sentinel fill.
+template <typename T>
+bool check_kv_cache_scatter_paged(sycl::queue& q, DType dt, bool fp8) {
+  namespace codec = quixicore::xpu::turboquant_codec;
+  const std::size_t n = 7, Hkv = 3, d = 32, page = 4, n_pages = 6;
+  const std::size_t row = Hkv * d, pe = page * row;
+  T* key = sycl::malloc_shared<T>(n * row, q);
+  T* value = sycl::malloc_shared<T>(n * row, q);
+  std::int64_t* slots = sycl::malloc_shared<std::int64_t>(n, q);
+  float* ks = sycl::malloc_shared<float>(1, q);
+  float* vs = sycl::malloc_shared<float>(1, q);
+  ks[0] = 0.5f; vs[0] = 0.25f;
+  const std::size_t cbytes = n_pages * pe * (fp8 ? 1 : sizeof(T));
+  auto* kc = sycl::malloc_shared<std::uint8_t>(n_pages * pe * sizeof(T), q);
+  auto* vc = sycl::malloc_shared<std::uint8_t>(n_pages * pe * sizeof(T), q);
+  std::vector<std::uint8_t> ekc(n_pages * pe * sizeof(T), 0xAB),
+      evc(n_pages * pe * sizeof(T), 0xAB);
+  std::memcpy(kc, ekc.data(), ekc.size());
+  std::memcpy(vc, evc.data(), evc.size());
+  for (std::size_t i = 0; i < n * row; ++i) {
+    key[i] = static_cast<T>(sample(i + 3));
+    value[i] = static_cast<T>(sample(i + 7));
+  }
+  const std::int64_t sl[7] = {0, 5, -1, 9, 22, 13, 2};
+  for (std::size_t i = 0; i < n; ++i) slots[i] = sl[i];
+
+  ops::kv_cache_scatter_paged(q, key, value, kc, vc, slots, n, Hkv, d, page,
+                              pe, ks, vs,
+                              fp8 ? ops::KvCacheDType::fp8_e4m3
+                                  : ops::KvCacheDType::same,
+                              dt, Variant::sycl, true);
+
+  for (std::size_t t = 0; t < n; ++t) {
+    if (sl[t] < 0) continue;
+    const std::size_t pg = static_cast<std::size_t>(sl[t]) / page;
+    const std::size_t off = static_cast<std::size_t>(sl[t]) % page;
+    for (std::size_t e = 0; e < row; ++e) {
+      const std::size_t dst = pg * pe + off * row + e;
+      if (fp8) {
+        ekc[dst] = codec::e4m3_encode(static_cast<float>(key[t * row + e]) / ks[0]);
+        evc[dst] = codec::e4m3_encode(static_cast<float>(value[t * row + e]) / vs[0]);
+      } else {
+        std::memcpy(ekc.data() + dst * sizeof(T), &key[t * row + e], sizeof(T));
+        std::memcpy(evc.data() + dst * sizeof(T), &value[t * row + e], sizeof(T));
+      }
+    }
+  }
+  const std::size_t cmp = fp8 ? n_pages * pe : n_pages * pe * sizeof(T);
+  const bool ok = std::memcmp(kc, ekc.data(), cmp) == 0 &&
+                  std::memcmp(vc, evc.data(), cmp) == 0;
+  sycl::free(key, q); sycl::free(value, q); sycl::free(slots, q);
+  sycl::free(ks, q); sycl::free(vs, q); sycl::free(kc, q); sycl::free(vc, q);
+  std::cout << "  kv_cache_scatter_paged dt=" << dtype_name(dt)
+            << (fp8 ? " fp8" : "") << (ok ? "  ok (exact)" : "  FAIL") << '\n';
+  return ok;
+}
+
 // Varlen gated delta rule. fp64 oracle of the exact recurrence (decay, kv,
 // rank-1 update, output) with fp32-replica final-state expectation; ragged
 // lengths incl. empty, GQA Hv/Hk, null slot, zero-init vs has_initial_state,
@@ -4424,6 +4483,11 @@ int main() {
                                                          false, false, false) ? 0 : 1;
   failures += check_causal_conv1d_decode<half_t, float>(q, DType::f16, DType::f32,
                                                         true, false, true) ? 0 : 1;
+
+  // serving: paged KV-cache write (exact scatter).
+  failures += check_kv_cache_scatter_paged<bf16_t>(q, DType::bf16, false) ? 0 : 1;
+  failures += check_kv_cache_scatter_paged<bf16_t>(q, DType::bf16, true) ? 0 : 1;
+  failures += check_kv_cache_scatter_paged<float>(q, DType::f32, false) ? 0 : 1;
 
   // linear_attention: varlen gated delta rule (exact recurrence).
   failures += check_gated_delta_rule<float, float>(q, DType::f32, DType::f32) ? 0 : 1;

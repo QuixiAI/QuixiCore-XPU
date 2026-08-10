@@ -55,4 +55,18 @@ void mqa_logits(sycl::queue& q, const std::uint8_t* q_fp8,
   if (blocking) ev.wait();
 }
 
+void kv_cache_scatter_paged(
+    sycl::queue& q, const void* key, const void* value, void* k_cache,
+    void* v_cache, const std::int64_t* slot_mapping, std::size_t n_tokens,
+    std::size_t n_kv_heads, std::size_t d, std::size_t page_size,
+    std::size_t page_stride_elems, const float* k_scale, const float* v_scale,
+    KvCacheDType kv_dt, DType dt, Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::kv_cache_scatter_paged_sycl(
+      q, key, value, k_cache, v_cache, slot_mapping, n_tokens, n_kv_heads, d,
+      page_size, page_stride_elems, k_scale, v_scale,
+      kv_dt == KvCacheDType::same ? 0 : 1, dt);
+  if (blocking) ev.wait();
+}
+
 }  // namespace quixicore::xpu::ops

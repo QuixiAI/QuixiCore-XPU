@@ -27,6 +27,14 @@
 
 namespace quixicore::xpu::ops {
 
+// KV-cache element encoding for the paged attention ops.
+enum class KvCacheDType {
+  same,      // cache elements are the activation dtype
+  fp8_e4m3,  // u8 e4m3 with device-scalar k/v scales
+  fp8_e5m2,
+};
+
+
 // ----------------------------------------------------------------------------
 // activations
 // ----------------------------------------------------------------------------
@@ -239,6 +247,22 @@ void kv_cache_scatter(sycl::queue& q, void* cache, const void* src,
 void kv_cache_gather(sycl::queue& q, const void* cache, const int* idx,
                      void* out, std::size_t n, std::size_t row, DType dt,
                      Variant variant = Variant::sycl, bool blocking = true);
+
+// Paged KV-cache write — the write side of paged_attention_* (vLLM
+// reshape_and_cache_flash semantics). key/value are [n_tokens, n_kv_heads, d]
+// of dtype dt; caches are the paged layout the attention ops read
+// ([n_pages, page_size, n_kv_heads, d], page_stride_elems pitch);
+// slot_mapping[t] is the FLAT slot (page * page_size + offset), int64, < 0
+// skips. kv_dt fp8_e4m3 divides by the device-scalar k/v scales before the
+// integer-exact e4m3 encode (the attention decode multiplies them back).
+// Graph-capture-safe.
+void kv_cache_scatter_paged(
+    sycl::queue& q, const void* key, const void* value, void* k_cache,
+    void* v_cache, const std::int64_t* slot_mapping, std::size_t n_tokens,
+    std::size_t n_kv_heads, std::size_t d, std::size_t page_size,
+    std::size_t page_stride_elems, const float* k_scale, const float* v_scale,
+    KvCacheDType kv_dt, DType dt, Variant variant = Variant::sycl,
+    bool blocking = true);
 
 // Sentence-embedding pooling head: masked mean-pool over each sequence's tokens
 // with a per-token RMSNorm (learned weight) folded in, then L2-normalize. `x` is
@@ -534,13 +558,6 @@ void causal_conv1d_prefill(sycl::queue& q, void* conv_state, const void* x,
                            DType act_dt, DType state_dt,
                            Variant variant = Variant::sycl,
                            bool blocking = true);
-
-// KV-cache element encoding for the paged attention ops.
-enum class KvCacheDType {
-  same,      // cache elements are the activation dtype
-  fp8_e4m3,  // u8 e4m3 with device-scalar k/v scales
-  fp8_e5m2,
-};
 
 // Split-KV paged attention decode (one query token per sequence; contract
 // decode_cache_attention). Q and O are [batch, n_heads, d] of dtype dt; the

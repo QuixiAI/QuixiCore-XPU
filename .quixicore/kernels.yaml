@@ -672,6 +672,21 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/serving/variants/xpu_sycl}
+  kv_cache_scatter_paged:
+    family: serving
+    status: implemented
+    path: kernels/serving
+    dtypes: [f32, f16, bf16]
+    shape: paged KV-cache write (reshape_and_cache_flash semantics)
+    note: >-
+      The write side of paged_attention_*: flat int64 slot_mapping (< 0
+      skips) into the [n_pages, page_size, heads, d] paged layout; optional
+      fp8 e4m3 mode divides by device-scalar k/v scales before the
+      integer-exact encode (the attention decode multiplies them back).
+      Exact-scatter test contract. Graph-capture-safe.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/serving/variants/xpu_sycl}
   kv_cache_scatter:
     family: serving
     status: implemented

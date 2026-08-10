@@ -2805,3 +2805,16 @@ Hv (32) work-groups; the win is launch amortization, and multi-sequence
 prefill batches parallelize fully across (seq, head). Decision: **keep** —
 coverage + real speedup; the chunked variant owns the single-sequence
 occupancy problem.
+
+## 2026-08-09: kv_cache_scatter_paged — the paged-attention write side
+
+vLLM reshape_and_cache_flash semantics (Apache; translated): flat int64
+slot_mapping into the same [n_pages, page_size, heads, d] layout the new
+paged_attention_* ops read; fp8 mode divides by the device-scalar scales
+before the integer-exact shared-codec e4m3 encode, mirroring the attention
+decode's multiply. Pure scatter -> the test contract is EXACT (memcmp vs a
+host replica, sentinel preservation on skipped slots): bf16/f32 x plain/fp8
+all byte-identical. Suite PASS. No standalone bench (a memcpy-shaped
+scatter; covered by the serving family traffic numbers). With this, the
+paged KV story is closed end-to-end: write (this op), decode
+(paged_attention_decode), prefill (paged_attention_prefill).

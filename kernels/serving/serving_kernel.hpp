@@ -5,6 +5,7 @@
 // width) so one kernel covers f32/f16/bf16.
 
 #include <cstddef>
+#include <cstdint>
 
 #include <sycl/sycl.hpp>
 
@@ -39,6 +40,14 @@ sycl::event kv_cache_gather_sycl(sycl::queue& q, const void* cache,
 //   out[s]= m * rsqrt(sum_d m[d]^2)                         (L2; 0-vector passes)
 // `dim` is the shape key (256/512/768/1024); one subgroup owns each sequence's
 // dim-vector. fp32 accumulation. An empty sequence (b==a) yields a zero vector.
+// Paged KV-cache write (see ops::kv_cache_scatter_paged).
+sycl::event kv_cache_scatter_paged_sycl(
+    sycl::queue& q, const void* key, const void* value, void* k_cache,
+    void* v_cache, const std::int64_t* slot_mapping, std::size_t n_tokens,
+    std::size_t n_kv_heads, std::size_t d, std::size_t page_size,
+    std::size_t page_stride_elems, const float* k_scale, const float* v_scale,
+    int fp8, DType dt);
+
 sycl::event pool_mean_rms_l2_sycl(sycl::queue& q, const void* x,
                                   const void* weight, const int* offsets,
                                   void* out, std::size_t batch, std::size_t dim,
