@@ -36,6 +36,9 @@ All notable QuixiCore XPU changes should be recorded here.
 - turboquant: KV-cache codec encode/decode implementing the format v2 ABI
   (rotated Lloyd-Max keys or e4m3 byte keys, per-group uniform values,
   LSB-first packing), byte-identical to the host-shared codec oracle.
+- merge_attn_states + kv_cache_gather_paged: the split-KV combiner (with
+  the empty-partition NaN guard) and the paged gather/dequant — completing
+  the paged-attention utility set.
 - mrope / rotary_positioned: multimodal (sectioned) and positioned rotary
   embedding, NeoX + GPT-J, in-place with untouched tails.
 - kv_cache_scatter_paged: paged KV-cache write (flat slot mapping, fp8

@@ -2829,3 +2829,14 @@ tail that must come back bit-equal; all zero excess, suite PASS.
 Correctness-first per-(token, head, pair) geometry; elementwise-bound, no
 standalone bench beyond the suite (RoPE-class ops are covered by the row
 kernels' vectorization pass when it lands).
+
+## 2026-08-10: merge_attn_states + kv_cache_gather_paged (C4)
+
+merge_attn_states: the standard LSE-weighted two-way combiner (max-shifted
+exp weights, log-sum output), translated from vllm-xpu-kernels — with the
+-inf empty-partition guard tested explicitly (one-empty and both-empty rows;
+the CUDA lineage's NaN class). kv_cache_gather_paged: exact inverse of the
+paged write incl. fp8 decode-with-scales. Oracles: fp64 merge reference with
+NaN counting; scatter->gather round-trips exact (plain) / within one e4m3
+step (fp8). All green, suite PASS. Elementwise-bound ops; no standalone
+bench.

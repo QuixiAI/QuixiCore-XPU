@@ -69,4 +69,18 @@ void kv_cache_scatter_paged(
   if (blocking) ev.wait();
 }
 
+void kv_cache_gather_paged(
+    sycl::queue& q, const void* k_cache, const void* v_cache, void* k_out,
+    void* v_out, const std::int64_t* slots, std::size_t n,
+    std::size_t n_kv_heads, std::size_t d, std::size_t page_size,
+    std::size_t page_stride_elems, const float* k_scale, const float* v_scale,
+    KvCacheDType kv_dt, DType dt, Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::kv_cache_gather_paged_sycl(
+      q, k_cache, v_cache, k_out, v_out, slots, n, n_kv_heads, d, page_size,
+      page_stride_elems, k_scale, v_scale,
+      kv_dt == KvCacheDType::same ? 0 : 1, dt);
+  if (blocking) ev.wait();
+}
+
 }  // namespace quixicore::xpu::ops

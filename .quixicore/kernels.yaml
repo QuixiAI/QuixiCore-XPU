@@ -774,6 +774,33 @@ operations:
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/attention/rope/variants/xpu_sycl}
 
+  merge_attn_states:
+    family: attention
+    status: implemented
+    path: kernels/attention/merge_attn_states
+    dtypes: [f32, f16, bf16]
+    shape: LSE-weighted merge of two partial attention results
+    note: >-
+      Split-KV / prefix+suffix combiner consuming paged_attention_prefill's
+      LSE; -inf partitions contribute zero weight (the empty-partition NaN
+      guard), all-empty rows give zero output and -inf lse. Translated from
+      vllm-xpu-kernels merge_attn_states.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/attention/merge_attn_states/variants/xpu_sycl}
+  kv_cache_gather_paged:
+    family: serving
+    status: implemented
+    path: kernels/serving
+    dtypes: [f32, f16, bf16]
+    shape: paged KV-cache gather + optional fp8 dequant
+    note: >-
+      Inverse of kv_cache_scatter_paged (flat int64 slots, < 0 gathers
+      zeros); fp8 mode decodes through the shared exact codec and multiplies
+      the device-scalar scales back. Exact round-trip test contract.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/serving/variants/xpu_sycl}
   mrope:
     family: attention
     status: implemented

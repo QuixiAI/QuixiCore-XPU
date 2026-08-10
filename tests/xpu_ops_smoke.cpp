@@ -1102,6 +1102,124 @@ bool check_causal_conv1d_prefill(sycl::queue& q, DType act_dt, DType state_dt,
   return ok;
 }
 
+// merge_attn_states: fp64 oracle incl. one-empty and both-empty rows (the
+// NaN hazard); kv_cache_gather_paged: exact round-trip through the paged
+// scatter (fp8 mode within decode round-trip tolerance of the stored code).
+template <typename T>
+bool check_merge_and_gather(sycl::queue& q, DType dt) {
+  namespace codec = quixicore::xpu::turboquant_codec;
+  const Tol tol = tol_for(dt);
+  bool ok = true;
+  {  // merge_attn_states
+    const std::size_t rows = 8, d = 32;
+    T* oa = sycl::malloc_shared<T>(rows * d, q);
+    T* ob = sycl::malloc_shared<T>(rows * d, q);
+    T* out = sycl::malloc_shared<T>(rows * d, q);
+    float* la = sycl::malloc_shared<float>(rows, q);
+    float* lb = sycl::malloc_shared<float>(rows, q);
+    float* lo = sycl::malloc_shared<float>(rows, q);
+    for (std::size_t i = 0; i < rows * d; ++i) {
+      oa[i] = static_cast<T>(sample(i + 3));
+      ob[i] = static_cast<T>(sample(i + 7));
+    }
+    const float ninf = -std::numeric_limits<float>::infinity();
+    for (std::size_t r = 0; r < rows; ++r) {
+      la[r] = 0.5f * sample(r + 11);
+      lb[r] = 0.5f * sample(r + 13);
+    }
+    la[2] = ninf;             // one-empty
+    la[5] = ninf; lb[5] = ninf;  // both-empty
+    ops::merge_attn_states(q, oa, la, ob, lb, out, lo, rows, d, dt,
+                           Variant::sycl, true);
+    double worst = 0.0;
+    int nan_bad = 0;
+    for (std::size_t r = 0; r < rows; ++r) {
+      const double m = std::max(la[r], lb[r]);
+      const bool empty = !(m > -1e30);
+      const double wa = (empty || !(la[r] > -1e30)) ? 0.0 : std::exp(la[r] - m);
+      const double wb = (empty || !(lb[r] > -1e30)) ? 0.0 : std::exp(lb[r] - m);
+      const double inv = wa + wb > 0.0 ? 1.0 / (wa + wb) : 0.0;
+      for (std::size_t j = 0; j < d; ++j) {
+        const double ref = static_cast<double>(static_cast<T>(
+            (wa * static_cast<double>(oa[r * d + j]) +
+             wb * static_cast<double>(ob[r * d + j])) * inv));
+        const double got = static_cast<double>(out[r * d + j]);
+        if (got != got) ++nan_bad;
+        worst = std::max(worst, std::abs(got - ref) -
+                                    (tol.atol + tol.rtol * std::abs(ref)));
+      }
+      const double lref = empty ? ninf : m + std::log(wa + wb);
+      if (empty) {
+        if (!(lo[r] == ninf)) ++nan_bad;
+      } else {
+        worst = std::max(worst, std::abs(static_cast<double>(lo[r]) - lref) -
+                                    (1e-4 + 1e-4 * std::abs(lref)));
+      }
+    }
+    ok = ok && worst <= 0.0 && nan_bad == 0;
+    std::cout << "  merge_attn_states dt=" << dtype_name(dt)
+              << " worst_excess=" << worst << " nan_bad=" << nan_bad
+              << (worst <= 0.0 && nan_bad == 0 ? "  ok" : "  FAIL") << '\n';
+    sycl::free(oa, q); sycl::free(ob, q); sycl::free(out, q);
+    sycl::free(la, q); sycl::free(lb, q); sycl::free(lo, q);
+  }
+  {  // kv_cache_gather_paged round-trip (plain + fp8)
+    const std::size_t n = 5, Hkv = 2, d = 16, page = 4, n_pages = 4;
+    const std::size_t row = Hkv * d, pe = page * row;
+    T* key = sycl::malloc_shared<T>(n * row, q);
+    T* value = sycl::malloc_shared<T>(n * row, q);
+    T* kout = sycl::malloc_shared<T>(n * row, q);
+    T* vout = sycl::malloc_shared<T>(n * row, q);
+    std::int64_t* slots = sycl::malloc_shared<std::int64_t>(n, q);
+    float* ks = sycl::malloc_shared<float>(1, q);
+    float* vs = sycl::malloc_shared<float>(1, q);
+    ks[0] = 0.5f; vs[0] = 0.25f;
+    auto* kc = sycl::malloc_shared<std::uint8_t>(n_pages * pe * sizeof(T), q);
+    auto* vc = sycl::malloc_shared<std::uint8_t>(n_pages * pe * sizeof(T), q);
+    for (std::size_t i = 0; i < n * row; ++i) {
+      key[i] = static_cast<T>(sample(i + 3));
+      value[i] = static_cast<T>(sample(i + 7));
+    }
+    const std::int64_t sl[5] = {0, 6, -1, 11, 14};
+    for (std::size_t i = 0; i < n; ++i) slots[i] = sl[i];
+    for (int fp8 = 0; fp8 <= 1; ++fp8) {
+      const auto kvdt = fp8 ? ops::KvCacheDType::fp8_e4m3
+                            : ops::KvCacheDType::same;
+      ops::kv_cache_scatter_paged(q, key, value, kc, vc, slots, n, Hkv, d,
+                                  page, pe, ks, vs, kvdt, dt, Variant::sycl,
+                                  true);
+      ops::kv_cache_gather_paged(q, kc, vc, kout, vout, slots, n, Hkv, d,
+                                 page, pe, ks, vs, kvdt, dt, Variant::sycl,
+                                 true);
+      int bad = 0;
+      for (std::size_t t = 0; t < n; ++t) {
+        for (std::size_t e = 0; e < row; ++e) {
+          const double kg = static_cast<double>(kout[t * row + e]);
+          if (sl[t] < 0) {
+            if (kg != 0.0) ++bad;
+            continue;
+          }
+          if (!fp8) {
+            if (kg != static_cast<double>(key[t * row + e])) ++bad;
+          } else {
+            // decode(encode(v/s))*s within one e4m3 step of v
+            const double v = static_cast<double>(key[t * row + e]);
+            if (std::abs(kg - v) > 0.075 * std::abs(v) + 0.01) ++bad;
+          }
+        }
+      }
+      ok = ok && bad == 0;
+      std::cout << "  kv_cache_gather_paged dt=" << dtype_name(dt)
+                << (fp8 ? " fp8" : "") << " bad=" << bad
+                << (bad == 0 ? "  ok" : "  FAIL") << '\n';
+    }
+    sycl::free(key, q); sycl::free(value, q); sycl::free(kout, q);
+    sycl::free(vout, q); sycl::free(slots, q); sycl::free(ks, q);
+    sycl::free(vs, q); sycl::free(kc, q); sycl::free(vc, q);
+  }
+  return ok;
+}
+
 // M-RoPE / positioned RoPE. fp64 oracle over the section-owned cos/sin
 // rows; both NeoX and GPT-J pair conventions, a rot_dim < head_size tail
 // (must stay untouched), and the single-section rotary_positioned form
@@ -4567,6 +4685,10 @@ int main() {
                                                          false, false, false) ? 0 : 1;
   failures += check_causal_conv1d_decode<half_t, float>(q, DType::f16, DType::f32,
                                                         true, false, true) ? 0 : 1;
+
+  // attention/serving: LSE merge + paged gather round-trip.
+  failures += check_merge_and_gather<bf16_t>(q, DType::bf16) ? 0 : 1;
+  failures += check_merge_and_gather<float>(q, DType::f32) ? 0 : 1;
 
   // attention: multimodal / positioned RoPE.
   failures += check_mrope<float>(q, DType::f32, true) ? 0 : 1;

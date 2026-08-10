@@ -48,6 +48,14 @@ sycl::event kv_cache_scatter_paged_sycl(
     std::size_t page_stride_elems, const float* k_scale, const float* v_scale,
     int fp8, DType dt);
 
+// Paged KV-cache gather + optional fp8 dequant (see ops::kv_cache_gather_paged).
+sycl::event kv_cache_gather_paged_sycl(
+    sycl::queue& q, const void* k_cache, const void* v_cache, void* k_out,
+    void* v_out, const std::int64_t* slots, std::size_t n,
+    std::size_t n_kv_heads, std::size_t d, std::size_t page_size,
+    std::size_t page_stride_elems, const float* k_scale, const float* v_scale,
+    int fp8, DType dt);
+
 sycl::event pool_mean_rms_l2_sycl(sycl::queue& q, const void* x,
                                   const void* weight, const int* offsets,
                                   void* out, std::size_t batch, std::size_t dim,

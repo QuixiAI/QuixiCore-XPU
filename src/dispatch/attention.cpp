@@ -3,6 +3,7 @@
 #include "quixicore/xpu/ops.hpp"
 
 #include "attention/attention/attention_kernel.hpp"
+#include "attention/merge_attn_states/merge_attn_states_kernel.hpp"
 #include "attention/mrope/mrope_kernel.hpp"
 #include "attention/paged_attention/paged_attention_kernel.hpp"
 #include "attention/rope/rope_kernel.hpp"
@@ -112,6 +113,17 @@ void rotary_positioned(sycl::queue& q, void* query, void* key,
   sycl::event ev = kernels::mrope_sycl(q, query, key, cos_sin_cache, positions,
                                        nullptr, 1, tokens, n_heads, n_kv_heads,
                                        head_size, rot_dim, neox ? 1 : 0, dt);
+  if (blocking) ev.wait();
+}
+
+void merge_attn_states(sycl::queue& q, const void* out_a, const float* lse_a,
+                       const void* out_b, const float* lse_b, void* out,
+                       float* lse_out, std::size_t rows, std::size_t d,
+                       DType dt, Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::merge_attn_states_sycl(q, out_a, lse_a, out_b,
+                                                   lse_b, out, lse_out, rows,
+                                                   d, dt);
   if (blocking) ev.wait();
 }
 

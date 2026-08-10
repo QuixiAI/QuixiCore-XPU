@@ -132,6 +132,17 @@ void rope(sycl::queue& q, const void* x, void* out, std::size_t tokens,
           std::size_t pos0, DType dt, Variant variant = Variant::sycl,
           bool blocking = true);
 
+// LSE-weighted merge of two partial attention results (split-KV / prefix +
+// suffix; consumes paged_attention_prefill's LSE). out_a/out_b/out are
+// [rows, d] of dtype dt, lse_a/lse_b/lse_out (nullable) [rows] f32. A
+// partition at -inf contributes nothing; all-empty rows give zero output
+// and -inf lse. Graph-capture-safe.
+void merge_attn_states(sycl::queue& q, const void* out_a, const float* lse_a,
+                       const void* out_b, const float* lse_b, void* out,
+                       float* lse_out, std::size_t rows, std::size_t d,
+                       DType dt, Variant variant = Variant::sycl,
+                       bool blocking = true);
+
 // Multimodal rotary embedding (M-RoPE, Qwen2-VL family). positions is
 // [n_sections, tokens] int64 — each rotary pair takes its cos/sin row from
 // the position axis owning it per the cumulative `sections` widths
@@ -285,6 +296,17 @@ void kv_cache_gather(sycl::queue& q, const void* cache, const int* idx,
 void kv_cache_scatter_paged(
     sycl::queue& q, const void* key, const void* value, void* k_cache,
     void* v_cache, const std::int64_t* slot_mapping, std::size_t n_tokens,
+    std::size_t n_kv_heads, std::size_t d, std::size_t page_size,
+    std::size_t page_stride_elems, const float* k_scale, const float* v_scale,
+    KvCacheDType kv_dt, DType dt, Variant variant = Variant::sycl,
+    bool blocking = true);
+
+// Paged KV-cache gather — inverse of kv_cache_scatter_paged with optional
+// fp8 dequant (x device-scalar scales); slots [n] int64 flat, < 0 gathers
+// zeros. k_out/v_out are [n, n_kv_heads, d] of dtype dt.
+void kv_cache_gather_paged(
+    sycl::queue& q, const void* k_cache, const void* v_cache, void* k_out,
+    void* v_out, const std::int64_t* slots, std::size_t n,
     std::size_t n_kv_heads, std::size_t d, std::size_t page_size,
     std::size_t page_stride_elems, const float* k_scale, const float* v_scale,
     KvCacheDType kv_dt, DType dt, Variant variant = Variant::sycl,
