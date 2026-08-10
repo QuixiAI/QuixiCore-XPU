@@ -266,6 +266,22 @@ operations:
     benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel rms_residual_next --approx {fused,unfused}"}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/norms/rms_norm/variants/xpu_sycl}
+  lora_apply:
+    family: matmul
+    status: implemented
+    path: kernels/matmul/lora_apply
+    dtypes: [f32, f16, bf16]
+    shape: batched-gather LoRA matvecs (shrink + expand with slice/accumulate)
+    note: >-
+      Per-row adapter selection with -1 no-adapter skip (shrink zeros, expand
+      leaves the base output); fp32 shrink intermediates; the expand slice
+      form covers fused-QKV split destinations. Translated from
+      vllm-xpu-kernels lora_shrink/lora_expand. Subgroup-cooperative shrink
+      is the recorded lever; lora_apply_direct_f16 (fused decode form) stays
+      planned.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/matmul/lora_apply/variants/xpu_sycl}
   dense_gemm:
     family: matmul
     status: implemented

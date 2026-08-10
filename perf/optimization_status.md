@@ -2869,3 +2869,22 @@ the oracle; top-p validated by set properties (mass reached, top-heavy,
 minimal). The fused bias/penalties/sample composite remains planned; the
 existing sample_categorical/top_k_sample ops cover the sampling step. All
 green, suite PASS.
+
+## 2026-08-10: lora_apply (C7) + the DeepSeek-family deferral ledger
+
+lora_apply: BGMV shrink (fp32 out, scaled) + expand (slice offset/stride for
+fused-QKV destinations, accumulate-into-base), per-row adapter ids with -1
+skip; fp64 oracle over the composed shrink->expand incl. untouched
+outside-slice and no-adapter rows. All green, suite PASS.
+
+DEFERRAL LEDGER — the remaining C3/C4 items are the DeepSeek-model family:
+inverse_rope, qk_norm_rope_kv_f16 (deepseek_qnorm_rope_kv_insert),
+indexer_q_rope_quant (fp8/mxfp4 indexer ropes), indexer_k_quant_cache /
+indexer_k_gather, concat_and_cache_mla, and threshold_topk_indices
+(topk_per_row). No DeepSeek model runs on this box, so their ports could not
+be validated beyond transliteration — exactly the situation the house rule
+("no claimed support without evidence") exists for. They stay planned in the
+manifest, sources pinned in vllm-xpu-kernels (dffcab7 tree), to land as a
+coherent unit with a DeepSeek bring-up that can exercise real shapes and
+oracles. Mamba1 varlen selective_scan stays deferred for the same reason
+(superseded by native SSD for every model on the box).

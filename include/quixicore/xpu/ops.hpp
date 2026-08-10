@@ -365,6 +365,30 @@ void hadamard(sycl::queue& q, const void* in, void* out, std::size_t rows,
               std::size_t n, DType dt, Variant variant = Variant::sycl,
               bool blocking = true);
 
+// Batched-gather LoRA matvecs (contract lora_apply). Per token row b the
+// adapter is lora_idx[b] int32 (-1 or out-of-range = no adapter: shrink
+// writes zeros, expand leaves the destination untouched).
+//   shrink: out[b, r] = scale * sum_h in[b, h] * A[idx, r, h], out fp32
+//           [batch, rank]; A is [n_loras, rank, hidden] of dtype dt.
+//   expand: out[b, out_offset + j] (+)= sum_r in[b, r] * B[idx, j, r];
+//           in is the shrink output (fp32 [batch, rank]), B is
+//           [n_loras, out_dim, rank] of dtype dt, out rows have out_stride
+//           elements (the slice form covers fused-QKV split destinations),
+//           and `accumulate` adds into the existing output.
+// fp32 math. Graph-capture-safe.
+void lora_shrink(sycl::queue& q, const void* in, const void* w,
+                 const std::int32_t* lora_idx, float* out, std::size_t batch,
+                 std::size_t hidden, std::size_t rank, std::size_t n_loras,
+                 float scale, DType dt, Variant variant = Variant::sycl,
+                 bool blocking = true);
+
+void lora_expand(sycl::queue& q, const float* in, const void* w,
+                 const std::int32_t* lora_idx, void* out, std::size_t batch,
+                 std::size_t rank, std::size_t out_dim, std::size_t n_loras,
+                 std::size_t out_offset, std::size_t out_stride,
+                 bool accumulate, DType dt, Variant variant = Variant::sycl,
+                 bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // moe
 // ----------------------------------------------------------------------------

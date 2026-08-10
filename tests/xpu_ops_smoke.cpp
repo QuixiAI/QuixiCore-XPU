@@ -1105,6 +1105,86 @@ bool check_causal_conv1d_prefill(sycl::queue& q, DType act_dt, DType state_dt,
   return ok;
 }
 
+// LoRA BGMV. fp64 oracle of shrink -> expand (slice + accumulate) with
+// per-row adapter selection incl. -1 (shrink zeros; expand leaves the base
+// output untouched).
+template <typename T>
+bool check_lora(sycl::queue& q, DType dt) {
+  const std::size_t B = 6, H = 128, R = 16, D = 64, L = 3, stride = 160,
+                    off = 32;
+  T* x = sycl::malloc_shared<T>(B * H, q);
+  T* A = sycl::malloc_shared<T>(L * R * H, q);
+  T* Bw = sycl::malloc_shared<T>(L * D * R, q);
+  float* mid = sycl::malloc_shared<float>(B * R, q);
+  T* out = sycl::malloc_shared<T>(B * stride, q);
+  std::int32_t* idxs = sycl::malloc_shared<std::int32_t>(B, q);
+  for (std::size_t i = 0; i < B * H; ++i) x[i] = static_cast<T>(sample(i + 3));
+  for (std::size_t i = 0; i < L * R * H; ++i)
+    A[i] = static_cast<T>(0.1f * sample(i + 5));
+  for (std::size_t i = 0; i < L * D * R; ++i)
+    Bw[i] = static_cast<T>(0.1f * sample(i + 7));
+  for (std::size_t i = 0; i < B * stride; ++i)
+    out[i] = static_cast<T>(0.5f * sample(i + 11));  // base output
+  const std::int32_t im[6] = {0, 2, -1, 1, 2, 0};
+  for (std::size_t b = 0; b < B; ++b) idxs[b] = im[b];
+  const float scale = 0.5f;
+  std::vector<double> base(B * stride);
+  for (std::size_t i = 0; i < B * stride; ++i)
+    base[i] = static_cast<double>(out[i]);
+
+  ops::lora_shrink(q, x, A, idxs, mid, B, H, R, L, scale, dt, Variant::sycl,
+                   true);
+  ops::lora_expand(q, mid, Bw, idxs, out, B, R, D, L, off, stride,
+                   /*accumulate=*/true, dt, Variant::sycl, true);
+
+  const Tol tol = tol_for(dt);
+  const double rtol = tol.rtol * std::sqrt(static_cast<double>(H)) + 5e-3;
+  double worst = 0.0;
+  int skip_bad = 0;
+  for (std::size_t b = 0; b < B; ++b) {
+    if (im[b] < 0) {
+      for (std::size_t r = 0; r < R; ++r)
+        if (mid[b * R + r] != 0.0f) ++skip_bad;
+      for (std::size_t i = 0; i < stride; ++i)
+        if (static_cast<double>(out[b * stride + i]) != base[b * stride + i])
+          ++skip_bad;
+      continue;
+    }
+    std::vector<double> m(R);
+    for (std::size_t r = 0; r < R; ++r) {
+      double acc = 0.0;
+      for (std::size_t h = 0; h < H; ++h)
+        acc += static_cast<double>(x[b * H + h]) *
+               static_cast<double>(A[(im[b] * R + r) * H + h]);
+      m[r] = acc * scale;
+      worst = std::max(worst, std::abs(static_cast<double>(mid[b * R + r]) - m[r]) -
+                                  (1e-4 + rtol * std::abs(m[r])));
+      m[r] = static_cast<double>(mid[b * R + r]);  // expand consumes device mid
+    }
+    for (std::size_t i = 0; i < stride; ++i) {
+      const double got = static_cast<double>(out[b * stride + i]);
+      if (i < off || i >= off + D) {
+        if (got != base[b * stride + i]) ++skip_bad;  // outside the slice
+        continue;
+      }
+      const std::size_t j = i - off;
+      double acc = base[b * stride + i];
+      for (std::size_t r = 0; r < R; ++r)
+        acc += m[r] * static_cast<double>(Bw[(im[b] * D + j) * R + r]);
+      const double ref = static_cast<double>(static_cast<T>(acc));
+      worst = std::max(worst,
+                       std::abs(got - ref) - (tol.atol + rtol * std::abs(ref)));
+    }
+  }
+  sycl::free(x, q); sycl::free(A, q); sycl::free(Bw, q); sycl::free(mid, q);
+  sycl::free(out, q); sycl::free(idxs, q);
+  const bool ok = worst <= 0.0 && skip_bad == 0;
+  std::cout << "  lora shrink+expand dt=" << dtype_name(dt)
+            << " worst=" << worst << " skip_bad=" << skip_bad
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // Renorm ops. fp64 oracle with well-separated probabilities (no float
 // boundary ambiguity): top-k must keep exactly the k largest and
 // renormalize; top-p must keep the minimal prefix reaching the mass.
@@ -4907,6 +4987,10 @@ int main() {
                                                          false, false, false) ? 0 : 1;
   failures += check_causal_conv1d_decode<half_t, float>(q, DType::f16, DType::f32,
                                                         true, false, true) ? 0 : 1;
+
+  // matmul: LoRA BGMV shrink + expand (slice + accumulate).
+  failures += check_lora<float>(q, DType::f32) ? 0 : 1;
+  failures += check_lora<bf16_t>(q, DType::bf16) ? 0 : 1;
 
   // sampling: top-k / top-p renormalization.
   failures += check_renorm<float>(q, DType::f32) ? 0 : 1;
