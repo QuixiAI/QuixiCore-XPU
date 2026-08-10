@@ -2463,3 +2463,58 @@ Split wins 5.1x at M=1 — the same occupancy profile as the SwiGLU split
 guidance mirrors nvfp4_moe: split for decode/graph-replay, fused only once
 M*top_k fills the device. Decision: **keep** both as co-equal experimental
 variants under the nvfp4_moe manifest entry.
+
+## 2026-08-09: Production P2P all-reduce (all_reduce) — capturable one-shot/two-shot
+
+Provenance: the algorithm semantics come from the vLLM XPU serving collective
+(`vllm-xpu-kernels csrc/xpu/sycl/p2p_all_reduce.cpp`, commit dffcab7,
+Apache-2.0) — TRANSLATED, not imported, per the reference-sources rule; the
+QuixiCore expression restructures the three named flag arrays into a phased
+sync[3] array and a single templated rendezvous helper, and chains the staging
+copy by explicit event (correct on out-of-order queues) instead of relying on
+queue order. The load-bearing invariants are preserved and documented in the
+variant header: (1) fp32 accumulation in FIXED rank order 0..world-1 — IEEE
+addition is commutative but not associative, so any per-rank order would
+silently desynchronize TP replicas; (2) block-aligned two-shot partitioning —
+the rendezvous only pairs work-group b with work-group b, so the all-gather
+may only read what the same-numbered peer group produced; (3) volatile-store +
+system-scope-fence flags — the B60 PCIe pairing reports access_supported but
+NOT atomics_supported, so peer atomic RMW is invalid
+(-DQUIXICORE_XPU_AR_SYSTEM_ATOMICS opts in on future hardware); (4)
+device-resident generation counters that self-increment per execution, which
+is what lets the collective record into a SYCL command graph and survive
+replay.
+
+Kernel + route: `ops::all_reduce` (+ `ops::all_reduce_region_bytes`) ->
+`kernels/collectives/all_reduce/variants/xpu_sycl/all_reduce.sycl.cpp`.
+`ops::all_reduce_sum` (the host-buffer demonstrator) now orchestrates the real
+collective in-process — shared context, per-GPU regions, all ranks launched
+concurrently — replacing the old serialized memcpy-onto-GPU0 reduce.
+
+Correctness: `check_all_reduce_p2p` in tests/xpu_ops_smoke.cpp. Every rank's
+output must be BITWISE identical to the fp32 fixed-rank-order host reference
+(memcmp, not tolerance) — f32/bf16 x one-shot/two-shot x world=4, two rounds
+on the same regions to exercise generation-counter reuse. All pass on the
+4x B60. Full smoke suite: PASS.
+
+Measurement (4x Arc Pro B60, in-process shared context, oneAPI icpx, Level
+Zero; harness `--kernel all_reduce --dtype bf16 --iters 50 --warmup 10`,
+median of 5 wall-clock batches, all-ranks launch + wait):
+
+| bytes | algo | median ms |
+|---:|---|---:|
+| 16 KiB  | one-shot | 0.069 |
+| 64 KiB  | two-shot | 0.091 |
+| 512 KiB | two-shot | 0.147 |
+| 1 MiB   | two-shot | 0.237 |
+
+Baseline: the prior copy-based demonstrator measured 15.8-18.2 ms per call at
+these sizes (16 KiB-1 MiB) — dominated by its per-call context/allocation
+rebuild, so the honest comparison is the design change (persistent peer
+regions + capturable kernel vs serialized D2D memcpy reduce), not a same-shape
+kernel A/B. At 1 MiB the two-shot moves 1.5x payload of peer traffic in 237 us
+(~6.6 GB/s effective over PCIe x8 per direction with rendezvous overhead).
+Decision: **keep** — this is the collective the TP2 decode-graph win
+(VLLM_XPU_CUSTOM_ALLREDUCE, +32% single-stream ITL) was built on, now
+library-owned. The multi-process IPC layer (fd export/open) lands as the
+follow-up commit; oneCCL vendor variant remains deferred.

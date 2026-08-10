@@ -21,6 +21,10 @@ All notable QuixiCore XPU changes should be recorded here.
 - nvfp4_moe_relu2_fused / nvfp4_moe_relu2_split: ReLU²-ungated NVFP4 MoE
   experts (NemotronH) — single up-projection w1 [E,I,K/2], relu(g)² with no
   gate multiply, W4A16, EP-safe expert-id skip.
+- all_reduce: capturable P2P sum all-reduce (world 2..8, one-shot +
+  two-shot) with bitwise-identical fixed-rank-order results, replay-safe
+  generation-counter rendezvous, and no peer-atomic requirement;
+  all_reduce_sum now orchestrates it in-process across all visible GPUs.
 
 ### Kernel families — breadth
 

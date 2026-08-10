@@ -894,6 +894,97 @@ bool check_ssd_prefill(sycl::queue& q, DType act_dt, DType state_dt,
   return ok;
 }
 
+// Capturable P2P all-reduce. Builds the in-process multi-GPU setup itself
+// (shared context, per-rank regions), launches every rank's collective
+// concurrently, and requires every rank's output to be BITWISE identical to
+// the fp32 fixed-rank-order host reference — the property tensor-parallel
+// replicas rely on. Runs two rounds on the same regions to exercise the
+// generation-counter reuse (the graph-replay mechanism). Skips without >1 GPU.
+template <typename T>
+bool check_all_reduce_p2p(DType dt, std::size_t count) {
+  std::vector<sycl::device> devices;
+  for (const auto& p : sycl::platform::get_platforms()) {
+    std::vector<sycl::device> gpus;
+    for (auto& d : p.get_devices())
+      if (d.is_gpu()) gpus.push_back(d);
+    if (gpus.size() > devices.size()) devices = std::move(gpus);
+  }
+  if (devices.size() < 2) {
+    std::cout << "  all_reduce (p2p): <2 GPUs (skip)\n";
+    return true;
+  }
+  const int world = static_cast<int>(std::min<std::size_t>(devices.size(), 4));
+  devices.resize(static_cast<std::size_t>(world));
+  for (int a = 0; a < world; ++a)
+    for (int b = 0; b < world; ++b) {
+      if (a == b) continue;
+      try {
+        devices[a].ext_oneapi_enable_peer_access(devices[b]);
+      } catch (const sycl::exception&) {
+      }
+    }
+  sycl::context ctx(devices);
+  std::vector<sycl::queue> qs;
+  for (int g = 0; g < world; ++g) qs.emplace_back(ctx, devices[g]);
+
+  const std::size_t region_bytes = ops::all_reduce_region_bytes(count * sizeof(T));
+  std::vector<void*> regions(static_cast<std::size_t>(world));
+  std::vector<T*> in_dev(world), out_dev(world);
+  for (int g = 0; g < world; ++g) {
+    regions[g] = sycl::malloc_device(region_bytes, qs[g]);
+    in_dev[g] = sycl::malloc_device<T>(count, qs[g]);
+    out_dev[g] = sycl::malloc_device<T>(count, qs[g]);
+    qs[g].memset(regions[g], 0, region_bytes);
+  }
+  for (auto& q : qs) q.wait();
+
+  bool ok = true;
+  for (int round = 0; round < 2; ++round) {
+    std::vector<std::vector<T>> in_host(world, std::vector<T>(count));
+    for (int r = 0; r < world; ++r)
+      for (std::size_t i = 0; i < count; ++i)
+        in_host[r][i] = static_cast<T>(sample(i + 1000 * r + 77 * round));
+    for (int g = 0; g < world; ++g)
+      qs[g].memcpy(in_dev[g], in_host[g].data(), count * sizeof(T));
+    for (auto& q : qs) q.wait();
+
+    for (int g = 0; g < world; ++g) {
+      ops::all_reduce(qs[g], in_dev[g], out_dev[g], regions.data(), g, world,
+                      count, dt, /*twoshot_min_bytes=*/65536, Variant::sycl,
+                      /*blocking=*/false);
+    }
+    for (auto& q : qs) q.wait();
+
+    std::vector<T> ref(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      float acc = 0.0f;  // fp32 fixed rank order, exactly as the kernel sums
+      for (int r = 0; r < world; ++r)
+        acc += static_cast<float>(in_host[r][i]);
+      ref[i] = static_cast<T>(acc);
+    }
+    std::vector<T> got(count);
+    for (int g = 0; g < world; ++g) {
+      qs[g].memcpy(got.data(), out_dev[g], count * sizeof(T)).wait();
+      if (std::memcmp(got.data(), ref.data(), count * sizeof(T)) != 0) {
+        ok = false;
+        std::cout << "  all_reduce (p2p) rank " << g << " round " << round
+                  << " mismatch\n";
+      }
+    }
+  }
+
+  for (int g = 0; g < world; ++g) {
+    sycl::free(regions[g], qs[g]);
+    sycl::free(in_dev[g], qs[g]);
+    sycl::free(out_dev[g], qs[g]);
+  }
+  const char* algo = count * sizeof(T) < 65536 ? "one-shot" : "two-shot";
+  std::cout << "  all_reduce (p2p) dt=" << dtype_name(dt) << " world=" << world
+            << " count=" << count << " " << algo
+            << (ok ? " bitwise-ok  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // Varlen causal conv1d prefill. fp64 oracle for the output pass; the state
 // write-back is a pure round-trip gather so its expectation is exact. Covers
 // ragged lengths {6, 0, 2, 9, 5} (incl. empty and shorter-than-window with
@@ -3383,6 +3474,10 @@ int main() {
 
   // collectives: multi-GPU sum all-reduce across the visible B60s.
   failures += check_collectives() ? 0 : 1;
+  failures += check_all_reduce_p2p<float>(DType::f32, 2000) ? 0 : 1;
+  failures += check_all_reduce_p2p<float>(DType::f32, 40000) ? 0 : 1;
+  failures += check_all_reduce_p2p<bf16_t>(DType::bf16, 3000) ? 0 : 1;
+  failures += check_all_reduce_p2p<bf16_t>(DType::bf16, 50000) ? 0 : 1;
 
   // sampling: categorical + top-k (invariants: top-k membership, greedy=argmax).
   failures += check_sampling<float>(q, DType::f32, 256, 4000, 8) ? 0 : 1;

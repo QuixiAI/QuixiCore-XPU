@@ -643,6 +643,74 @@ int main(int argc, char** argv) {
     sycl::free(dt_bias, q); sycl::free(D, q); sycl::free(idx, q);
     return 0;
   }
+  if (kernel == "all_reduce") {
+    // In-process capturable P2P all-reduce across all visible GPUs (cap 4):
+    // --n elements of --dtype per rank; wall-clock per collective.
+    std::vector<sycl::device> ar_devices;
+    for (const auto &p : sycl::platform::get_platforms()) {
+      std::vector<sycl::device> gpus;
+      for (auto &d : p.get_devices())
+        if (d.is_gpu()) gpus.push_back(d);
+      if (gpus.size() > ar_devices.size()) ar_devices = std::move(gpus);
+    }
+    if (ar_devices.size() < 2) {
+      std::cerr << "all_reduce bench needs >1 GPU\n";
+      return 0;
+    }
+    const int world = static_cast<int>(std::min<std::size_t>(ar_devices.size(), 4));
+    ar_devices.resize(static_cast<std::size_t>(world));
+    for (int a = 0; a < world; ++a)
+      for (int b = 0; b < world; ++b) {
+        if (a == b) continue;
+        try { ar_devices[a].ext_oneapi_enable_peer_access(ar_devices[b]); }
+        catch (const sycl::exception &) {}
+      }
+    sycl::context ar_ctx(ar_devices);
+    std::vector<sycl::queue> ar_qs;
+    for (int g = 0; g < world; ++g) ar_qs.emplace_back(ar_ctx, ar_devices[g]);
+    const std::size_t bytes = n * elem;
+    const std::size_t region_bytes = ops::all_reduce_region_bytes(bytes);
+    std::vector<void *> regions(static_cast<std::size_t>(world));
+    std::vector<void *> in_dev(world), out_dev(world);
+    for (int g = 0; g < world; ++g) {
+      regions[g] = sycl::malloc_device(region_bytes, ar_qs[g]);
+      in_dev[g] = sycl::malloc_device(bytes, ar_qs[g]);
+      out_dev[g] = sycl::malloc_device(bytes, ar_qs[g]);
+      ar_qs[g].memset(regions[g], 0, region_bytes);
+      ar_qs[g].memset(in_dev[g], 0, bytes);
+    }
+    for (auto &qq : ar_qs) qq.wait();
+    auto run_once = [&] {
+      for (int g = 0; g < world; ++g)
+        ops::all_reduce(ar_qs[g], in_dev[g], out_dev[g], regions.data(), g,
+                        world, n, dt, 65536, Variant::sycl, /*blocking=*/false);
+      for (auto &qq : ar_qs) qq.wait();
+    };
+    for (int i = 0; i < warmup; ++i) run_once();
+    std::vector<double> samples;
+    for (int s = 0; s < 5; ++s) {
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < iters; ++i) run_once();
+      const auto t1 = std::chrono::steady_clock::now();
+      samples.push_back(
+          std::chrono::duration<double, std::milli>(t1 - t0).count() / iters);
+    }
+    std::sort(samples.begin(), samples.end());
+    std::cout << "{\"schema_version\":2,\"kernel\":\"all_reduce\","
+              << "\"variant\":\"sycl\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"world\":" << world << ",\"numel\":" << n
+              << ",\"bytes\":" << bytes << ",\"iters\":" << iters
+              << ",\"median_ms\":" << samples[samples.size() / 2]
+              << ",\"min_ms\":" << samples.front() << ",\"max_ms\":" << samples.back()
+              << ",\"algo\":\"" << (bytes < 65536 ? "one-shot" : "two-shot")
+              << "\"}" << std::endl;
+    for (int g = 0; g < world; ++g) {
+      sycl::free(regions[g], ar_qs[g]);
+      sycl::free(in_dev[g], ar_qs[g]);
+      sycl::free(out_dev[g], ar_qs[g]);
+    }
+    return 0;
+  }
   if (kernel == "ssd_prefill") {
     // Varlen SSD prefill: --M packed tokens split across --rows equal
     // sequences, NemotronH TP2 slice (nheads 64, headdim 64, dstate 128,

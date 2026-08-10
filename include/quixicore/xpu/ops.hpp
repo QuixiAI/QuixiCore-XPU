@@ -456,12 +456,35 @@ void causal_conv1d_prefill(sycl::queue& q, void* conv_state, const void* x,
 // collectives (multi-GPU)
 // ----------------------------------------------------------------------------
 
+// Bytes for one rank's peer-visible all-reduce region ([signal | staging]);
+// staging must hold the largest payload the group will reduce. Regions must be
+// zero-filled once before the first collective.
+std::size_t all_reduce_region_bytes(std::size_t staging_bytes);
+
+// Capturable P2P sum all-reduce (world 2..8). regions[r] is rank r's region
+// base as mapped in THIS rank's address space (same-context USM in-process, or
+// an IPC-mapped pointer cross-process; the fd exchange is integration-owned);
+// regions[rank] is our own. inp/out are device pointers of dtype dt with numel
+// elements (out-of-place). Accumulation is fp32 in FIXED rank order 0..world-1
+// so every rank produces bitwise-identical results. Payloads below
+// twoshot_min_bytes use the one-shot algorithm (latency-bound), larger ones
+// reduce-scatter + all-gather. The flag handshake self-increments a
+// device-resident generation counter, so the call records into a SYCL command
+// graph and survives replay; no host sync, no allocation. Out-of-envelope
+// rank/world are rejected without launching. Every rank in the group must
+// launch the collective concurrently or the (bounded) spins expire.
+void all_reduce(sycl::queue& q, const void* inp, void* out,
+                void* const* regions, int rank, int world, std::size_t numel,
+                DType dt, std::size_t twoshot_min_bytes = 65536,
+                Variant variant = Variant::sycl, bool blocking = true);
+
 // Sum all-reduce across ALL visible Intel GPUs (the 4x B60). `in_per_gpu` is a
 // host buffer [n_gpus * count] where GPU g's contribution is at offset g*count;
-// `out` is host [count] = the elementwise sum across GPUs. Internally scatters
-// to each GPU (shared SYCL context), reduces via cross-device USM copies, and
-// broadcasts. Returns the number of GPUs used (capability-gated: 0 if none).
-// Native path; a oneCCL vendor variant is the production route (deferred).
+// `out` is host [count] = the elementwise sum across GPUs. Orchestrates the
+// capturable `all_reduce` in-process: one shared SYCL context, per-GPU regions,
+// every rank's collective launched concurrently. Returns the number of GPUs
+// used (capability-gated: 0 if none). Native path; a oneCCL vendor variant is
+// the production route (deferred).
 std::size_t all_reduce_sum(const float* in_per_gpu, float* out,
                            std::size_t count);
 

@@ -67,8 +67,12 @@ families:
   collectives:
     status: capability_gated
     paths:
+      - kernels/collectives
       - src/dispatch/collectives.cpp
-    note: Native multi-GPU sum all-reduce across the 4x B60 (verified); requires >1 GPU. oneCCL vendor variant deferred.
+    note: >-
+      Capturable P2P sum all-reduce (one-shot + two-shot) across the 4x B60,
+      bitwise-identical on every rank; requires >1 GPU launched concurrently.
+      oneCCL vendor variant deferred.
   utils:
     status: partial
     paths:
@@ -471,6 +475,28 @@ operations:
         status: experimental
         path: kernels/moe/nvfp4_moe/variants/xpu_sycl
         note: Two-stage relu2 form; caller scratch [M*top_k, I]. Preferred at decode.
+  all_reduce:
+    family: collectives
+    status: capability_gated
+    path: kernels/collectives/all_reduce
+    dtypes: [f32, f16, bf16]
+    shape: capturable P2P sum all-reduce (world 2..8)
+    note: >-
+      One-shot (latency-bound) and two-shot (reduce-scatter + all-gather)
+      algorithms over peer-visible [signal | staging] regions; fp32 FIXED
+      rank-order accumulation so every rank produces bitwise-identical
+      results; volatile-store + system-fence flag protocol (B60 reports peer
+      access without peer atomics); device-resident generation counters make
+      the handshake graph-replay-safe; bounded spins degrade a broken
+      handshake to a caught error instead of a device hang. Requires >1 GPU
+      with every rank launching concurrently. Region sizing via
+      ops::all_reduce_region_bytes; the cross-process fd exchange is
+      integration-owned. Semantics shared with vLLM's proven custom
+      all-reduce; independently expressed.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel all_reduce --n numel --dtype dt"}
+    variants:
+      - {name: xpu_sycl, status: capability_gated, path: kernels/collectives/all_reduce/variants/xpu_sycl}
   dropout:
     family: utils
     status: implemented
