@@ -2900,3 +2900,36 @@ DSV4 model can validate — transliterating them would claim support without
 evidence. Both stay planned; sources pinned (vllm-xpu-kernels dffcab7); the
 D5 split-K rewrite design (bf16 joint_matrix on xmx_tile, caller scratch)
 is recorded in the plan for when the bring-up happens.
+
+## 2026-08-10: Wave E — oneDNN int4/fp4/w8a8 vendor variants: probed, blocked, deferred (ledger)
+
+Actual on-B60 attempt per the house rule (never mark unsupported from
+inherited wisdom): system oneDNN 3.11.2 exposes the s4/u4 data types, but
+GPU matmul primitive-descriptor creation for the w4a16 shape
+(f16 acts x s4 weights [K,N], K-grouped scales) either fails outright
+(scale mask 3, any scale dtype; all bf16-activation forms) or resolves only
+to `ocl:ref:any` (f16 acts, mask 2) — the REFERENCE OpenCL kernel, not an
+XMX path; reference implementations are diagnostic fallbacks, not viable
+co-equal vendor variants. The vLLM oneDNN int4/fp8/fp4 wrappers ran against
+a VENDORED newer oneDNN (vllm-xpu-kernels third_party/oneDNN via
+FetchContent), not the system library. Conclusion: E2-E5 (w4a16 vendor
+variant, qgemm_q4q8, fp8 w8a8 scaled, fp4_gemm_w4a4) are blocked on a
+oneDNN upgrade/vendoring decision — a build-system change outside a kernel
+port — and stay planned with this probe as the recorded blocker
+(probe source: scratchpad dnnl_probe{,2}.cpp; impl strings above). The
+existing co-equal vendor variants (gelu, softmax, layernorm, dense_gemm,
+qgemm_int8, fp8_gemm) already exercise the vendor architecture end-to-end.
+
+## 2026-08-10: PORT CAMPAIGN CLOSE-OUT
+
+The vLLM-XPU -> QuixiCore-XPU port plan (plan file
+make-a-plan-to-federated-hearth.md) is complete: Waves 0/A/B/C/D/F landed
+(24 new contract ops + the xmx/codec/IPC infrastructure across ~26 kernel
+commits), Wave E and the remaining DeepSeek-family / perf-variant items are
+closed as evidence-gated deferrals with recorded blockers and designs
+(chunked SSD, chunked-DPAS GDR, fused qswiglu + fp8/mxfp4 grouped formats,
+paged mqa_logits, dsv4_hc pre/comb, DeepSeek rope/indexer/MLA set, oneDNN
+int4 vendor variants, contract-stub regeneration pending ruby +
+QuixiCore-CPU checkout). docs/capability-gaps.md still reflects the
+2026-07-27 inventory; kernels.yaml + this notebook are authoritative until
+the umbrella sync tool can rerun.

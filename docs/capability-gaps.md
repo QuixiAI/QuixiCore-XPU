@@ -1,6 +1,11 @@
 # XPU Capability Gaps
 
-Inventory date: 2026-07-27.
+Inventory date: 2026-07-27. STALE: the 2026-08-09/10 serving-port campaign
+landed 24+ new operations (ssm, collectives, turboquant, norm/glu quant,
+paged attention, grouped GEMM, GDN, MoE routing/permutation, sampling
+renorm, LoRA, mrope, dsv4_hc_post and more) — see `.quixicore/kernels.yaml`
+and `perf/optimization_status.md`; regeneration awaits the umbrella sync
+tool (ruby + QuixiCore-CPU checkout).
 
 This file compares the XPU backend with the **263-operation semantic
 union** and **17 exact quant-format IDs** recorded in the
