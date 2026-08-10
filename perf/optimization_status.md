@@ -2609,3 +2609,20 @@ traffic (vs 394 GB/s for the vectorized plain rms_norm at the same shape —
 the gap is the double gated-value recompute + scalar loads). Decision:
 **keep** — closes the last eager-torch op in the XPU Mamba decode path;
 vectorized loads + SLM staging deferred to a norms tuning pass.
+
+### Deferral note: ssd_prefill chunked variant (xpu_sycl_chunked)
+
+The chunked parallel-scan upgrade of ssd_prefill (ssd_torch._prefill_chunked
+tiling) is DEFERRED to the ssm depth wave with its design recorded here: the
+win is inter-chunk parallelism via the classic three-phase decomposition —
+(A) per-chunk local states + intra-chunk outputs, parallel over
+(chunk, head); (B) a cheap sequential state-passing chain over chunks;
+(C) inter-chunk outputs from each chunk's entering state, parallel again.
+Requirements learned from the torch reference: chunk boundaries must not
+cross sequences (caller-provided chunk partition arrays keep the kernel
+data-independent and capture-safe), the per-chunk (L,L) decay matrix must be
+tiled through SLM (never materialized), A<0 keeps every exp argument <= 0,
+and intermediate chunk states need caller scratch
+[nchunks, nheads, headdim, dstate] f32 (no-allocation rule). Gate: keep only
+on a >=3% median win over xpu_sycl_seq at NemotronH prefill shapes with a
+cross-variant equality test (rel ~1e-4 f32; different summation order).
