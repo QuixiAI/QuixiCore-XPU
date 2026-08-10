@@ -544,6 +544,29 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/moe/moe_route/variants/xpu_sycl}
+  moe_grouped_qgemm:
+    family: moe
+    status: experimental
+    path: kernels/moe/grouped_qgemm
+    dtypes: [f16, bf16]
+    shape: segmented per-expert GEMM with fused weight dequant (grouped_gemm / moe_grouped_qgemm / moe_grouped_qswiglu)
+    note: >-
+      Rows sorted by expert + device rows_per_expert [E] (never host-read);
+      static worst-case grid with an on-device segment walk
+      (graph-capture-safe, zeros/empty experts fine). Formats: w16, int4
+      group (f16 scales), nvfp4 (e2m1 + LINEAR de-swizzled e4m3 16-block
+      scales + per-expert f32 global scale applied exactly in the fp32
+      epilogue). moe_grouped_qswiglu ships as the composite (qgemm ->
+      caller scratch [M,2I] -> glu swiglu). HONEST STANDING: correct and
+      contract-closing but not yet a throughput winner — the scalar
+      stage-lambda dequant is ALU-bound (see optimization_status); the
+      nvfp4_moe GEMV split remains the production route until the recorded
+      levers land. fp8/mxfp4 formats + the fused swiglu follow with that
+      throughput pass.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel moe_grouped_qgemm --M rows --dim N --K K --N experts"}
+    variants:
+      - {name: xpu_sycl, status: experimental, path: kernels/moe/grouped_qgemm/variants/xpu_sycl}
   nvfp4_moe:
     family: moe
     status: experimental

@@ -2745,3 +2745,37 @@ prefill tiling on xmx_tile (prefill is compute-bound and still scalar).
 Decision: **keep, experimental** — the contract's biggest gap is closed
 correctness-first with an honest perf ledger; the throughput pass is the
 attention depth wave.
+
+## 2026-08-09: moe_grouped_qgemm — segmented grouped GEMM on the xmx block (honest baseline)
+
+Semantics from the vllm-xpu-kernels cutlass grouped GEMM including its local
+NVFP4 graft (Apache; translated): expert-sorted rows + device
+rows_per_expert, and the graft's two key decisions preserved — e4m3 block
+scales consumed LINEAR [E,N,K/16] (de-swizzled at weight load) and the
+per-expert f32 global scale applied OUTSIDE the accumulation (exact, in the
+fp32 epilogue here rather than a Python wrapper). Graph-safe segmentation:
+static worst-case grid (ceil(M/8)+E m-tiles), per-work-group SLM prefix walk
+of rows_per_expert, host never reads the counts.
+
+Correctness: `check_moe_grouped_qgemm` — fp64 oracle per expert segment with
+exact per-format weight decode, MODELING THE STAGED ROUNDING (the dequantized
+weight is staged in the 16-bit act dtype before the DPAS — the int4 case
+caught this at 1.4e-3 excess before the oracle rounded its dequant). Empty
+leading expert, m/n-tile tails, w16/int4/nvfp4 x bf16/f16: all
+worst_excess = 0. Full suite PASS.
+
+Measurement (B60; Qwen3.6-NVFP4 prefill shape M=1536 (256 tok x top-6),
+N=2I=3712, K=4480, E=64, bf16): 155.8 ms, 0.33 TFLOPs, 3.4 GB/s of unique
+weight bytes — vs 42.9 ms for the nvfp4_moe GEMV split doing the same
+logical stage. The single-8x16-tile-per-work-group geometry with scalar
+per-element lambda dequant (280 K-steps of SLM round-trips, 16 lanes decoding
+128 nibbles per step) is ALU/barrier-bound, the same standing the original
+w4a16_gemm baseline recorded. Levers, priority order: packed-word dequant in
+the stage (decode 8 e2m1 values per u32 like nvfp4_row_dot's WVec path),
+register-blocked multi-tile accumulators (AccTile) amortizing each staged B
+tile across 2-4 M-tiles, multiple subgroups per work-group sharing B, and
+A-tiles loaded direct from global (row-major bf16 needs no SLM staging).
+Decision: **keep, experimental** — closes grouped_gemm / moe_grouped_qgemm /
+moe_grouped_qswiglu contract stubs with exact NVFP4 semantics; the GEMV
+split remains the production route until the throughput pass (which gates
+the fused swiglu + fp8/mxfp4 formats).

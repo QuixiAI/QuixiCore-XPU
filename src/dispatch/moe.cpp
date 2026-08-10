@@ -3,6 +3,7 @@
 #include "quixicore/xpu/ops.hpp"
 
 #include "moe/moe_route/moe_route_kernel.hpp"
+#include "moe/grouped_qgemm/grouped_qgemm_kernel.hpp"
 #include "moe/nvfp4_moe/nvfp4_moe_kernel.hpp"
 
 namespace quixicore::xpu::ops {
@@ -80,6 +81,35 @@ void nvfp4_moe_relu2_split(sycl::queue &q, const void *hidden, const int *topk_i
       zeroed);
   if (blocking)
     event.wait();
+}
+
+void moe_grouped_qgemm(sycl::queue& q, const void* A, const void* W,
+                       const void* scales, const float* global_scales, void* C,
+                       const std::int32_t* rows_per_expert, std::size_t M_total,
+                       std::size_t N, std::size_t K, std::size_t E,
+                       std::size_t group, MoeWeightFormat fmt, DType act_dt,
+                       Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::moe_grouped_qgemm_sycl(
+      q, A, W, scales, global_scales, C, rows_per_expert, M_total, N, K, E,
+      group, static_cast<int>(fmt), act_dt);
+  if (blocking) ev.wait();
+}
+
+void moe_grouped_qswiglu(sycl::queue& q, const void* A, const void* W,
+                         const void* scales, const float* global_scales,
+                         void* scratch_2i, void* C,
+                         const std::int32_t* rows_per_expert,
+                         std::size_t M_total, std::size_t I, std::size_t K,
+                         std::size_t E, std::size_t group, MoeWeightFormat fmt,
+                         DType act_dt, Variant variant, bool blocking) {
+  (void)variant;  // native only (composite: grouped qgemm -> glu swiglu)
+  sycl::event g = kernels::moe_grouped_qgemm_sycl(
+      q, A, W, scales, global_scales, scratch_2i, rows_per_expert, M_total,
+      2 * I, K, E, group, static_cast<int>(fmt), act_dt);
+  g.wait();  // glu launches on the same in-order-agnostic queue; serialize
+  glu(q, scratch_2i, C, M_total, I, act_dt, GluMode::swiglu, Variant::sycl,
+      blocking);
 }
 
 }  // namespace quixicore::xpu::ops

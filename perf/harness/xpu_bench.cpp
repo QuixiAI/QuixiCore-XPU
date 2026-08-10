@@ -67,6 +67,7 @@
 #include "linear_attention/linear_attn/linear_attn_kernel.hpp"
 #include "linear_attention/qwen_gdn_decode/qwen_gdn_kernel.hpp"
 #include "moe/moe_route/moe_route_kernel.hpp"
+#include "moe/grouped_qgemm/grouped_qgemm_kernel.hpp"
 #include "moe/nvfp4_moe/nvfp4_moe_kernel.hpp"
 #include "ssm/selective_scan/selective_scan_kernel.hpp"
 #include "serving/serving_kernel.hpp"
@@ -647,6 +648,41 @@ int main(int argc, char** argv) {
     sycl::free(state, q); sycl::free(x, q); sycl::free(B, q); sycl::free(C, q);
     sycl::free(out, q); sycl::free(dt_raw, q); sycl::free(A, q);
     sycl::free(dt_bias, q); sycl::free(D, q); sycl::free(idx, q);
+    return 0;
+  }
+  if (kernel == "moe_grouped_qgemm") {
+    // --M rows total (spread evenly over --n experts... uses --N experts),
+    // --dim N, --K K, nvfp4 weights.
+    const std::size_t E2 = N && N <= 256 ? N : 64;
+    const std::size_t Mt = M, Ncols = dim, Kd = K;
+    auto *A = sycl::malloc_device(Mt * Kd * elem, q);
+    auto *W = sycl::malloc_device<std::uint8_t>(E2 * Ncols * Kd / 2, q);
+    auto *S = sycl::malloc_device<std::uint8_t>(E2 * Ncols * (Kd / 16), q);
+    float *G = sycl::malloc_device<float>(E2, q);
+    auto *C = sycl::malloc_device(Mt * Ncols * elem, q);
+    auto *rpe = sycl::malloc_shared<std::int32_t>(E2, q);
+    q.memset(A, 0, Mt * Kd * elem).wait();
+    q.memset(W, 0x22, E2 * Ncols * Kd / 2).wait();
+    q.memset(S, 0x38, E2 * Ncols * (Kd / 16)).wait();
+    q.fill(G, 0.02f, E2).wait();
+    for (std::size_t e = 0; e < E2; ++e)
+      rpe[e] = static_cast<std::int32_t>(Mt / E2 + (e < Mt % E2 ? 1 : 0));
+    auto once = [&] {
+      kernels::moe_grouped_qgemm_sycl(q, A, W, S, G, C, rpe, Mt, Ncols, Kd,
+                                      E2, 16, 2, dt);
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    const double tflops = 2.0 * Mt * Ncols * Kd / (timing.median_ms * 1e-3) / 1e12;
+    const double wgb = (E2 * Ncols * Kd / 2.0) / 1e9 / (timing.median_ms * 1e-3);
+    std::cout << "{\"schema_version\":2,\"kernel\":\"moe_grouped_qgemm\",\"fmt\":\"nvfp4\","
+              << "\"dtype\":\"" << dtype_name(dt) << "\",\"M\":" << Mt << ",\"N\":" << Ncols
+              << ",\"K\":" << Kd << ",\"E\":" << E2 << ",\"iters\":" << iters
+              << ",\"median_ms\":" << timing.median_ms << ",\"tflops\":" << tflops
+              << ",\"weight_gbps\":" << wgb << ",\"device\":\""
+              << q.get_device().get_info<sycl::info::device::name>() << "\"}"
+              << std::endl;
+    sycl::free(A, q); sycl::free(W, q); sycl::free(S, q); sycl::free(G, q);
+    sycl::free(C, q); sycl::free(rpe, q);
     return 0;
   }
   if (kernel == "paged_attention_decode") {

@@ -1102,6 +1102,104 @@ bool check_causal_conv1d_prefill(sycl::queue& q, DType act_dt, DType state_dt,
   return ok;
 }
 
+// Segmented grouped GEMM. fp64 oracle over expert segments with exact
+// weight decode per format; covers empty experts (incl. first), m-tile and
+// n-tile tails, and the composite qswiglu path.
+template <typename T>
+bool check_moe_grouped_qgemm(sycl::queue& q, DType dt, int fmt_i) {
+  namespace codec = quixicore::xpu::turboquant_codec;
+  const auto fmt = static_cast<ops::MoeWeightFormat>(fmt_i);
+  const std::size_t E = 4, K = 128, N = 90, group = 32;
+  const std::int32_t rpe_h[E] = {0, 5, 12, 3};
+  std::size_t M = 0;
+  for (auto r : rpe_h) M += static_cast<std::size_t>(r);
+
+  T* A = sycl::malloc_shared<T>(M * K, q);
+  T* C = sycl::malloc_shared<T>(M * N, q);
+  std::int32_t* rpe = sycl::malloc_shared<std::int32_t>(E, q);
+  for (std::size_t e = 0; e < E; ++e) rpe[e] = rpe_h[e];
+  for (std::size_t i = 0; i < M * K; ++i)
+    A[i] = static_cast<T>(0.25f * sample(i + 3));
+  for (std::size_t i = 0; i < M * N; ++i) C[i] = static_cast<T>(-99.0f);
+
+  // Weights per format.
+  T* w16 = sycl::malloc_shared<T>(E * N * K, q);
+  std::uint8_t* wq = sycl::malloc_shared<std::uint8_t>(E * N * K / 2, q);
+  sycl::half* s16 = sycl::malloc_shared<sycl::half>(E * N * (K / group), q);
+  std::uint8_t* s8 = sycl::malloc_shared<std::uint8_t>(E * N * (K / 16), q);
+  float* gs = sycl::malloc_shared<float>(E, q);
+  for (std::size_t i = 0; i < E * N * K; ++i)
+    w16[i] = static_cast<T>(0.25f * sample(i + 7));
+  for (std::size_t i = 0; i < E * N * K / 2; ++i) {
+    auto det = [](std::size_t idx) -> std::uint8_t {
+      const std::uint8_t mag = static_cast<std::uint8_t>((idx * 5 + 1) & 0x07u);
+      return (idx % 5 == 0 ? 0x08u : 0u) | mag;
+    };
+    wq[i] = det(2 * i) | static_cast<std::uint8_t>(det(2 * i + 1) << 4);
+  }
+  for (std::size_t i = 0; i < E * N * (K / group); ++i)
+    s16[i] = static_cast<sycl::half>(0.05f + 0.01f * std::abs(sample(i + 11)));
+  for (std::size_t i = 0; i < E * N * (K / 16); ++i)
+    s8[i] = (i & 1) ? 0x38u : 0x30u;
+  for (std::size_t e = 0; e < E; ++e) gs[e] = 0.02f + 0.003f * e;
+
+  const void* W = fmt == ops::MoeWeightFormat::w16 ? static_cast<void*>(w16)
+                                                   : static_cast<void*>(wq);
+  const void* S = fmt == ops::MoeWeightFormat::int4_group
+                      ? static_cast<void*>(s16)
+                      : static_cast<void*>(s8);
+  ops::moe_grouped_qgemm(q, A, W, S, gs, C, rpe, M, N, K, E, group, fmt, dt,
+                         Variant::sycl, true);
+
+  auto wref = [&](std::size_t e, std::size_t n, std::size_t k) -> double {
+    if (fmt == ops::MoeWeightFormat::w16)
+      return static_cast<double>(w16[e * N * K + n * K + k]);
+    const std::uint8_t byte = wq[e * N * (K / 2) + n * (K / 2) + k / 2];
+    const std::uint8_t nib = (k & 1) ? (byte >> 4) : (byte & 0x0f);
+    if (fmt == ops::MoeWeightFormat::int4_group) {
+      const int v = nib >= 8 ? static_cast<int>(nib) - 16 : nib;
+      const float dq = static_cast<float>(v) *
+                       static_cast<float>(s16[e * N * (K / group) +
+                                              n * (K / group) + k / group]);
+      return static_cast<double>(static_cast<T>(dq));  // staged in T
+    }
+    constexpr double kE2m1[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
+    const double mag = kE2m1[nib & 0x7];
+    const double ev = (nib & 0x8) ? -mag : mag;
+    return ev * static_cast<double>(codec::e4m3_decode(
+               s8[e * N * (K / 16) + n * (K / 16) + k / 16])) *
+           static_cast<double>(gs[e]);
+  };
+  const Tol tol = tol_for(dt);
+  const double rtol = tol.rtol * std::sqrt(static_cast<double>(K)) + 8e-3;
+  double worst = 0.0;
+  std::size_t row0 = 0;
+  for (std::size_t e = 0; e < E; ++e) {
+    for (std::int32_t r = 0; r < rpe_h[e]; ++r) {
+      for (std::size_t n = 0; n < N; ++n) {
+        double acc = 0.0;
+        for (std::size_t k = 0; k < K; ++k)
+          acc += static_cast<double>(A[(row0 + r) * K + k]) * wref(e, n, k);
+        const double ref = static_cast<double>(static_cast<T>(acc));
+        const double err =
+            std::abs(static_cast<double>(C[(row0 + r) * N + n]) - ref);
+        worst = std::max(worst, err - (tol.atol + rtol * std::abs(ref)));
+      }
+    }
+    row0 += static_cast<std::size_t>(rpe_h[e]);
+  }
+  sycl::free(A, q); sycl::free(C, q); sycl::free(rpe, q); sycl::free(w16, q);
+  sycl::free(wq, q); sycl::free(s16, q); sycl::free(s8, q); sycl::free(gs, q);
+  const bool ok = worst <= 0.0;
+  const char* fname = fmt == ops::MoeWeightFormat::w16
+                          ? "w16"
+                          : (fmt == ops::MoeWeightFormat::int4_group ? "int4"
+                                                                     : "nvfp4");
+  std::cout << "  moe_grouped_qgemm dt=" << dtype_name(dt) << " fmt=" << fname
+            << " worst_excess=" << worst << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // Paged attention decode. Builds a scattered paged KV cache from logical
 // per-sequence K/V, runs split-KV decode, and checks against a fp64 online
 // softmax oracle. Covers page tails, a 1-token context, GQA, splits > pages,
@@ -4193,6 +4291,12 @@ int main() {
                                                          false, false, false) ? 0 : 1;
   failures += check_causal_conv1d_decode<half_t, float>(q, DType::f16, DType::f32,
                                                         true, false, true) ? 0 : 1;
+
+  // moe: segmented grouped GEMM (w16 / int4 / nvfp4).
+  failures += check_moe_grouped_qgemm<bf16_t>(q, DType::bf16, 0) ? 0 : 1;
+  failures += check_moe_grouped_qgemm<bf16_t>(q, DType::bf16, 1) ? 0 : 1;
+  failures += check_moe_grouped_qgemm<bf16_t>(q, DType::bf16, 2) ? 0 : 1;
+  failures += check_moe_grouped_qgemm<half_t>(q, DType::f16, 2) ? 0 : 1;
 
   // attention: paged decode (split-KV) + varlen prefill.
   failures += check_paged_attention_decode<bf16_t>(q, DType::bf16,

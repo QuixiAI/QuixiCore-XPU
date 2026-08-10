@@ -36,6 +36,10 @@ All notable QuixiCore XPU changes should be recorded here.
 - turboquant: KV-cache codec encode/decode implementing the format v2 ABI
   (rotated Lloyd-Max keys or e4m3 byte keys, per-group uniform values,
   LSB-first packing), byte-identical to the host-shared codec oracle.
+- moe_grouped_qgemm / moe_grouped_qswiglu: segmented per-expert GEMM with
+  fused w16/int4/nvfp4 dequant on the native DPAS block (graph-safe
+  on-device segmentation; composite swiglu); experimental — GEMV split
+  stays the production route until the recorded throughput pass.
 - paged_attention_decode / paged_attention_prefill: native paged KV-cache
   attention (runtime page size, split-KV decode with caller workspaces and
   LSE merge, varlen prefill with causal/window/sinks/LSE/mixed-batch mask,

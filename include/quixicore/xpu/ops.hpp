@@ -290,6 +290,42 @@ void moe_route_topk(sycl::queue& q, const void* router_logits, int* expert_ids,
                     std::size_t n_experts, int k, DType dt,
                     Variant variant = Variant::sycl, bool blocking = true);
 
+// Grouped-GEMM weight formats (see moe_grouped_qgemm).
+enum class MoeWeightFormat {
+  w16,         // W [E, N, K] in the activation dtype
+  int4_group,  // W [E, N, K/2] packed nibbles + f16 scales [E, N, K/group]
+  nvfp4,       // W [E, N, K/2] e2m1 + u8 e4m3 scales [E, N, K/16] LINEAR
+               // (de-swizzled) + per-expert f32 global scale (fp32 epilogue)
+};
+
+// Segmented per-expert GEMM with fused weight dequant on the native DPAS
+// building block (contract grouped_gemm / moe_grouped_qgemm). A [M_total, K]
+// act_dt with rows SORTED BY EXPERT; rows_per_expert [E] device int32 (zeros
+// allowed, sum == M_total, E <= 256, never read on host); C [M_total, N]
+// act_dt. K % 16 == 0; act_dt f16/bf16 (DPAS operands). The permute prologue
+// (row sorting) is caller-owned. Graph-capture-safe: static worst-case grid,
+// on-device segment walk, no allocation.
+void moe_grouped_qgemm(sycl::queue& q, const void* A, const void* W,
+                       const void* scales, const float* global_scales, void* C,
+                       const std::int32_t* rows_per_expert, std::size_t M_total,
+                       std::size_t N, std::size_t K, std::size_t E,
+                       std::size_t group, MoeWeightFormat fmt, DType act_dt,
+                       Variant variant = Variant::sycl, bool blocking = true);
+
+// Grouped GEMM + SwiGLU (contract moe_grouped_qswiglu), composite v1:
+// W is [E, 2I, K] with gate rows [0, I) and up rows [I, 2I); the GEMM lands
+// in caller scratch [M_total, 2I] (the glu layout) and ops::glu applies
+// silu(gate) * up into C [M_total, I]. A fused single-kernel form is the
+// recorded follow-up (keep only if it beats the composite on B60).
+void moe_grouped_qswiglu(sycl::queue& q, const void* A, const void* W,
+                         const void* scales, const float* global_scales,
+                         void* scratch_2i, void* C,
+                         const std::int32_t* rows_per_expert,
+                         std::size_t M_total, std::size_t I, std::size_t K,
+                         std::size_t E, std::size_t group, MoeWeightFormat fmt,
+                         DType act_dt, Variant variant = Variant::sycl,
+                         bool blocking = true);
+
 // Decode-oriented routed MoE with ModelOpt NVFP4 weights. `hidden` is [M,K]
 // dtype `act_dt`; ids/weights are [M,top_k] int32/f32. Weight layouts are
 // w13 [E,2I,K/2], w13_scales [E,2I,K/16], w2 [E,K,I/2], and w2_scales
