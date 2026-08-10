@@ -906,6 +906,30 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/optimizers/adamw/variants/xpu_sycl}
+  top_k_renorm:
+    family: sampling
+    status: implemented
+    path: kernels/sampling/renorm
+    dtypes: [f32, f16, bf16]
+    shape: keep-top-k probability renormalization (ties at the pivot kept)
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/sampling/renorm/variants/xpu_sycl}
+  top_p_renorm:
+    family: sampling
+    status: implemented
+    path: kernels/sampling/renorm
+    dtypes: [f32, f16, bf16]
+    shape: nucleus (top-p) renormalization via threshold binary search
+    note: >-
+      FlashInfer-style threshold formulation equivalent to the minimal
+      sorted-prefix definition with ties included; validated by set
+      properties (mass reached, top-heavy, minimal) rather than a fixed
+      ordering. One work-item per row, correctness-first; the fused
+      logits_bias_penalties_top_k_top_p_sample composite stays planned.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/sampling/renorm/variants/xpu_sycl}
   argmax:
     family: sampling
     status: implemented

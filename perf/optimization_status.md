@@ -2857,3 +2857,15 @@ functionally (histogram equality, per-row gather equality through the map,
 and unpermute equal to the direct weighted sum — row order within an expert
 is free by construction). All green, suite PASS. Elementwise/scatter-bound;
 covered by the existing moe_route bench branch.
+
+## 2026-08-10: top_k_renorm + top_p_renorm (C6)
+
+Threshold formulations (per the vLLM/FlashInfer renorm lineage, translated):
+top-k finds the k-th value by iterative masked max and keeps >= it (ties
+included); top-p binary-searches the largest threshold whose kept mass still
+reaches the target (32 halvings), equivalent to the minimal sorted-prefix
+set. One work-item per row (sequential vocab scans) — replicable exactly by
+the oracle; top-p validated by set properties (mass reached, top-heavy,
+minimal). The fused bias/penalties/sample composite remains planned; the
+existing sample_categorical/top_k_sample ops cover the sampling step. All
+green, suite PASS.

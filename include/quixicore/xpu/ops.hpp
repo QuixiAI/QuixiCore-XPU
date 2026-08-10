@@ -273,6 +273,21 @@ void embedding_lookup(sycl::queue& q, const void* table, const int* ids,
                       void* out, std::size_t n, std::size_t dim, DType dt,
                       Variant variant = Variant::sycl, bool blocking = true);
 
+// Top-k probability renormalization (contract top_k_renorm): keep the k
+// largest probabilities per row (ties at the k-th value included), zero the
+// rest, renormalize to sum 1. probs/out are [rows, vocab] of dtype dt
+// (out-of-place; may alias). k <= 64. Rows with zero kept mass pass through.
+void top_k_renorm(sycl::queue& q, const void* probs, void* out,
+                  std::size_t rows, std::size_t vocab, int k, DType dt,
+                  Variant variant = Variant::sycl, bool blocking = true);
+
+// Top-p (nucleus) renormalization (contract top_p_renorm): keep the minimal
+// high-probability set whose mass reaches top_p (threshold binary search,
+// ties included), renormalize. Same layout rules as top_k_renorm.
+void top_p_renorm(sycl::queue& q, const void* probs, void* out,
+                  std::size_t rows, std::size_t vocab, float top_p, DType dt,
+                  Variant variant = Variant::sycl, bool blocking = true);
+
 // KV-cache scatter: cache[slots[t], :] = src[t, :]. `cache` is [max_slots, row],
 // `src` is [n, row], `slots` is [n] int32 (a negative slot skips the row).
 // `row` = n_heads * head_dim (or any contiguous row width), dtype `dt`.

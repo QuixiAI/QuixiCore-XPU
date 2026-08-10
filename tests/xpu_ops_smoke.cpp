@@ -9,7 +9,9 @@
 // torch.xpu / pytest harness is planned once the PyTorch-XPU binding lands; the
 // fp64 oracle here does not depend on any Python stack.
 
+#include <algorithm>
 #include <cmath>
+#include <functional>
 #include <cstddef>
 #include <cstring>
 #include <iostream>
@@ -1100,6 +1102,101 @@ bool check_causal_conv1d_prefill(sycl::queue& q, DType act_dt, DType state_dt,
             << (strided_tokens ? " strided" : " packed")
             << " worst_out=" << worst_out << " state_bad=" << state_bad
             << " zero_bad=" << zero_bad << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+// Renorm ops. fp64 oracle with well-separated probabilities (no float
+// boundary ambiguity): top-k must keep exactly the k largest and
+// renormalize; top-p must keep the minimal prefix reaching the mass.
+template <typename T>
+bool check_renorm(sycl::queue& q, DType dt) {
+  const std::size_t rows = 16, vocab = 512;
+  T* probs = sycl::malloc_shared<T>(rows * vocab, q);
+  T* out = sycl::malloc_shared<T>(rows * vocab, q);
+  for (std::size_t r = 0; r < rows; ++r) {
+    double sum = 0.0;
+    std::vector<double> p(vocab);
+    for (std::size_t v = 0; v < vocab; ++v) {
+      p[v] = std::exp(2.5 * sample(r * vocab + v + 3));
+      sum += p[v];
+    }
+    for (std::size_t v = 0; v < vocab; ++v)
+      probs[r * vocab + v] = static_cast<T>(p[v] / sum);
+  }
+  const Tol tol = tol_for(dt);
+  bool ok = true;
+  {  // top-k
+    const int k = 8;
+    ops::top_k_renorm(q, probs, out, rows, vocab, k, dt, Variant::sycl, true);
+    double worst = 0.0;
+    int set_bad = 0;
+    for (std::size_t r = 0; r < rows; ++r) {
+      std::vector<double> p(vocab);
+      for (std::size_t v = 0; v < vocab; ++v)
+        p[v] = static_cast<double>(probs[r * vocab + v]);
+      std::vector<double> sorted(p);
+      std::nth_element(sorted.begin(), sorted.begin() + (k - 1), sorted.end(),
+                       std::greater<double>());
+      const double thresh = sorted[k - 1];
+      double kept = 0.0;
+      for (std::size_t v = 0; v < vocab; ++v)
+        if (p[v] >= thresh) kept += p[v];
+      for (std::size_t v = 0; v < vocab; ++v) {
+        const double got = static_cast<double>(out[r * vocab + v]);
+        if (p[v] >= thresh) {
+          const double ref = static_cast<double>(static_cast<T>(p[v] / kept));
+          worst = std::max(worst, std::abs(got - ref) -
+                                      (tol.atol + 4 * tol.rtol * std::abs(ref)));
+        } else if (got != 0.0) {
+          ++set_bad;
+        }
+      }
+    }
+    ok = ok && worst <= 0.0 && set_bad == 0;
+    std::cout << "  top_k_renorm dt=" << dtype_name(dt) << " worst=" << worst
+              << " set_bad=" << set_bad
+              << (worst <= 0.0 && set_bad == 0 ? "  ok" : "  FAIL") << '\n';
+  }
+  {  // top-p
+    const float tp = 0.8f;
+    ops::top_p_renorm(q, probs, out, rows, vocab, tp, dt, Variant::sycl, true);
+    double worst = 0.0;
+    int mass_bad = 0;
+    for (std::size_t r = 0; r < rows; ++r) {
+      std::vector<double> p(vocab);
+      for (std::size_t v = 0; v < vocab; ++v)
+        p[v] = static_cast<double>(probs[r * vocab + v]);
+      // kept set from the device output; verify minimality + mass + renorm
+      double kept_mass = 0.0;
+      double min_kept = 1e300, max_dropped = 0.0;
+      for (std::size_t v = 0; v < vocab; ++v) {
+        if (static_cast<double>(out[r * vocab + v]) > 0.0) {
+          kept_mass += p[v];
+          min_kept = std::min(min_kept, p[v]);
+        } else {
+          max_dropped = std::max(max_dropped, p[v]);
+        }
+      }
+      if (kept_mass < tp - 1e-3) ++mass_bad;              // reaches the mass
+      if (max_dropped > min_kept + 1e-9) ++mass_bad;      // top-heavy set
+      // minimality: dropping the smallest kept must fall below top_p
+      if (kept_mass - min_kept >= tp + 1e-3) ++mass_bad;
+      for (std::size_t v = 0; v < vocab; ++v) {
+        const double got = static_cast<double>(out[r * vocab + v]);
+        if (got > 0.0) {
+          const double ref =
+              static_cast<double>(static_cast<T>(p[v] / kept_mass));
+          worst = std::max(worst, std::abs(got - ref) -
+                                      (tol.atol + 4 * tol.rtol * std::abs(ref)));
+        }
+      }
+    }
+    ok = ok && worst <= 0.0 && mass_bad == 0;
+    std::cout << "  top_p_renorm dt=" << dtype_name(dt) << " worst=" << worst
+              << " mass_bad=" << mass_bad
+              << (worst <= 0.0 && mass_bad == 0 ? "  ok" : "  FAIL") << '\n';
+  }
+  sycl::free(probs, q); sycl::free(out, q);
   return ok;
 }
 
@@ -4810,6 +4907,10 @@ int main() {
                                                          false, false, false) ? 0 : 1;
   failures += check_causal_conv1d_decode<half_t, float>(q, DType::f16, DType::f32,
                                                         true, false, true) ? 0 : 1;
+
+  // sampling: top-k / top-p renormalization.
+  failures += check_renorm<float>(q, DType::f32) ? 0 : 1;
+  failures += check_renorm<bf16_t>(q, DType::bf16) ? 0 : 1;
 
   // moe: router gating modes + permute/unpermute round-trip.
   failures += check_moe_route_modes_and_permute<float>(q, DType::f32) ? 0 : 1;
