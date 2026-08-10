@@ -377,6 +377,35 @@ void nvfp4_moe_relu2_split(sycl::queue &q, const void *hidden, const int *topk_i
 // linear_attention
 // ----------------------------------------------------------------------------
 
+// In-place L2 normalization of q/k head vectors (the Gated DeltaNet
+// pre-step): each [dk] vector of the [tokens, heads, dk] tensor is divided
+// by sqrt(sum(x^2) + eps). Run on q and k before gated_delta_rule_varlen.
+void gdn_l2norm_qk(sycl::queue& q, void* qk, std::size_t tokens,
+                   std::size_t heads, std::size_t dk, float eps, DType dt,
+                   Variant variant = Variant::sycl, bool blocking = true);
+
+// Varlen gated delta rule (Gated DeltaNet), exact recurrence, prefill +
+// decode in one call. Q, K are [T, Hk, dk] (pre-L2-normalized) and V,
+// core_out [T, Hv, dv] of dtype act_dt, packed by cu_seqlens [batch+1];
+// b and a are [T, Hv] f32 raw gate projections (beta = sigmoid(b),
+// g = exp(-exp(A_log[hv]) * softplus(a + dt_bias[hv]))); A_log, dt_bias
+// (nullptr = 0) are [Hv] f32. ssm_state [nslots, Hv, dv, dk] of state_dt is
+// read at state_indices[seq] (zeros when has_initial_state[seq] is false or
+// the pointer is null-slot) and written back IN PLACE after the last token;
+// null/out-of-range slots emit zero output and touch no state. GQA maps
+// hv -> hv / (Hv/Hk). dk <= 128; per-token order is decay, kv read, rank-1
+// update, output (matching the vLLM general kernel). The width-4 conv stage
+// is causal_conv1d_prefill/decode with token-major strides; the chunked-DPAS
+// prefill pipeline is the deferred perf variant.
+void gated_delta_rule_varlen(
+    sycl::queue& q, const void* Q, const void* K, const void* V,
+    const float* b, const float* a, const float* A_log, const float* dt_bias,
+    void* ssm_state, void* core_out, const std::int32_t* cu_seqlens,
+    const std::int32_t* state_indices, const bool* has_initial_state,
+    std::size_t batch, std::size_t Hk, std::size_t dk, std::size_t Hv,
+    std::size_t dv, std::size_t nslots, DType act_dt, DType state_dt,
+    Variant variant = Variant::sycl, bool blocking = true);
+
 // Non-causal linear attention. Q, K, V are [n_heads, seq, dim] dtype dt; O is
 // [n_heads, seq, dim]. Per head: KV = sum_t K[t]^T V[t] (dim x dim), z = sum_t
 // K[t] (dim), O[t] = (Q[t] @ KV) / (Q[t] . z + eps). fp32 accumulation. dim must

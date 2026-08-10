@@ -523,6 +523,35 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/linear_attention/linear_attn/variants/xpu_sycl}
+  gdn_l2norm_qk:
+    family: linear_attention
+    status: implemented
+    path: kernels/linear_attention/gated_delta_rule
+    dtypes: [f32, f16, bf16]
+    shape: in-place per-head L2 normalize (GDN pre-step)
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/linear_attention/gated_delta_rule/variants/xpu_sycl}
+  gated_delta_rule_varlen:
+    family: linear_attention
+    status: implemented
+    path: kernels/linear_attention/gated_delta_rule
+    dtypes: [f32, f16, bf16]
+    shape: varlen gated delta rule, exact recurrence (prefill + decode)
+    note: >-
+      One work-group per (sequence, v head), lane-per-v-dim register state
+      rows, SLM-staged q/k per token; beta = sigmoid(b), g = exp(-exp(A_log)
+      * softplus(a + dt_bias)); GQA hv->hk map; cu_seqlens varlen with empty
+      sequences; state read at state_indices (zero when has_initial_state is
+      false), written back in place; null slots emit zeros. dk <= 128.
+      Unlocks GDN beyond the shape-locked qwen_gdn_decode; the width-4 conv
+      is causal_conv1d_prefill/decode with token-major strides. The
+      chunked-DPAS prefill pipeline is the deferred perf variant (>= 2.5x
+      gate, caller workspaces). Graph-capture-safe.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel gated_delta_rule --M tokens"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/linear_attention/gated_delta_rule/variants/xpu_sycl}
   qwen_gdn_decode:
     family: linear_attention
     status: experimental

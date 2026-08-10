@@ -1102,6 +1102,139 @@ bool check_causal_conv1d_prefill(sycl::queue& q, DType act_dt, DType state_dt,
   return ok;
 }
 
+// Varlen gated delta rule. fp64 oracle of the exact recurrence (decay, kv,
+// rank-1 update, output) with fp32-replica final-state expectation; ragged
+// lengths incl. empty, GQA Hv/Hk, null slot, zero-init vs has_initial_state,
+// and prefill->decode state continuity (a second 1-token call must continue
+// where the first ended).
+template <typename T, typename StateT>
+bool check_gated_delta_rule(sycl::queue& q, DType act_dt, DType state_dt) {
+  const std::size_t B = 3, Hk = 2, dk = 64, Hv = 4, dv = 32, nslots = 5;
+  const std::int32_t lens[B] = {6, 0, 9};
+  std::int32_t cs_h[B + 1] = {0};
+  for (std::size_t s = 0; s < B; ++s) cs_h[s + 1] = cs_h[s] + lens[s];
+  const std::size_t T_tot = static_cast<std::size_t>(cs_h[B]);
+  const std::size_t vpk = Hv / Hk;
+
+  T* Q = sycl::malloc_shared<T>(T_tot * Hk * dk, q);
+  T* K = sycl::malloc_shared<T>(T_tot * Hk * dk, q);
+  T* V = sycl::malloc_shared<T>(T_tot * Hv * dv, q);
+  T* out = sycl::malloc_shared<T>(T_tot * Hv * dv, q);
+  float* b = sycl::malloc_shared<float>(T_tot * Hv, q);
+  float* a = sycl::malloc_shared<float>(T_tot * Hv, q);
+  float* A_log = sycl::malloc_shared<float>(Hv, q);
+  float* dtb = sycl::malloc_shared<float>(Hv, q);
+  StateT* st = sycl::malloc_shared<StateT>(nslots * Hv * dv * dk, q);
+  std::int32_t* cs = sycl::malloc_shared<std::int32_t>(B + 1, q);
+  std::int32_t* si = sycl::malloc_shared<std::int32_t>(B, q);
+  bool* hi = sycl::malloc_shared<bool>(B, q);
+  for (std::size_t i = 0; i < T_tot * Hk * dk; ++i) {
+    Q[i] = static_cast<T>(0.3f * sample(i + 3));
+    K[i] = static_cast<T>(0.3f * sample(i + 5));
+  }
+  for (std::size_t i = 0; i < T_tot * Hv * dv; ++i) {
+    V[i] = static_cast<T>(0.5f * sample(i + 7));
+    out[i] = static_cast<T>(-99.0f);
+  }
+  for (std::size_t i = 0; i < T_tot * Hv; ++i) {
+    b[i] = sample(i + 11);
+    a[i] = 0.3f * sample(i + 13);
+  }
+  for (std::size_t h = 0; h < Hv; ++h) {
+    A_log[h] = -0.5f + 0.2f * sample(h + 17);
+    dtb[h] = 0.1f * sample(h + 19);
+  }
+  for (std::size_t i = 0; i < nslots * Hv * dv * dk; ++i)
+    st[i] = static_cast<StateT>(0.1f * sample(i + 23));
+  for (std::size_t s = 0; s <= B; ++s) cs[s] = cs_h[s];
+  si[0] = 1; si[1] = 3; si[2] = -1;  // seq 2 null slot
+  hi[0] = true; hi[1] = false; hi[2] = true;
+  std::vector<double> snap(nslots * Hv * dv * dk);
+  for (std::size_t i = 0; i < snap.size(); ++i)
+    snap[i] = static_cast<double>(st[i]);
+
+  ops::gated_delta_rule_varlen(q, Q, K, V, b, a, A_log, dtb, st, out, cs, si,
+                               hi, B, Hk, dk, Hv, dv, nslots, act_dt, state_dt,
+                               Variant::sycl, true);
+
+  const Tol tol = tol_for(act_dt);
+  const Tol stol = tol_for(state_dt);
+  const double rtol = tol.rtol * std::sqrt(static_cast<double>(dk)) + 8e-3;
+  double worst = 0.0, worst_state = 0.0;
+  int zero_bad = 0;
+  for (std::size_t s = 0; s < B; ++s) {
+    const bool ok_slot = si[s] >= 0;
+    for (std::size_t hv = 0; hv < Hv; ++hv) {
+      const std::size_t hk = hv / vpk;
+      for (std::size_t d = 0; d < dv; ++d) {
+        std::vector<double> S(dk, 0.0);
+        std::vector<float> Sf(dk, 0.0f);
+        const std::size_t sbase =
+            ok_slot ? ((static_cast<std::size_t>(si[s]) * Hv + hv) * dv + d) * dk
+                    : 0;
+        if (ok_slot && hi[s])
+          for (std::size_t i = 0; i < dk; ++i) {
+            S[i] = snap[sbase + i];
+            Sf[i] = static_cast<float>(snap[sbase + i]);
+          }
+        for (std::int32_t t = cs_h[s]; t < cs_h[s + 1]; ++t) {
+          const std::size_t ti = static_cast<std::size_t>(t);
+          if (!ok_slot) {
+            if (static_cast<double>(out[(ti * Hv + hv) * dv + d]) != 0.0)
+              ++zero_bad;
+            continue;
+          }
+          const double beta = 1.0 / (1.0 + std::exp(-static_cast<double>(b[ti * Hv + hv])));
+          const double av = static_cast<double>(a[ti * Hv + hv]) + dtb[hv];
+          const double sp = av <= 20.0 ? std::log(1.0 + std::exp(av)) : av;
+          const double g = std::exp(-std::exp(static_cast<double>(A_log[hv])) * sp);
+          const float beta_f = 1.0f / (1.0f + std::exp(-b[ti * Hv + hv]));
+          const float av_f = a[ti * Hv + hv] + dtb[hv];
+          const float sp_f = av_f <= 20.0f ? std::log(1.0f + std::exp(av_f)) : av_f;
+          const float g_f = std::exp(-std::exp(A_log[hv]) * sp_f);
+          double kv = 0.0; float kv_f = 0.0f;
+          for (std::size_t i = 0; i < dk; ++i) {
+            S[i] *= g; Sf[i] *= g_f;
+            const double kvv = static_cast<double>(K[(ti * Hk + hk) * dk + i]);
+            kv += S[i] * kvv; kv_f += Sf[i] * static_cast<float>(kvv);
+          }
+          const double vv = static_cast<double>(V[(ti * Hv + hv) * dv + d]);
+          const double delta = (vv - kv) * beta;
+          const float delta_f = (static_cast<float>(vv) - kv_f) * beta_f;
+          double o = 0.0;
+          for (std::size_t i = 0; i < dk; ++i) {
+            const double kvv = static_cast<double>(K[(ti * Hk + hk) * dk + i]);
+            const double qv = static_cast<double>(Q[(ti * Hk + hk) * dk + i]);
+            S[i] += kvv * delta; Sf[i] += static_cast<float>(kvv) * delta_f;
+            o += S[i] * qv;
+          }
+          const double ref = static_cast<double>(static_cast<T>(o));
+          const double err =
+              std::abs(static_cast<double>(out[(ti * Hv + hv) * dv + d]) - ref);
+          worst = std::max(worst, err - (tol.atol + rtol * std::abs(ref)));
+        }
+        if (ok_slot && lens[s] > 0) {
+          for (std::size_t i = 0; i < dk; ++i) {
+            const double sref = static_cast<double>(static_cast<StateT>(Sf[i]));
+            worst_state = std::max(
+                worst_state, std::abs(static_cast<double>(st[sbase + i]) - sref) -
+                                 (stol.atol + stol.rtol * std::abs(sref)));
+          }
+        }
+      }
+    }
+  }
+  sycl::free(Q, q); sycl::free(K, q); sycl::free(V, q); sycl::free(out, q);
+  sycl::free(b, q); sycl::free(a, q); sycl::free(A_log, q); sycl::free(dtb, q);
+  sycl::free(st, q); sycl::free(cs, q); sycl::free(si, q); sycl::free(hi, q);
+  const bool ok = worst <= 0.0 && worst_state <= 0.0 && zero_bad == 0;
+  std::cout << "  gated_delta_rule act=" << dtype_name(act_dt)
+            << " state=" << dtype_name(state_dt) << " worst_out=" << worst
+            << " worst_state=" << worst_state << " zero_bad=" << zero_bad
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // Segmented grouped GEMM. fp64 oracle over expert segments with exact
 // weight decode per format; covers empty experts (incl. first), m-tile and
 // n-tile tails, and the composite qswiglu path.
@@ -4291,6 +4424,10 @@ int main() {
                                                          false, false, false) ? 0 : 1;
   failures += check_causal_conv1d_decode<half_t, float>(q, DType::f16, DType::f32,
                                                         true, false, true) ? 0 : 1;
+
+  // linear_attention: varlen gated delta rule (exact recurrence).
+  failures += check_gated_delta_rule<float, float>(q, DType::f32, DType::f32) ? 0 : 1;
+  failures += check_gated_delta_rule<bf16_t, float>(q, DType::bf16, DType::f32) ? 0 : 1;
 
   // moe: segmented grouped GEMM (w16 / int4 / nvfp4).
   failures += check_moe_grouped_qgemm<bf16_t>(q, DType::bf16, 0) ? 0 : 1;

@@ -2779,3 +2779,29 @@ Decision: **keep, experimental** — closes grouped_gemm / moe_grouped_qgemm /
 moe_grouped_qswiglu contract stubs with exact NVFP4 semantics; the GEMV
 split remains the production route until the throughput pass (which gates
 the fused swiglu + fp8/mxfp4 formats).
+
+## 2026-08-09: gated_delta_rule_varlen + gdn_l2norm_qk (general GDN)
+
+Port decision per plan: the GENERAL pure-SYCL kernel from
+vllm-xpu-kernels csrc/xpu/gdn_attn/gated_delta_rule.hpp (Apache; translated
+— per-token order decay -> kv read -> rank-1 update -> output preserved
+exactly) gives full varlen prefill+decode coverage; the chunked-DPAS
+six-kernel pipeline stays the deferred perf variant (it also allocates torch
+temporaries internally, forbidden here — its port requires caller
+workspaces; >= 2.5x gate at T >= 2048 Qwen3.6 shape). The conv stage needed
+NO new kernel: causal_conv1d_prefill/decode take token-major mixed_qkv as
+strides. Geometry simplified vs the source (lane-per-v-dim register state
+rows + SLM q/k staging instead of the 4-v-dim-per-subgroup distribution) —
+equivalent math, simpler exactness story.
+
+Correctness: fp64 recurrence oracle + fp32-replica final-state expectation;
+ragged {6, 0, 9}, GQA Hv/Hk = 2, null slot (zero out, untouched state),
+zero-init vs has_initial_state. All zero excess, suite PASS.
+
+Measurement (B60; Qwen3.6 shape Hk16/dk128/Hv32/dv128, bf16, one sequence):
+T=512 varlen 6.73 ms vs 24.79 ms for 512 sequential single-token calls —
+3.68x. Below the 5x aspiration: with ONE sequence both forms run only
+Hv (32) work-groups; the win is launch amortization, and multi-sequence
+prefill batches parallelize fully across (seq, head). Decision: **keep** —
+coverage + real speedup; the chunked variant owns the single-sequence
+occupancy problem.

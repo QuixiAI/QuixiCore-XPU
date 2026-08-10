@@ -67,6 +67,7 @@
 #include "linear_attention/linear_attn/linear_attn_kernel.hpp"
 #include "linear_attention/qwen_gdn_decode/qwen_gdn_kernel.hpp"
 #include "moe/moe_route/moe_route_kernel.hpp"
+#include "linear_attention/gated_delta_rule/gated_delta_rule_kernel.hpp"
 #include "moe/grouped_qgemm/grouped_qgemm_kernel.hpp"
 #include "moe/nvfp4_moe/nvfp4_moe_kernel.hpp"
 #include "ssm/selective_scan/selective_scan_kernel.hpp"
@@ -648,6 +649,65 @@ int main(int argc, char** argv) {
     sycl::free(state, q); sycl::free(x, q); sycl::free(B, q); sycl::free(C, q);
     sycl::free(out, q); sycl::free(dt_raw, q); sycl::free(A, q);
     sycl::free(dt_bias, q); sycl::free(D, q); sycl::free(idx, q);
+    return 0;
+  }
+  if (kernel == "gated_delta_rule") {
+    // Qwen3.6 shape: Hk16/dk128, Hv32/dv128; --M tokens, one sequence.
+    const std::size_t T2 = M, Hk = 16, dk2 = 128, Hv = 32, dv = 128, slots = 4;
+    void *Q = sycl::malloc_device(T2 * Hk * dk2 * elem, q);
+    void *Kb = sycl::malloc_device(T2 * Hk * dk2 * elem, q);
+    void *V = sycl::malloc_device(T2 * Hv * dv * elem, q);
+    void *out = sycl::malloc_device(T2 * Hv * dv * elem, q);
+    float *b = sycl::malloc_device<float>(T2 * Hv, q);
+    float *a = sycl::malloc_device<float>(T2 * Hv, q);
+    float *Al = sycl::malloc_shared<float>(Hv, q);
+    float *db = sycl::malloc_device<float>(Hv, q);
+    float *st = sycl::malloc_device<float>(slots * Hv * dv * dk2, q);
+    auto *cs = sycl::malloc_shared<std::int32_t>(2, q);
+    auto *cs1 = sycl::malloc_shared<std::int32_t>(2, q);
+    auto *si = sycl::malloc_shared<std::int32_t>(1, q);
+    bool *hi2 = sycl::malloc_shared<bool>(1, q);
+    q.memset(Q, 0, T2 * Hk * dk2 * elem).wait();
+    q.memset(Kb, 0, T2 * Hk * dk2 * elem).wait();
+    q.memset(V, 0, T2 * Hv * dv * elem).wait();
+    q.memset(b, 0, T2 * Hv * sizeof(float)).wait();
+    q.memset(a, 0, T2 * Hv * sizeof(float)).wait();
+    q.memset(db, 0, Hv * sizeof(float)).wait();
+    q.memset(st, 0, slots * Hv * dv * dk2 * sizeof(float)).wait();
+    for (std::size_t h2 = 0; h2 < Hv; ++h2) Al[h2] = -0.5f;
+    cs[0] = 0; cs[1] = static_cast<std::int32_t>(T2);
+    cs1[0] = 0; cs1[1] = 1;
+    si[0] = 0; hi2[0] = true;
+    auto once = [&] {
+      kernels::gated_delta_rule_varlen_sycl(q, Q, Kb, V, b, a, Al, db, st, out,
+                                            cs, si, hi2, 1, Hk, dk2, Hv, dv,
+                                            slots, dt, DType::f32);
+    };
+    const DeviceTiming tp = time_device_batches(once);
+    // Sequential-decode yardstick: T calls of one token each.
+    auto seq_once = [&] {
+      for (std::size_t t = 0; t < T2; ++t)
+        kernels::gated_delta_rule_varlen_sycl(q, Q, Kb, V, b, a, Al, db, st,
+                                              out, cs1, si, hi2, 1, Hk, dk2,
+                                              Hv, dv, slots, dt, DType::f32);
+    };
+    for (int i = 0; i < 2; ++i) seq_once();
+    q.wait();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 3; ++i) seq_once();
+    q.wait();
+    const auto t1 = std::chrono::steady_clock::now();
+    const double seq_ms =
+        std::chrono::duration<double, std::milli>(t1 - t0).count() / 3;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"gated_delta_rule\","
+              << "\"dtype\":\"" << dtype_name(dt) << "\",\"tokens\":" << T2
+              << ",\"iters\":" << iters << ",\"varlen_median_ms\":" << tp.median_ms
+              << ",\"seq_decode_ms\":" << seq_ms
+              << ",\"speedup\":" << seq_ms / tp.median_ms << "}" << std::endl;
+    sycl::free(Q, q); sycl::free(Kb, q); sycl::free(V, q); sycl::free(out, q);
+    sycl::free(b, q); sycl::free(a, q); sycl::free(Al, q); sycl::free(db, q);
+    sycl::free(st, q); sycl::free(cs, q); sycl::free(cs1, q); sycl::free(si, q);
+    sycl::free(hi2, q);
     return 0;
   }
   if (kernel == "moe_grouped_qgemm") {
