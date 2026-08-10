@@ -2,6 +2,7 @@
 
 #include "quixicore/xpu/ops.hpp"
 
+#include "ssm/causal_conv1d/causal_conv1d_kernel.hpp"
 #include "ssm/selective_scan/selective_scan_kernel.hpp"
 #include "ssm/ssd/ssd_kernel.hpp"
 
@@ -31,6 +32,21 @@ void ssd_decode(sycl::queue& q, void* state, const void* x, const float* dt_raw,
       q, state, x, dt_raw, A, B, C, D, dt_bias, src_indices, dst_indices, out,
       dt_softplus, batch, nheads, headdim, dstate, ngroups, nslots, s0, s1, s2,
       s3, act_dt, state_dt);
+  if (blocking) ev.wait();
+}
+
+void causal_conv1d_decode(sycl::queue& q, void* conv_state, const void* x,
+                          const void* weight, const void* bias,
+                          const std::int32_t* indices, void* out, bool silu,
+                          std::size_t batch, std::size_t dim,
+                          std::size_t state_len, std::size_t kernel,
+                          std::size_t nslots, std::int64_t cs0,
+                          std::int64_t cs1, std::int64_t cs2, DType act_dt,
+                          DType state_dt, Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::causal_conv1d_decode_sycl(
+      q, conv_state, x, weight, bias, indices, out, silu, batch, dim, state_len,
+      kernel, nslots, cs0, cs1, cs2, act_dt, state_dt);
   if (blocking) ev.wait();
 }
 

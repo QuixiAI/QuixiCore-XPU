@@ -361,6 +361,26 @@ void ssd_decode(sycl::queue& q, void* state, const void* x, const float* dt_raw,
                 std::int64_t s3, DType act_dt, DType state_dt,
                 Variant variant = Variant::sycl, bool blocking = true);
 
+// Depthwise causal conv1d decode update (Mamba-2 conv stage), one token per
+// sequence. conv_state is [nslots, dim, state_len] of dtype state_dt with
+// element strides cs0..cs2 (both the dim-major and the len-major serving
+// layouts are just stride choices); x and out are [batch, dim] of dtype act_dt;
+// weight is [dim, kernel], bias [dim] (nullptr = none), both act_dt. Per row b
+// the state at slot indices[b] is read and updated in place (shift left one,
+// append x); a negative or out-of-range slot emits zero output and touches no
+// state. Requires kernel == state_len + 1 and kernel <= 8 (register window);
+// shapes outside that envelope are rejected without launching. fp32 math,
+// optional SiLU. Graph-capture-safe.
+void causal_conv1d_decode(sycl::queue& q, void* conv_state, const void* x,
+                          const void* weight, const void* bias,
+                          const std::int32_t* indices, void* out, bool silu,
+                          std::size_t batch, std::size_t dim,
+                          std::size_t state_len, std::size_t kernel,
+                          std::size_t nslots, std::int64_t cs0,
+                          std::int64_t cs1, std::int64_t cs2, DType act_dt,
+                          DType state_dt, Variant variant = Variant::sycl,
+                          bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // collectives (multi-GPU)
 // ----------------------------------------------------------------------------

@@ -362,6 +362,25 @@ operations:
     benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel ssd_decode --M batch --N slots"}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/ssm/ssd/variants/xpu_sycl}
+  causal_conv1d_decode:
+    family: ssm
+    status: implemented
+    path: kernels/ssm/causal_conv1d
+    dtypes: [f32, f16, bf16]
+    shape: depthwise width-<=8 causal conv decode update
+    note: >-
+      One work-item per (batch, channel); kernel-tap correlation over the
+      rolling conv-state window, optional SiLU, in-place shift-append state
+      update. Independent act/state dtypes; dim-major and len-major serving
+      layouts via element strides cs0..cs2; -1/out-of-range slots emit zeros
+      and touch no state. Requires kernel == state_len+1 and kernel <= 8
+      (register window); out-of-envelope shapes are rejected without
+      launching. Graph-capture-safe. Adapted from the QuixiAI MIT decode
+      kernel set proven in vLLM XPU serving (NemotronH conv stage).
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel causal_conv1d_decode --M batch --dim channels"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/ssm/causal_conv1d/variants/xpu_sycl}
   linear_attn:
     family: linear_attention
     status: implemented

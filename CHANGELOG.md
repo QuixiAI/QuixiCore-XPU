@@ -9,6 +9,9 @@ All notable QuixiCore XPU changes should be recorded here.
 - ssd_decode: Mamba-2 SSD selective-state-update decode (scalar-A-per-head)
   with independent act/state dtypes, strided state views, and copy-on-write
   slot indices. Graph-capture-safe.
+- causal_conv1d_decode: depthwise causal conv decode update (width <= 8)
+  with in-place shift-append state, both serving layouts via strides, and
+  null-slot semantics. Graph-capture-safe.
 
 ### Kernel families — breadth
 

@@ -42,6 +42,7 @@
 #include "attention/rope/rope_kernel.hpp"
 
 #include "norms/qk_norm_rope/qk_norm_rope_kernel.hpp"
+#include "ssm/causal_conv1d/causal_conv1d_kernel.hpp"
 #include "ssm/ssd/ssd_kernel.hpp"
 #include "matmul/dense_gemm/dense_gemm_kernel.hpp"
 #include "norms/norms_kernel.hpp"
@@ -573,6 +574,42 @@ int main(int argc, char** argv) {
     sycl::free(state, q); sycl::free(x, q); sycl::free(B, q); sycl::free(C, q);
     sycl::free(out, q); sycl::free(dt_raw, q); sycl::free(A, q);
     sycl::free(dt_bias, q); sycl::free(D, q); sycl::free(idx, q);
+    return 0;
+  }
+  if (kernel == "causal_conv1d_decode") {
+    // Mamba-2 conv decode step: batch = --M rows, --dim channels, width-4
+    // taps, --N state slots, f32 state, act dtype = --dtype.
+    const std::size_t batch = M;
+    const std::size_t slots = std::max<std::size_t>(N, batch);
+    const std::size_t taps = 4, state_len = taps - 1;
+    const std::int64_t cs0 = static_cast<std::int64_t>(dim) * state_len,
+                       cs1 = state_len, cs2 = 1;
+    float *state = sycl::malloc_device<float>(slots * dim * state_len, q);
+    void *x = sycl::malloc_device(batch * dim * elem, q);
+    void *w = sycl::malloc_device(dim * taps * elem, q);
+    void *bias = sycl::malloc_device(dim * elem, q);
+    void *out = sycl::malloc_device(batch * dim * elem, q);
+    int *idx = sycl::malloc_shared<int>(batch, q);
+    q.memset(state, 0, slots * dim * state_len * sizeof(float)).wait();
+    q.memset(x, 0, batch * dim * elem).wait();
+    q.memset(w, 0, dim * taps * elem).wait();
+    q.memset(bias, 0, dim * elem).wait();
+    for (std::size_t i = 0; i < batch; ++i) idx[i] = static_cast<int>(i % slots);
+    auto once = [&] {
+      kernels::causal_conv1d_decode_sycl(q, state, x, w, bias, idx, out, true,
+                                         batch, dim, state_len, taps, slots,
+                                         cs0, cs1, cs2, dt, DType::f32);
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    std::cout << "{\"schema_version\":2,\"kernel\":\"causal_conv1d_decode\","
+              << "\"variant\":\"sycl\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"batch\":" << batch << ",\"dim\":" << dim
+              << ",\"iters\":" << iters << ",\"median_ms\":" << timing.median_ms
+              << ",\"min_ms\":" << timing.min_ms << ",\"max_ms\":" << timing.max_ms
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}"
+              << std::endl;
+    sycl::free(state, q); sycl::free(x, q); sycl::free(w, q);
+    sycl::free(bias, q); sycl::free(out, q); sycl::free(idx, q);
     return 0;
   }
   if (kernel == "fused_add_rms_norm") {

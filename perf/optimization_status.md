@@ -2305,3 +2305,39 @@ identical kernel shape to the production vLLM path. Obvious untuned levers for a
 later ssm throughput pass: vectorized state row loads (sycl::vec on s3==1 fast
 path), multiple heads per work-group at small batch, and subgroup-cooperative
 dstate tiling. Raw JSON not archived (git-ignored perf/results/).
+
+## 2026-08-09: Port causal_conv1d_decode from the vLLM XPU serving work
+
+Provenance: adapted from the QuixiAI MIT decode kernel set
+(`vllm-xpu-kernels csrc/xpu/sycl/decode/mamba2_conv1d_decode_kernel.hpp`,
+commit dffcab7) — the kernel that replaced the last host-dispatched torch op in
+the NemotronH Mamba decode path. MIT-to-MIT adaptation; deviations: `has_bias`
+became a nullable `bias` pointer, and the shape envelope (kernel == state_len+1,
+kernel <= 8) is now validated at dispatch (reject, don't corrupt).
+
+Kernel + route: `ops::causal_conv1d_decode` ->
+`kernels/ssm/causal_conv1d/variants/xpu_sycl/causal_conv1d_decode.sycl.cpp`.
+One work-item per (batch, channel), width-4 register window, fp32 math,
+optional SiLU, in-place shift-append state at indices[b], -1 null slots.
+Graph-capture-safe.
+
+Correctness: `check_causal_conv1d_decode` in tests/xpu_ops_smoke.cpp. fp64
+oracle for the tap correlation + SiLU; the state shift is a pure StateT
+round-trip copy so the state expectation is EXACT (state_bad counts bit
+mismatches, must be 0). Covers dim-major and len-major layouts via strides,
+act x state dtypes {f32,bf16,f16} x {f32,bf16}, bias/silu on/off, null and
+out-of-range slots, untouched-slot preservation. All worst_out = 0,
+state_bad = 0. Full smoke suite: PASS.
+
+Measurement (Arc Pro B60 device 0, oneAPI icpx, Level Zero; harness
+`--kernel causal_conv1d_decode --dim 5120 --N 128 --iters 100 --warmup 20`,
+bf16 act / f32 state, median of 5 interleaved batches):
+
+| batch | median ms | approx traffic GB/s |
+|---:|---:|---:|
+| 1  | 0.00359 | launch-bound |
+| 96 | 0.04549 | ~303 (state R+W + act) |
+
+At batch 96 the kernel moves ~13.8 MB in 45.5 us — ~66% of the ~456 GB/s
+roofline; adequate for a kernel this small (it is ~1.6% of the ssd_decode step
+cost at the same batch). Decision: **keep** — port baseline, correctness-first.

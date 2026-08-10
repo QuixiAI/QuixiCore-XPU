@@ -677,6 +677,93 @@ bool check_ssd_decode(sycl::queue& q, DType act_dt, DType state_dt) {
   return ok;
 }
 
+// Depthwise causal conv1d decode. fp64 oracle for the tap correlation + SiLU;
+// the state shift is a pure StateT round-trip copy, so the state expectation is
+// exact. Runs both the dim-major ([nslots, dim, state_len]) and len-major
+// ([nslots, state_len, dim]) layouts via strides, null/out-of-range slots, and
+// bias/silu on/off.
+template <typename T, typename StateT>
+bool check_causal_conv1d_decode(sycl::queue& q, DType act_dt, DType state_dt,
+                                bool len_major, bool with_bias, bool silu) {
+  const std::size_t batch = 6, dim = 96, kernel = 4, state_len = kernel - 1,
+                    nslots = 8;
+  const std::int64_t cs0 = static_cast<std::int64_t>(dim) * state_len;
+  const std::int64_t cs1 = len_major ? 1 : static_cast<std::int64_t>(state_len);
+  const std::int64_t cs2 = len_major ? static_cast<std::int64_t>(dim) : 1;
+  const std::size_t state_elems = nslots * dim * state_len;
+
+  StateT* st = sycl::malloc_shared<StateT>(state_elems, q);
+  T* x = sycl::malloc_shared<T>(batch * dim, q);
+  T* w = sycl::malloc_shared<T>(dim * kernel, q);
+  T* bias = sycl::malloc_shared<T>(dim, q);
+  T* out = sycl::malloc_shared<T>(batch * dim, q);
+  std::int32_t* idx = sycl::malloc_shared<std::int32_t>(batch, q);
+
+  for (std::size_t i = 0; i < state_elems; ++i)
+    st[i] = static_cast<StateT>(0.5f * sample(i + 3));
+  for (std::size_t i = 0; i < batch * dim; ++i) x[i] = static_cast<T>(sample(i + 7));
+  for (std::size_t i = 0; i < dim * kernel; ++i) w[i] = static_cast<T>(sample(i + 11));
+  for (std::size_t i = 0; i < dim; ++i) bias[i] = static_cast<T>(0.3f * sample(i + 13));
+  idx[0] = 0; idx[1] = 3; idx[2] = -1; idx[3] = 5;
+  idx[4] = static_cast<std::int32_t>(nslots);  // out of range => null
+  idx[5] = 6;
+
+  std::vector<double> snap(state_elems);
+  for (std::size_t i = 0; i < state_elems; ++i) snap[i] = static_cast<double>(st[i]);
+
+  ops::causal_conv1d_decode(q, st, x, w, with_bias ? bias : nullptr, idx, out,
+                            silu, batch, dim, state_len, kernel, nslots, cs0,
+                            cs1, cs2, act_dt, state_dt, Variant::sycl,
+                            /*blocking=*/true);
+
+  const Tol tol = tol_for(act_dt);
+  std::vector<double> expect(snap);
+  double worst_out = 0.0;
+  int zero_bad = 0;
+  for (std::size_t b = 0; b < batch; ++b) {
+    for (std::size_t c = 0; c < dim; ++c) {
+      const std::size_t oi = b * dim + c;
+      if (idx[b] < 0 || static_cast<std::size_t>(idx[b]) >= nslots) {
+        if (static_cast<double>(out[oi]) != 0.0) ++zero_bad;
+        continue;
+      }
+      const std::int64_t base = idx[b] * cs0 + static_cast<std::int64_t>(c) * cs1;
+      double acc = with_bias ? static_cast<double>(bias[c]) : 0.0;
+      double window[8];
+      for (std::size_t k = 0; k < state_len; ++k)
+        window[k] = snap[static_cast<std::size_t>(base + static_cast<std::int64_t>(k) * cs2)];
+      window[state_len] = static_cast<double>(x[oi]);
+      for (std::size_t k = 0; k < kernel; ++k)
+        acc += window[k] * static_cast<double>(w[c * kernel + k]);
+      if (silu) acc = acc / (1.0 + std::exp(-acc));
+      const double ref = static_cast<double>(static_cast<T>(acc));
+      worst_out = std::max(worst_out,
+                           std::abs(static_cast<double>(out[oi]) - ref) -
+                               (tol.atol + tol.rtol * std::abs(ref)));
+      for (std::size_t k = 0; k < state_len; ++k) {
+        const float shifted = static_cast<float>(window[k + 1]);
+        expect[static_cast<std::size_t>(base + static_cast<std::int64_t>(k) * cs2)] =
+            static_cast<double>(static_cast<StateT>(shifted));
+      }
+    }
+  }
+  int state_bad = 0;
+  for (std::size_t i = 0; i < state_elems; ++i)
+    if (static_cast<double>(st[i]) != expect[i]) ++state_bad;
+
+  sycl::free(st, q); sycl::free(x, q); sycl::free(w, q); sycl::free(bias, q);
+  sycl::free(out, q); sycl::free(idx, q);
+
+  const bool ok = worst_out <= 0.0 && state_bad == 0 && zero_bad == 0;
+  std::cout << "  causal_conv1d_decode act=" << dtype_name(act_dt)
+            << " state=" << dtype_name(state_dt)
+            << (len_major ? " len-major" : " dim-major")
+            << (with_bias ? " bias" : " nobias") << (silu ? " silu" : " id")
+            << " worst_out=" << worst_out << " state_bad=" << state_bad
+            << " zero_bad=" << zero_bad << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 bool check_collectives() {
   const std::size_t count = 4096;
   std::vector<float> in(8 * count), out(count, 0.0f);
@@ -2905,6 +2992,16 @@ int main() {
   failures += check_ssd_decode<bf16_t, float>(q, DType::bf16, DType::f32) ? 0 : 1;
   failures += check_ssd_decode<bf16_t, bf16_t>(q, DType::bf16, DType::bf16) ? 0 : 1;
   failures += check_ssd_decode<half_t, float>(q, DType::f16, DType::f32) ? 0 : 1;
+
+  // ssm: depthwise causal conv1d decode (both serving layouts via strides).
+  failures += check_causal_conv1d_decode<float, float>(q, DType::f32, DType::f32,
+                                                       false, true, true) ? 0 : 1;
+  failures += check_causal_conv1d_decode<bf16_t, float>(q, DType::bf16, DType::f32,
+                                                        true, true, true) ? 0 : 1;
+  failures += check_causal_conv1d_decode<bf16_t, bf16_t>(q, DType::bf16, DType::bf16,
+                                                         false, false, false) ? 0 : 1;
+  failures += check_causal_conv1d_decode<half_t, float>(q, DType::f16, DType::f32,
+                                                        true, false, true) ? 0 : 1;
 
   // collectives: multi-GPU sum all-reduce across the visible B60s.
   failures += check_collectives() ? 0 : 1;
