@@ -2585,3 +2585,27 @@ The one-row-per-work-item geometry serializes the FWHT and packing per lane;
 a subgroup-cooperative variant is the obvious throughput lever if KV codec
 time ever matters. Decision: **keep** — correctness-first implementation of
 the declared codec ABI; quant-formats.yaml turboquant is now `implemented`.
+
+## 2026-08-09: Add group_rms_norm_gated (Mamba-2 mixer norm)
+
+The gated group-RMSNorm that runs EAGER TORCH on XPU in vLLM today
+(Mixer2RMSNormGated.forward_native — the Triton rms_norm_gated is never
+reached on this platform). Semantics translated, independently expressed:
+y = x * silu(gate) in fp32, per-group variance over hidden/n_groups slices,
+round-to-dtype THEN weight multiply (the torch order), rms_norm=false
+passthrough. Single-device semantics; the TP n_groups==1 cross-rank variance
+reduction stays integration-owned.
+
+Kernel: one work-group per (row, group), reduce_over_group fp32; gated values
+recomputed on the output pass (SLM staging is the recorded perf lever).
+Correctness: fp64 oracle with a 3x-rtol double-rounding pad (the fp32
+variance can land the pre-weight intermediate on the adjacent bf16 — 1 ULP ~
+2 rtol — which the weight multiply propagates); n_groups {1, 4, 8} x
+{f32, f16, bf16} + the no-norm path, all worst_excess = 0. Full suite PASS.
+
+Measurement (B60 device 0; `--kernel group_rms_norm_gated --rows 4096
+--dim 4096 --N 8 --iters 30`, bf16): 0.453 ms, ~222 GB/s of the 3-tensor
+traffic (vs 394 GB/s for the vectorized plain rms_norm at the same shape —
+the gap is the double gated-value recompute + scalar loads). Decision:
+**keep** — closes the last eager-torch op in the XPU Mamba decode path;
+vectorized loads + SLM staging deferred to a norms tuning pass.

@@ -718,6 +718,22 @@ void fused_add_rms_norm(sycl::queue &q, const void *x, void *residual, const voi
 // `next_out` is always f16 and must not alias `residual`. Collapses the
 // post-norm, residual add, next pre-norm, and f16 convert into one launch.
 // Shape: residual-add + double RMSNorm -> f16.
+// Gated group-RMSNorm (the Mamba-2 mixer output norm). x, gate, out are
+// [rows, hidden] of dtype dt; weight is [hidden]. y = x * silu(gate) in fp32;
+// with rms_norm true, each of n_groups contiguous slices of the hidden dim is
+// RMS-normalized independently (variance over hidden/n_groups elements), the
+// result is rounded to dt and multiplied by weight (the torch rounding
+// order); rms_norm false returns y directly and ignores weight (may be
+// nullptr). Single-device semantics: the tensor-parallel n_groups==1
+// cross-rank variance reduction is integration-owned. hidden must be
+// divisible by n_groups.
+void group_rms_norm_gated(sycl::queue& q, const void* x, const void* gate,
+                          const void* weight, void* out, std::size_t rows,
+                          std::size_t hidden, std::size_t n_groups, float eps,
+                          bool rms_norm, DType dt,
+                          Variant variant = Variant::sycl,
+                          bool blocking = true);
+
 void rms_residual_next(sycl::queue &q, const void *projection, const void *post_weight,
                        void *residual, const void *next_weight, void *next_out,
                        std::size_t rows, std::size_t dim, float eps, DType dt,

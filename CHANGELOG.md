@@ -25,6 +25,9 @@ All notable QuixiCore XPU changes should be recorded here.
   two-shot) with bitwise-identical fixed-rank-order results, replay-safe
   generation-counter rendezvous, and no peer-atomic requirement;
   all_reduce_sum now orchestrates it in-process across all visible GPUs.
+- group_rms_norm_gated: gated group-RMSNorm (Mamba-2 mixer norm, fp32
+  gating, per-group variance, torch rounding order) — replaces the last
+  eager-torch op in the XPU Mamba decode path.
 - turboquant: KV-cache codec encode/decode implementing the format v2 ABI
   (rotated Lloyd-Max keys or e4m3 byte keys, per-group uniform values,
   LSB-first packing), byte-identical to the host-shared codec oracle.

@@ -1101,6 +1101,73 @@ bool check_causal_conv1d_prefill(sycl::queue& q, DType act_dt, DType state_dt,
   return ok;
 }
 
+// Gated group-RMSNorm. fp64 oracle of x*silu(gate) -> per-group RMS norm ->
+// round-to-dtype -> weight multiply (the torch rounding order), plus the
+// rms_norm=false passthrough. Covers n_groups 1 (full-row variance) and >1.
+template <typename T>
+bool check_group_rms_norm_gated(sycl::queue& q, DType dt, std::size_t rows,
+                                std::size_t hidden, std::size_t n_groups,
+                                bool rms_norm) {
+  const std::size_t n = rows * hidden;
+  T* x = sycl::malloc_shared<T>(n, q);
+  T* gate = sycl::malloc_shared<T>(n, q);
+  T* w = sycl::malloc_shared<T>(hidden, q);
+  T* out = sycl::malloc_shared<T>(n, q);
+  for (std::size_t i = 0; i < n; ++i) {
+    x[i] = static_cast<T>(sample(i + 3));
+    gate[i] = static_cast<T>(sample(i + 7));
+  }
+  for (std::size_t i = 0; i < hidden; ++i)
+    w[i] = static_cast<T>(0.8f + 0.1f * sample(i + 11));
+  const float eps = 1e-6f;
+
+  ops::group_rms_norm_gated(q, x, gate, w, out, rows, hidden, n_groups, eps,
+                            rms_norm, dt, Variant::sycl, /*blocking=*/true);
+
+  const Tol tol = tol_for(dt);
+  const std::size_t group_size = hidden / n_groups;
+  double worst = 0.0;
+  for (std::size_t r = 0; r < rows; ++r) {
+    for (std::size_t g = 0; g < n_groups; ++g) {
+      const std::size_t base = r * hidden + g * group_size;
+      double ss = 0.0;
+      std::vector<double> y(group_size);
+      for (std::size_t i = 0; i < group_size; ++i) {
+        const double xv = static_cast<double>(x[base + i]);
+        const double gv = static_cast<double>(gate[base + i]);
+        y[i] = xv * (gv / (1.0 + std::exp(-gv)));
+        ss += y[i] * y[i];
+      }
+      const double inv =
+          1.0 / std::sqrt(ss / static_cast<double>(group_size) + eps);
+      for (std::size_t i = 0; i < group_size; ++i) {
+        double ref;
+        if (!rms_norm) {
+          ref = static_cast<double>(static_cast<T>(y[i]));
+        } else {
+          const double rounded =
+              static_cast<double>(static_cast<T>(y[i] * inv));
+          ref = static_cast<double>(static_cast<T>(
+              static_cast<double>(w[g * group_size + i]) * rounded));
+        }
+        const double err = std::abs(static_cast<double>(out[base + i]) - ref);
+        // 3x rtol absorbs the double-rounding hazard: the kernel's fp32
+        // variance vs the fp64 oracle can land the pre-weight intermediate on
+        // the adjacent representable (1 ULP ~ 2 rtol at bf16), which the
+        // weight multiply then propagates.
+        worst = std::max(worst, err - (tol.atol + 3.0 * tol.rtol * std::abs(ref)));
+      }
+    }
+  }
+  sycl::free(x, q); sycl::free(gate, q); sycl::free(w, q); sycl::free(out, q);
+  const bool ok = worst <= 0.0;
+  std::cout << "  group_rms_norm_gated dt=" << dtype_name(dt)
+            << " hidden=" << hidden << " groups=" << n_groups
+            << (rms_norm ? "" : " no-norm") << " worst_excess=" << worst
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // TurboQuant codec. The per-row codec is shared verbatim between kernel and
 // oracle (turboquant_codec.hpp), so the contract here is BYTE IDENTITY: the
 // host runs the same functions and every cache byte, scale, zero, and decoded
@@ -3619,6 +3686,12 @@ int main() {
                                                          false, false, false) ? 0 : 1;
   failures += check_causal_conv1d_decode<half_t, float>(q, DType::f16, DType::f32,
                                                         true, false, true) ? 0 : 1;
+
+  // norms: gated group-RMSNorm (Mamba-2 mixer norm).
+  failures += check_group_rms_norm_gated<float>(q, DType::f32, 32, 2048, 1, true) ? 0 : 1;
+  failures += check_group_rms_norm_gated<bf16_t>(q, DType::bf16, 32, 4096, 8, true) ? 0 : 1;
+  failures += check_group_rms_norm_gated<half_t>(q, DType::f16, 16, 1024, 4, true) ? 0 : 1;
+  failures += check_group_rms_norm_gated<bf16_t>(q, DType::bf16, 16, 2048, 1, false) ? 0 : 1;
 
   // quantization: TurboQuant KV-cache codec (byte-identical shared-codec
   // oracle; bit-width x head-size x signedness x fp8-key sweep).

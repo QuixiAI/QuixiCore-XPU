@@ -645,6 +645,33 @@ int main(int argc, char** argv) {
     sycl::free(dt_bias, q); sycl::free(D, q); sycl::free(idx, q);
     return 0;
   }
+  if (kernel == "group_rms_norm_gated") {
+    // --rows x --dim hidden, --N groups.
+    const std::size_t groups = std::max<std::size_t>(1, N <= dim ? N : 1);
+    void *x = sycl::malloc_device(rows * dim * elem, q);
+    void *gate = sycl::malloc_device(rows * dim * elem, q);
+    void *w = sycl::malloc_device(dim * elem, q);
+    void *out = sycl::malloc_device(rows * dim * elem, q);
+    q.memset(x, 0, rows * dim * elem).wait();
+    q.memset(gate, 0, rows * dim * elem).wait();
+    q.memset(w, 0, dim * elem).wait();
+    auto once = [&] {
+      kernels::group_rms_norm_gated_sycl(q, x, gate, w, out, rows, dim, groups,
+                                         1e-6f, true, dt);
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    const double gbps = 3.0 * static_cast<double>(rows * dim * elem) /
+                        (timing.median_ms * 1e-3) / 1e9;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"group_rms_norm_gated\","
+              << "\"variant\":\"sycl\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"rows\":" << rows << ",\"dim\":" << dim
+              << ",\"groups\":" << groups << ",\"iters\":" << iters
+              << ",\"median_ms\":" << timing.median_ms << ",\"gbps\":" << gbps
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}"
+              << std::endl;
+    sycl::free(x, q); sycl::free(gate, q); sycl::free(w, q); sycl::free(out, q);
+    return 0;
+  }
   if (kernel == "turboquant") {
     // KV codec: --M tokens, 8 kv heads, --dim head_size, key/value bits from
     // --K (packed as kb*10+vb, default 44 => kb=4 vb=4). Encode + decode

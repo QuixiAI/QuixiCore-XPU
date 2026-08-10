@@ -56,4 +56,11 @@ sycl::event layernorm_onednn(sycl::queue& q, const void* x, const void* weight,
                              std::size_t dim, float eps, DType dt);
 #endif
 
+// Gated group-RMSNorm (Mamba-2 mixer norm); see ops::group_rms_norm_gated.
+sycl::event group_rms_norm_gated_sycl(sycl::queue& q, const void* x,
+                                      const void* gate, const void* weight,
+                                      void* out, std::size_t rows,
+                                      std::size_t hidden, std::size_t n_groups,
+                                      float eps, bool rms_norm, DType dt);
+
 }  // namespace quixicore::xpu::kernels

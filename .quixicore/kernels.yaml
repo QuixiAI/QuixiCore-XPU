@@ -176,6 +176,23 @@ operations:
     variants:
       - {name: xpu_sycl, status: experimental, path: kernels/norms/rms_norm/variants/xpu_sycl}
 
+  group_rms_norm_gated:
+    family: norms
+    status: implemented
+    path: kernels/norms/rms_norm
+    dtypes: [f32, f16, bf16]
+    shape: x * silu(gate) + per-group RMSNorm + weight
+    note: >-
+      The Mamba-2 mixer output norm (vLLM Mixer2RMSNormGated semantics,
+      single-device): fp32 gating, variance per hidden/n_groups slice,
+      round-to-dtype before the weight multiply, rms_norm=false passthrough.
+      The tensor-parallel n_groups==1 cross-rank reduction is
+      integration-owned. Closes the last eager-torch op in the XPU Mamba
+      decode path.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel group_rms_norm_gated --rows R --dim H --N groups"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/norms/rms_norm/variants/xpu_sycl}
   rms_residual_next:
     family: norms
     status: implemented

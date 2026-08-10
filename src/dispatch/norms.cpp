@@ -66,6 +66,17 @@ void layernorm(sycl::queue& q, const void* x, const void* weight,
   if (blocking) ev.wait();
 }
 
+void group_rms_norm_gated(sycl::queue& q, const void* x, const void* gate,
+                          const void* weight, void* out, std::size_t rows,
+                          std::size_t hidden, std::size_t n_groups, float eps,
+                          bool rms_norm, DType dt, Variant variant,
+                          bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::group_rms_norm_gated_sycl(
+      q, x, gate, weight, out, rows, hidden, n_groups, eps, rms_norm, dt);
+  if (blocking) ev.wait();
+}
+
 void qk_norm_rope(sycl::queue& q, void* Q, void* K, const void* q_weight,
                   const void* k_weight, void* Q_f16, void* K_f16,
                   std::size_t tokens, std::size_t n_head, std::size_t n_head_kv,
