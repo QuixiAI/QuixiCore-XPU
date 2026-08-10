@@ -1101,6 +1101,128 @@ bool check_causal_conv1d_prefill(sycl::queue& q, DType act_dt, DType state_dt,
   return ok;
 }
 
+// Fused RMSNorm + quantization. Oracle: fp64 residual-add (rounded read-back
+// exact-checked) + norm, then compare the DECODED quantized output against
+// the fp64 normed value within norm tolerance + the format's quantization
+// step (e4m3 rel ~2^-4 after clamp; e2m1 half-gap up to 1.0 * scale).
+// Scales are sanity-checked (dynamic: ~absmax/448 and >= min; mxfp4: power
+// of two covering the group absmax).
+template <typename T>
+bool check_norm_quant(sycl::queue& q, DType dt, ops::NormQuantMode mode,
+                      bool with_residual, std::size_t rows,
+                      std::size_t hidden) {
+  namespace codec = quixicore::xpu::turboquant_codec;
+  const std::size_t n = rows * hidden;
+  const bool mx = mode == ops::NormQuantMode::mxfp4;
+  const std::size_t qbytes = mx ? n / 2 : n;
+  const std::size_t nscales =
+      mode == ops::NormQuantMode::dynamic_fp8 ? rows : (mx ? n / 32 : 1);
+
+  T* x = sycl::malloc_shared<T>(n, q);
+  T* res = sycl::malloc_shared<T>(n, q);
+  T* w = sycl::malloc_shared<T>(hidden, q);
+  std::uint8_t* out_q = sycl::malloc_shared<std::uint8_t>(qbytes, q);
+  float* sscale = sycl::malloc_shared<float>(1, q);
+  float* oscales = sycl::malloc_shared<float>(nscales, q);
+  for (std::size_t i = 0; i < n; ++i) {
+    x[i] = static_cast<T>(sample(i + 3));
+    res[i] = static_cast<T>(0.5f * sample(i + 5));
+  }
+  for (std::size_t i = 0; i < hidden; ++i)
+    w[i] = static_cast<T>(0.8f + 0.1f * sample(i + 7));
+  sscale[0] = 0.005f;
+  const float eps = 1e-6f;
+  std::vector<double> res_snapshot(n);
+  for (std::size_t i = 0; i < n; ++i)
+    res_snapshot[i] = static_cast<double>(res[i]);
+
+  ops::norm_quant(q, x, with_residual ? res : nullptr, w, out_q, sscale,
+                  oscales, rows, hidden, eps, mode, dt, Variant::sycl, true);
+
+  const Tol tol = tol_for(dt);
+  double worst = 0.0;
+  int res_bad = 0, scale_bad = 0;
+  for (std::size_t r = 0; r < rows; ++r) {
+    std::vector<double> v(hidden);
+    double ss = 0.0;
+    for (std::size_t i = 0; i < hidden; ++i) {
+      double xv = static_cast<double>(x[r * hidden + i]);
+      if (with_residual) {
+        const double sum = xv + res_snapshot[r * hidden + i];
+        const double rounded = static_cast<double>(static_cast<T>(sum));
+        if (static_cast<double>(res[r * hidden + i]) != rounded) ++res_bad;
+        xv = rounded;
+      }
+      v[i] = xv;
+      ss += xv * xv;
+    }
+    const double inv = 1.0 / std::sqrt(ss / hidden + eps);
+    std::vector<double> norm(hidden);
+    double amax = 0.0;
+    for (std::size_t i = 0; i < hidden; ++i) {
+      norm[i] = v[i] * inv * static_cast<double>(w[i]);
+      amax = std::max(amax, std::abs(norm[i]));
+    }
+    if (mode == ops::NormQuantMode::static_fp8 ||
+        mode == ops::NormQuantMode::dynamic_fp8) {
+      double scale;
+      if (mode == ops::NormQuantMode::static_fp8) {
+        scale = sscale[0];
+      } else {
+        scale = oscales[r];
+        const double ref_scale = std::max(amax / 448.0, 1.0 / (448.0 * 512.0));
+        if (std::abs(scale - ref_scale) >
+            1e-3 * ref_scale + tol.rtol * ref_scale * 8)
+          ++scale_bad;
+      }
+      for (std::size_t i = 0; i < hidden; ++i) {
+        const double dec =
+            static_cast<double>(codec::e4m3_decode(out_q[r * hidden + i])) *
+            scale;
+        const double clamped =
+            std::min(std::max(norm[i] / scale, -448.0), 448.0) * scale;
+        const double step = 0.0625 * std::abs(clamped) + scale * 0.002;
+        const double err = std::abs(dec - clamped);
+        worst = std::max(worst,
+                         err - (step + tol.atol + 4 * tol.rtol * amax));
+      }
+    } else {
+      for (std::size_t g = 0; g < hidden / 32; ++g) {
+        const double ys = oscales[r * (hidden / 32) + g];
+        double gmax = 0.0;
+        for (std::size_t j = 0; j < 32; ++j)
+          gmax = std::max(gmax, std::abs(norm[g * 32 + j]));
+        const double l2 = std::log2(ys);
+        if (l2 != std::floor(l2) || ys * 6.0 < gmax * 0.999) ++scale_bad;
+        for (std::size_t j = 0; j < 32; ++j) {
+          const std::size_t i = g * 32 + j;
+          const std::uint8_t byte = out_q[(r * hidden + i) / 2];
+          const std::uint8_t nib = (i & 1) ? (byte >> 4) : (byte & 0x0f);
+          constexpr double kE2m1[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
+          const double mag = kE2m1[nib & 0x7];
+          const double dec = ((nib & 0x8) ? -mag : mag) * ys;
+          const double err = std::abs(dec - norm[i]);
+          worst = std::max(
+              worst, err - (1.0 * ys + tol.atol + 4 * tol.rtol * gmax));
+        }
+      }
+    }
+  }
+
+  sycl::free(x, q); sycl::free(res, q); sycl::free(w, q);
+  sycl::free(out_q, q); sycl::free(sscale, q); sycl::free(oscales, q);
+  const bool ok = worst <= 0.0 && res_bad == 0 && scale_bad == 0;
+  const char* mname = mode == ops::NormQuantMode::static_fp8 ? "static_fp8"
+                      : mode == ops::NormQuantMode::dynamic_fp8
+                          ? "dynamic_fp8"
+                          : "mxfp4";
+  std::cout << "  norm_quant dt=" << dtype_name(dt) << " mode=" << mname
+            << (with_residual ? " +residual" : "") << " worst_excess=" << worst
+            << " res_bad=" << res_bad << " scale_bad=" << scale_bad
+            << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 // Gated group-RMSNorm. fp64 oracle of x*silu(gate) -> per-group RMS norm ->
 // round-to-dtype -> weight multiply (the torch rounding order), plus the
 // rms_norm=false passthrough. Covers n_groups 1 (full-row variance) and >1.
@@ -3686,6 +3808,21 @@ int main() {
                                                          false, false, false) ? 0 : 1;
   failures += check_causal_conv1d_decode<half_t, float>(q, DType::f16, DType::f32,
                                                         true, false, true) ? 0 : 1;
+
+  // norms: fused RMSNorm + quantization (fp8 static/dynamic, mxfp4;
+  // +residual = residual_rms_norm_quant contract).
+  failures += check_norm_quant<bf16_t>(q, DType::bf16, ops::NormQuantMode::static_fp8,
+                                       false, 32, 1024) ? 0 : 1;
+  failures += check_norm_quant<bf16_t>(q, DType::bf16, ops::NormQuantMode::static_fp8,
+                                       true, 32, 1024) ? 0 : 1;
+  failures += check_norm_quant<float>(q, DType::f32, ops::NormQuantMode::dynamic_fp8,
+                                      false, 32, 2048) ? 0 : 1;
+  failures += check_norm_quant<bf16_t>(q, DType::bf16, ops::NormQuantMode::dynamic_fp8,
+                                       true, 16, 4096) ? 0 : 1;
+  failures += check_norm_quant<bf16_t>(q, DType::bf16, ops::NormQuantMode::mxfp4,
+                                       false, 16, 2048) ? 0 : 1;
+  failures += check_norm_quant<half_t>(q, DType::f16, ops::NormQuantMode::mxfp4,
+                                       true, 16, 1024) ? 0 : 1;
 
   // norms: gated group-RMSNorm (Mamba-2 mixer norm).
   failures += check_group_rms_norm_gated<float>(q, DType::f32, 32, 2048, 1, true) ? 0 : 1;

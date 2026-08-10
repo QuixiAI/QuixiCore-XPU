@@ -718,6 +718,30 @@ void fused_add_rms_norm(sycl::queue &q, const void *x, void *residual, const voi
 // `next_out` is always f16 and must not alias `residual`. Collapses the
 // post-norm, residual add, next pre-norm, and f16 convert into one launch.
 // Shape: residual-add + double RMSNorm -> f16.
+// Fused RMSNorm + activation quantization modes.
+enum class NormQuantMode {
+  static_fp8,   // e4m3 with a caller-provided device-scalar scale
+  dynamic_fp8,  // e4m3 with a per-row scale = max(absmax/448, 1/(448*512)),
+                // written to out_scales[row]
+  mxfp4,        // per-32-group fp32 power-of-two scale
+                // exp2(ceil(log2(max(absmax/6, 1e-10)))) in out_scales
+                // [rows, hidden/32], packed e2m1 nibbles (element 2i low)
+};
+
+// Fused RMSNorm + quantize. x is [rows, hidden] of dtype dt, weight [hidden];
+// out_q is u8 [rows, hidden] (fp8 modes) or [rows, hidden/2] (mxfp4). With
+// residual non-null the call adds it IN PLACE first (variance uses the
+// dtype-rounded read-back) — that form satisfies the residual_rms_norm_quant
+// contract. static_scale is a device scalar (static_fp8 only); out_scales is
+// the scale output (dynamic/mxfp4 only). The e4m3/e2m1 encode steps are
+// integer-exact; hidden must be divisible by 32 for mxfp4 (rejected
+// otherwise).
+void norm_quant(sycl::queue& q, const void* x, void* residual,
+                const void* weight, std::uint8_t* out_q,
+                const float* static_scale, float* out_scales, std::size_t rows,
+                std::size_t hidden, float eps, NormQuantMode mode, DType dt,
+                Variant variant = Variant::sycl, bool blocking = true);
+
 // Gated group-RMSNorm (the Mamba-2 mixer output norm). x, gate, out are
 // [rows, hidden] of dtype dt; weight is [hidden]. y = x * silu(gate) in fp32;
 // with rms_norm true, each of n_groups contiguous slices of the hidden dim is

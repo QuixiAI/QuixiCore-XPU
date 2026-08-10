@@ -4,6 +4,7 @@
 #include "quixicore/xpu/ops.hpp"
 
 #include "norms/norms_kernel.hpp"
+#include "norms/norm_quant/norm_quant_kernel.hpp"
 #include "norms/qk_norm_rope/qk_norm_rope_kernel.hpp"
 
 namespace quixicore::xpu::ops {
@@ -63,6 +64,19 @@ void layernorm(sycl::queue& q, const void* x, const void* weight,
       ev = kernels::layernorm_sycl(q, x, weight, bias, out, rows, dim, eps, dt);
       break;
   }
+  if (blocking) ev.wait();
+}
+
+void norm_quant(sycl::queue& q, const void* x, void* residual,
+                const void* weight, std::uint8_t* out_q,
+                const float* static_scale, float* out_scales, std::size_t rows,
+                std::size_t hidden, float eps, NormQuantMode mode, DType dt,
+                Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::norm_quant_sycl(q, x, residual, weight, out_q,
+                                            static_scale, out_scales, rows,
+                                            hidden, eps,
+                                            static_cast<int>(mode), dt);
   if (blocking) ev.wait();
 }
 

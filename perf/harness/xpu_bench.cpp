@@ -42,6 +42,7 @@
 #include "attention/rope/rope_kernel.hpp"
 
 #include "norms/qk_norm_rope/qk_norm_rope_kernel.hpp"
+#include "norms/norm_quant/norm_quant_kernel.hpp"
 #include "quantization/turboquant/turboquant_kernel.hpp"
 #include "quantization/turboquant/turboquant_tables.hpp"
 #include "ssm/causal_conv1d/causal_conv1d_kernel.hpp"
@@ -643,6 +644,37 @@ int main(int argc, char** argv) {
     sycl::free(state, q); sycl::free(x, q); sycl::free(B, q); sycl::free(C, q);
     sycl::free(out, q); sycl::free(dt_raw, q); sycl::free(A, q);
     sycl::free(dt_bias, q); sycl::free(D, q); sycl::free(idx, q);
+    return 0;
+  }
+  if (kernel == "norm_quant") {
+    // --rows x --dim, --approx {static,dynamic,mxfp4}, optional residual via
+    // --window 1.
+    const int mode = approx_s == "dynamic" ? 1 : (approx_s == "mxfp4" ? 2 : 0);
+    const bool with_res = window == 1;
+    void *x = sycl::malloc_device(rows * dim * elem, q);
+    void *res = sycl::malloc_device(rows * dim * elem, q);
+    void *w = sycl::malloc_device(dim * elem, q);
+    auto *outq = sycl::malloc_device<std::uint8_t>(rows * dim, q);
+    float *ss = sycl::malloc_shared<float>(1, q);
+    float *os = sycl::malloc_device<float>(rows * (dim / 32 + 1), q);
+    q.memset(x, 0, rows * dim * elem).wait();
+    q.memset(res, 0, rows * dim * elem).wait();
+    q.memset(w, 0, dim * elem).wait();
+    ss[0] = 0.01f;
+    auto once = [&] {
+      kernels::norm_quant_sycl(q, x, with_res ? res : nullptr, w, outq, ss, os,
+                               rows, dim, 1e-6f, mode, dt);
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    std::cout << "{\"schema_version\":2,\"kernel\":\"norm_quant\",\"variant\":\"sycl\","
+              << "\"dtype\":\"" << dtype_name(dt) << "\",\"mode\":\"" << approx_s
+              << "\",\"residual\":" << (with_res ? 1 : 0) << ",\"rows\":" << rows
+              << ",\"dim\":" << dim << ",\"iters\":" << iters
+              << ",\"median_ms\":" << timing.median_ms << ",\"device\":\""
+              << q.get_device().get_info<sycl::info::device::name>() << "\"}"
+              << std::endl;
+    sycl::free(x, q); sycl::free(res, q); sycl::free(w, q); sycl::free(outq, q);
+    sycl::free(ss, q); sycl::free(os, q);
     return 0;
   }
   if (kernel == "group_rms_norm_gated") {

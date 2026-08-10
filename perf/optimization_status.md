@@ -2626,3 +2626,30 @@ and intermediate chunk states need caller scratch
 [nchunks, nheads, headdim, dstate] f32 (no-allocation rule). Gate: keep only
 on a >=3% median win over xpu_sycl_seq at NemotronH prefill shapes with a
 cross-variant equality test (rel ~1e-4 f32; different summation order).
+
+## 2026-08-09: Add norm_quant (fused RMSNorm + fp8/mxfp4 activation quant)
+
+Chains translated from vllm-xpu-kernels csrc/layernorm_quant.cpp and
+csrc/quantization/fp4/mxfp4_quant.h (Apache; read, not imported). One
+work-group per token row; the in-place residual form uses the dtype-rounded
+read-back so the variance matches what later passes read (the source's
+invariant), satisfying both norm_quant and residual_rms_norm_quant contract
+names. static_fp8 / dynamic_fp8 (per-row absmax scale with the 1/(448*512)
+floor) / mxfp4 (per-32-group exp2(ceil(log2(absmax/6))) fp32 scale, e2m1
+midpoint codes packed via subgroup shuffle). The pure encode steps reuse the
+integer-exact shared codec (turboquant_codec e4m3; e2m1 midpoints), so
+determinism rests on the same foundations as the turboquant entry.
+
+Correctness: `check_norm_quant` — decoded-output oracle (fp64 norm reference
+within norm tolerance + format quantization step), exact residual read-back
+check, scale sanity (dynamic ~absmax/448; mxfp4 power-of-two covering the
+group absmax). Six configs across modes x residual x {f32,f16,bf16}, all
+worst_excess = 0. Full suite PASS.
+
+Measurement (B60 device 0; `--rows 4096 --dim 4096 --iters 30`, bf16):
+static 0.431 ms, dynamic 0.450 ms, mxfp4 0.451 ms — all within ~6% of the
+plain rms_norm+quant traffic bound at this shape (rms_norm alone is 0.170 ms
+vectorized; the gap is scalar loads + the extra absmax pass). Decision:
+**keep** — correctness-first; vectorization shared with the norms tuning
+pass. Per-block fp8 (DeepSeek 128-group) deliberately deferred: planned in
+the manifest, needs its own layout decision.

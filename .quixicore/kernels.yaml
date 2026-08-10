@@ -176,6 +176,25 @@ operations:
     variants:
       - {name: xpu_sycl, status: experimental, path: kernels/norms/rms_norm/variants/xpu_sycl}
 
+  norm_quant:
+    family: norms
+    status: implemented
+    path: kernels/norms/norm_quant
+    dtypes: [f32, f16, bf16]
+    shape: fused RMSNorm + fp8/mxfp4 activation quantization
+    note: >-
+      Modes static_fp8 (caller device-scalar scale), dynamic_fp8 (per-row
+      scale = max(absmax/448, 1/(448*512))), and mxfp4 (per-32-group fp32
+      power-of-two scale + packed e2m1 nibbles, element 2i low). A non-null
+      residual is added IN PLACE first with the dtype-rounded read-back
+      feeding the variance — that form satisfies the residual_rms_norm_quant
+      contract. e4m3/e2m1 encode steps are integer-exact (shared codec);
+      chains match vllm-xpu-kernels layernorm_quant + mxfp4_quant
+      (translated). Per-block fp8 quant (DeepSeek-style) remains planned.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel norm_quant --rows R --dim H --approx {static,dynamic,mxfp4}"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/norms/norm_quant/variants/xpu_sycl}
   group_rms_norm_gated:
     family: norms
     status: implemented
