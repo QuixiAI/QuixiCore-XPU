@@ -2518,3 +2518,15 @@ Decision: **keep** — this is the collective the TP2 decode-graph win
 (VLLM_XPU_CUSTOM_ALLREDUCE, +32% single-stream ITL) was built on, now
 library-owned. The multi-process IPC layer (fd export/open) lands as the
 follow-up commit; oneCCL vendor variant remains deferred.
+
+### Addendum: Level Zero IPC layer + multi-process reference
+
+`include/quixicore/xpu/ipc.hpp` + `src/runtime/ipc.cpp`: dma_buf fd export /
+open / close for device-USM regions plus peer-capability helpers, compiled to
+unavailable-stubs when the ze_loader library is absent (scaffold build stays
+green; CMake `find_library(ze_loader)`). The SCM_RIGHTS fd exchange stays out
+of the library (integration-owned, per the qwen-serving-port boundary);
+`examples/p2p_all_reduce_mp.cpp` is the reference implementation: fork +
+socketpair, two processes on two B60s, fd exchange, `ops::all_reduce`, both
+ranks verify the fixed-order reference bitwise. Verified on this box:
+`quixicore_xpu_p2p_all_reduce_mp` -> both ranks bitwise OK, PASS.

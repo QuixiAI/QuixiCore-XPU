@@ -96,6 +96,10 @@ if(QUIXICORE_XPU_ENABLE_SYCL)
     list(APPEND QUIXICORE_XPU_SYCL_SOURCES ${QUIXICORE_XPU_ONEDNN_SOURCES})
   endif()
 
+  # Level Zero IPC (cross-process region export/open). Optional: without the
+  # loader library the ipc entry points compile to stubs reporting unavailable.
+  find_library(QUIXICORE_XPU_ZE_LOADER ze_loader)
+
   add_library(quixicore_xpu_ops ${QUIXICORE_XPU_SYCL_SOURCES})
   add_library(QuixiCore::XPUOps ALIAS quixicore_xpu_ops)
   set_target_properties(quixicore_xpu_ops PROPERTIES EXPORT_NAME XPUOps)
@@ -116,6 +120,13 @@ if(QUIXICORE_XPU_ENABLE_SYCL)
     target_compile_definitions(quixicore_xpu_ops PUBLIC QUIXICORE_XPU_HAS_ONEDNN)
     target_link_libraries(quixicore_xpu_ops PUBLIC DNNL::dnnl)
   endif()
+  if(QUIXICORE_XPU_ZE_LOADER)
+    target_compile_definitions(quixicore_xpu_ops PRIVATE QUIXICORE_XPU_HAS_LEVEL_ZERO)
+    target_link_libraries(quixicore_xpu_ops PUBLIC ${QUIXICORE_XPU_ZE_LOADER})
+    message(STATUS "QuixiCore XPU: Level Zero loader found; IPC enabled.")
+  else()
+    message(STATUS "QuixiCore XPU: Level Zero loader not found; IPC stubs.")
+  endif()
 
   add_executable(quixicore_xpu_sycl_device_probe examples/sycl_device_probe.cpp)
   target_link_libraries(quixicore_xpu_sycl_device_probe PRIVATE QuixiCore::XPU)
@@ -133,6 +144,15 @@ if(QUIXICORE_XPU_ENABLE_SYCL)
     add_executable(quixicore_xpu_graph_smoke tests/xpu_graph_smoke.cpp)
     target_link_libraries(quixicore_xpu_graph_smoke PRIVATE QuixiCore::XPUOps)
     add_test(NAME quixicore_xpu_graph_smoke COMMAND quixicore_xpu_graph_smoke)
+  endif()
+
+  if(QUIXICORE_XPU_BUILD_EXAMPLES AND UNIX)
+    # Multi-process all-reduce reference: fork + socketpair SCM_RIGHTS fd
+    # exchange over the ipc.hpp primitives (the exchange itself is
+    # integration-owned; this is the documented example of it).
+    add_executable(quixicore_xpu_p2p_all_reduce_mp examples/p2p_all_reduce_mp.cpp)
+    target_link_libraries(quixicore_xpu_p2p_all_reduce_mp PRIVATE QuixiCore::XPUOps)
+    target_include_directories(quixicore_xpu_p2p_all_reduce_mp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/kernels)
   endif()
 
   # On-device benchmark harness (not a CTest test; driven by perf/bench_kernels.py).
