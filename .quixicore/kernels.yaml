@@ -383,6 +383,24 @@ operations:
     benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel ssd_prefill --M tokens --rows seqs"}
     variants:
       - {name: xpu_sycl_seq, status: implemented, path: kernels/ssm/ssd/variants/xpu_sycl}
+  causal_conv1d_prefill:
+    family: ssm
+    status: implemented
+    path: kernels/ssm/causal_conv1d
+    dtypes: [f32, f16, bf16]
+    shape: varlen depthwise causal conv prefill (dim-major layout)
+    note: >-
+      Two chained kernels (output pass, then state write-back gathering the
+      last state_len samples of [initial_state | seq_x]); the event dependency
+      guarantees old-window reads precede writes. cu_seqlens varlen with empty
+      sequences leaving slots untouched, has_init per sequence, -1 null slots,
+      dim-major strided x/out. Same kernel <= 8 envelope as the decode op.
+      Graph-capture-safe. Adapted from the QuixiAI MIT decode kernel set
+      proven in vLLM XPU serving (NemotronH prefill conv stage).
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel causal_conv1d_prefill --M tokens --dim channels"}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/ssm/causal_conv1d/variants/xpu_sycl}
   causal_conv1d_decode:
     family: ssm
     status: implemented

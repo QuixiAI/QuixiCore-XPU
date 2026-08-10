@@ -2385,3 +2385,44 @@ reach (per-token Python-loop kernel launches), and the yardstick the planned
 chunked parallel-scan variant (ssd_torch._prefill_chunked tiling) must beat.
 Decision: **keep** — port baseline, correctness-first; chunked variant is the
 follow-up throughput lever with a cross-variant equality gate.
+
+## 2026-08-09: Port causal_conv1d_prefill from the vLLM XPU serving work
+
+Provenance: adapted from the QuixiAI MIT decode kernel set
+(`vllm-xpu-kernels csrc/xpu/sycl/decode/mamba2_conv1d_prefill_kernel.hpp`,
+commit dffcab7) — replaced the per-sequence torch conv loop (host `.item()`
+syncs + an F.conv1d launch per sequence) in NemotronH prefill. MIT-to-MIT
+adaptation; deviations: nullable bias/has_init pointers, dispatch-time shape
+envelope validation.
+
+Kernel + route: `ops::causal_conv1d_prefill` ->
+`kernels/ssm/causal_conv1d/variants/xpu_sycl/causal_conv1d_prefill.sycl.cpp`.
+Two kernels chained by an explicit event dependency: (A) output per (token,
+channel), earliest taps drawn from the slot window when in reach of the
+sequence start; (B) state write-back per (seq, channel), gathering into
+registers before writing because source and destination may alias. The
+returned event is (B)'s. Graph-capture-safe.
+
+Correctness: `check_causal_conv1d_prefill` in tests/xpu_ops_smoke.cpp. fp64
+oracle for the output pass; exact state expectation (round-trip gather).
+Ragged lengths {6, 0, 2, 9, 5} — empty sequence leaves its slot untouched,
+the length-2 sequence exercises the shorter-than-window init gather in both
+kernels — has_init on/off, null slot (zero rows, no state), strided token
+pitch. All worst_out = 0, state_bad = 0. Full smoke suite: PASS.
+
+Measurement (Arc Pro B60 device 0, oneAPI icpx, Level Zero; harness
+`--kernel causal_conv1d_prefill --dim 5120 --iters 50 --warmup 10`, bf16 act /
+f32 state, single sequence):
+
+| tokens | median ms | us/token |
+|---:|---:|---:|
+| 2048 | 1.215 | 0.59 |
+| 8192 | 5.008 | 0.61 |
+
+Honest standing: adequate (the conv is ~5% of the SSD prefill cost at the same
+shape) but far from bandwidth-bound — the work-item mapping puts consecutive
+lanes on consecutive CHANNELS while the dim-major layout makes those reads
+`total_tokens` elements apart (uncoalesced). Swapping the gid mapping so
+consecutive lanes walk consecutive tokens within a channel row is the obvious
+lever for a later ssm throughput pass. Decision: **keep** — port baseline,
+correctness-first.

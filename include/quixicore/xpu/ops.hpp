@@ -403,6 +403,33 @@ void causal_conv1d_decode(sycl::queue& q, void* conv_state, const void* x,
                           DType state_dt, Variant variant = Variant::sycl,
                           bool blocking = true);
 
+// Varlen depthwise causal conv1d prefill. x and out are DIM-MAJOR
+// [dim, total_tokens] of dtype act_dt with element strides xs0/xs1 and
+// os0/os1 (the packed serving transpose layout); weight [dim, kernel] and
+// bias [dim] (nullptr = none) act_dt; conv_state [nslots, dim, state_len]
+// state_dt with strides cs0..cs2; cu_seqlens [batch+1] int32; indices [batch]
+// int32 cache slots (<0 = null: zero output rows, no state touch); has_init
+// [batch] bools (nullptr = all false) select whether the earliest taps of a
+// sequence read the slot's existing window or zeros. Two chained kernels:
+// output pass, then state write-back (last state_len samples of
+// [initial_state | seq_x]); the dependency guarantees old-window reads precede
+// the writes, and the returned/waited event is the write-back's. Empty
+// sequences leave their slot untouched. Same kernel <= 8 envelope as
+// causal_conv1d_decode. fp32 math, optional SiLU. Graph-capture-safe.
+void causal_conv1d_prefill(sycl::queue& q, void* conv_state, const void* x,
+                           const void* weight, const void* bias,
+                           const std::int32_t* cu_seqlens,
+                           const std::int32_t* indices, const bool* has_init,
+                           void* out, bool silu, std::size_t total_tokens,
+                           std::size_t batch, std::size_t dim,
+                           std::size_t state_len, std::size_t kernel,
+                           std::size_t nslots, std::int64_t xs0,
+                           std::int64_t xs1, std::int64_t os0, std::int64_t os1,
+                           std::int64_t cs0, std::int64_t cs1, std::int64_t cs2,
+                           DType act_dt, DType state_dt,
+                           Variant variant = Variant::sycl,
+                           bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // collectives (multi-GPU)
 // ----------------------------------------------------------------------------

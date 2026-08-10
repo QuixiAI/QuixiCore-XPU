@@ -15,6 +15,9 @@ All notable QuixiCore XPU changes should be recorded here.
 - ssd_prefill: varlen Mamba-2 SSD prefill selective scan (sequential
   xpu_sycl_seq variant, SLM-resident state rows, softplus + dt_limit clamp,
   caller-owned state gather/scatter). Graph-capture-safe.
+- causal_conv1d_prefill: varlen depthwise causal conv prefill (dim-major
+  layout, event-chained output + state write-back passes, has_init and
+  null-slot semantics). Graph-capture-safe.
 
 ### Kernel families — breadth
 

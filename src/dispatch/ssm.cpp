@@ -66,4 +66,24 @@ void causal_conv1d_decode(sycl::queue& q, void* conv_state, const void* x,
   if (blocking) ev.wait();
 }
 
+void causal_conv1d_prefill(sycl::queue& q, void* conv_state, const void* x,
+                           const void* weight, const void* bias,
+                           const std::int32_t* cu_seqlens,
+                           const std::int32_t* indices, const bool* has_init,
+                           void* out, bool silu, std::size_t total_tokens,
+                           std::size_t batch, std::size_t dim,
+                           std::size_t state_len, std::size_t kernel,
+                           std::size_t nslots, std::int64_t xs0,
+                           std::int64_t xs1, std::int64_t os0, std::int64_t os1,
+                           std::int64_t cs0, std::int64_t cs1, std::int64_t cs2,
+                           DType act_dt, DType state_dt, Variant variant,
+                           bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::causal_conv1d_prefill_sycl(
+      q, conv_state, x, weight, bias, cu_seqlens, indices, has_init, out, silu,
+      total_tokens, batch, dim, state_len, kernel, nslots, xs0, xs1, os0, os1,
+      cs0, cs1, cs2, act_dt, state_dt);
+  if (blocking) ev.wait();
+}
+
 }  // namespace quixicore::xpu::ops

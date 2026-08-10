@@ -894,6 +894,119 @@ bool check_ssd_prefill(sycl::queue& q, DType act_dt, DType state_dt,
   return ok;
 }
 
+// Varlen causal conv1d prefill. fp64 oracle for the output pass; the state
+// write-back is a pure round-trip gather so its expectation is exact. Covers
+// ragged lengths {6, 0, 2, 9, 5} (incl. empty and shorter-than-window with
+// initial state), has_init on/off, a null slot, and an optional strided
+// token pitch on x/out.
+template <typename T, typename StateT>
+bool check_causal_conv1d_prefill(sycl::queue& q, DType act_dt, DType state_dt,
+                                 bool strided_tokens) {
+  const std::size_t batch = 5, dim = 64, kernel = 4, state_len = kernel - 1,
+                    nslots = 6;
+  const std::int32_t lens[batch] = {6, 0, 2, 9, 5};
+  const bool init_h[batch] = {true, false, true, true, false};
+  const std::int32_t idx_h[batch] = {0, 2, 4, -1, 1};
+  std::int32_t qsl_h[batch + 1] = {0};
+  for (std::size_t s = 0; s < batch; ++s) qsl_h[s + 1] = qsl_h[s] + lens[s];
+  const std::size_t T_total = static_cast<std::size_t>(qsl_h[batch]);
+  const std::int64_t pitch = strided_tokens ? 2 : 1;
+  const std::int64_t xs1 = pitch, xs0 = static_cast<std::int64_t>(T_total) * pitch;
+  const std::size_t xbuf = dim * static_cast<std::size_t>(xs0);
+  const std::int64_t cs0 = static_cast<std::int64_t>(dim) * state_len,
+                     cs1 = state_len, cs2 = 1;
+  const std::size_t st_elems = nslots * dim * state_len;
+
+  StateT* st = sycl::malloc_shared<StateT>(st_elems, q);
+  T* x = sycl::malloc_shared<T>(xbuf, q);
+  T* out = sycl::malloc_shared<T>(xbuf, q);
+  T* w = sycl::malloc_shared<T>(dim * kernel, q);
+  T* bias = sycl::malloc_shared<T>(dim, q);
+  std::int32_t* qsl = sycl::malloc_shared<std::int32_t>(batch + 1, q);
+  std::int32_t* idx = sycl::malloc_shared<std::int32_t>(batch, q);
+  bool* hinit = sycl::malloc_shared<bool>(batch, q);
+
+  for (std::size_t i = 0; i < st_elems; ++i)
+    st[i] = static_cast<StateT>(0.5f * sample(i + 3));
+  for (std::size_t i = 0; i < xbuf; ++i) {
+    x[i] = static_cast<T>(sample(i + 7));
+    out[i] = static_cast<T>(-99.0f);
+  }
+  for (std::size_t i = 0; i < dim * kernel; ++i) w[i] = static_cast<T>(sample(i + 11));
+  for (std::size_t i = 0; i < dim; ++i) bias[i] = static_cast<T>(0.3f * sample(i + 13));
+  for (std::size_t s = 0; s <= batch; ++s) qsl[s] = qsl_h[s];
+  for (std::size_t s = 0; s < batch; ++s) { idx[s] = idx_h[s]; hinit[s] = init_h[s]; }
+
+  std::vector<double> snap(st_elems), expect(st_elems);
+  for (std::size_t i = 0; i < st_elems; ++i) snap[i] = static_cast<double>(st[i]);
+  expect = snap;
+
+  ops::causal_conv1d_prefill(q, st, x, w, bias, qsl, idx, hinit, out,
+                             /*silu=*/true, T_total, batch, dim, state_len,
+                             kernel, nslots, xs0, xs1, xs0, xs1, cs0, cs1, cs2,
+                             act_dt, state_dt, Variant::sycl, /*blocking=*/true);
+
+  const Tol tol = tol_for(act_dt);
+  double worst_out = 0.0;
+  int zero_bad = 0, state_bad = 0;
+  for (std::size_t s = 0; s < batch; ++s) {
+    const std::size_t bos = static_cast<std::size_t>(qsl_h[s]);
+    const std::size_t seqlen = static_cast<std::size_t>(lens[s]);
+    const bool slot_ok = idx_h[s] >= 0;
+    for (std::size_t c = 0; c < dim; ++c) {
+      const std::int64_t sbase =
+          slot_ok ? idx_h[s] * cs0 + static_cast<std::int64_t>(c) * cs1 : 0;
+      // conv_input = [init (state_len) | seq_x (seqlen)] in fp64.
+      std::vector<double> ci(state_len + seqlen, 0.0);
+      for (std::size_t m = 0; m < state_len; ++m)
+        if (slot_ok && init_h[s])
+          ci[m] = snap[static_cast<std::size_t>(sbase + static_cast<std::int64_t>(m) * cs2)];
+      for (std::size_t t = 0; t < seqlen; ++t)
+        ci[state_len + t] = static_cast<double>(
+            x[static_cast<std::size_t>(static_cast<std::int64_t>(c) * xs0 +
+                                       static_cast<std::int64_t>(bos + t) * xs1)]);
+      for (std::size_t t = 0; t < seqlen; ++t) {
+        const std::size_t oi = static_cast<std::size_t>(
+            static_cast<std::int64_t>(c) * xs0 +
+            static_cast<std::int64_t>(bos + t) * xs1);
+        if (!slot_ok) {
+          if (static_cast<double>(out[oi]) != 0.0) ++zero_bad;
+          continue;
+        }
+        double acc = static_cast<double>(bias[c]);
+        for (std::size_t k = 0; k < kernel; ++k)
+          acc += ci[t + k] * static_cast<double>(w[c * kernel + k]);
+        acc = acc / (1.0 + std::exp(-acc));
+        const double ref = static_cast<double>(static_cast<T>(acc));
+        worst_out = std::max(worst_out,
+                             std::abs(static_cast<double>(out[oi]) - ref) -
+                                 (tol.atol + tol.rtol * std::abs(ref)));
+      }
+      if (slot_ok && seqlen > 0) {
+        for (std::size_t m = 0; m < state_len; ++m) {
+          const float v = static_cast<float>(ci[seqlen + m]);
+          expect[static_cast<std::size_t>(sbase + static_cast<std::int64_t>(m) * cs2)] =
+              static_cast<double>(static_cast<StateT>(v));
+        }
+      }
+    }
+  }
+  for (std::size_t i = 0; i < st_elems; ++i)
+    if (static_cast<double>(st[i]) != expect[i]) ++state_bad;
+
+  sycl::free(st, q); sycl::free(x, q); sycl::free(out, q); sycl::free(w, q);
+  sycl::free(bias, q); sycl::free(qsl, q); sycl::free(idx, q);
+  sycl::free(hinit, q);
+
+  const bool ok = worst_out <= 0.0 && state_bad == 0 && zero_bad == 0;
+  std::cout << "  causal_conv1d_prefill act=" << dtype_name(act_dt)
+            << " state=" << dtype_name(state_dt)
+            << (strided_tokens ? " strided" : " packed")
+            << " worst_out=" << worst_out << " state_bad=" << state_bad
+            << " zero_bad=" << zero_bad << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
 bool check_collectives() {
   const std::size_t count = 4096;
   std::vector<float> in(8 * count), out(count, 0.0f);
@@ -3128,6 +3241,17 @@ int main() {
   failures += check_ssd_prefill<bf16_t, float>(q, DType::bf16, DType::f32, true) ? 0 : 1;
   failures += check_ssd_prefill<bf16_t, float>(q, DType::bf16, DType::f32, false) ? 0 : 1;
   failures += check_ssd_prefill<bf16_t, bf16_t>(q, DType::bf16, DType::bf16, true) ? 0 : 1;
+
+  // ssm: varlen causal conv1d prefill (ragged, short-seq init gather, null
+  // slot, strided token pitch).
+  failures += check_causal_conv1d_prefill<float, float>(q, DType::f32, DType::f32,
+                                                        false) ? 0 : 1;
+  failures += check_causal_conv1d_prefill<bf16_t, float>(q, DType::bf16, DType::f32,
+                                                         false) ? 0 : 1;
+  failures += check_causal_conv1d_prefill<bf16_t, float>(q, DType::bf16, DType::f32,
+                                                         true) ? 0 : 1;
+  failures += check_causal_conv1d_prefill<bf16_t, bf16_t>(q, DType::bf16, DType::bf16,
+                                                          false) ? 0 : 1;
 
   // ssm: depthwise causal conv1d decode (both serving layouts via strides).
   failures += check_causal_conv1d_decode<float, float>(q, DType::f32, DType::f32,

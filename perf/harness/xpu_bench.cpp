@@ -621,6 +621,47 @@ int main(int argc, char** argv) {
     sycl::free(D, q); sycl::free(qsl, q); sycl::free(vstates, q);
     return 0;
   }
+  if (kernel == "causal_conv1d_prefill") {
+    // Varlen conv prefill: --M packed tokens in one sequence, --dim channels,
+    // width-4 taps, dim-major layout, f32 state.
+    const std::size_t tokens = M;
+    const std::size_t taps = 4, state_len = taps - 1, slots = 4;
+    const std::int64_t xs0 = static_cast<std::int64_t>(tokens), xs1 = 1;
+    const std::int64_t cs0 = static_cast<std::int64_t>(dim) * state_len,
+                       cs1 = state_len, cs2 = 1;
+    float *state = sycl::malloc_device<float>(slots * dim * state_len, q);
+    void *x = sycl::malloc_device(dim * tokens * elem, q);
+    void *out = sycl::malloc_device(dim * tokens * elem, q);
+    void *w = sycl::malloc_device(dim * taps * elem, q);
+    void *bias = sycl::malloc_device(dim * elem, q);
+    int *qsl = sycl::malloc_shared<int>(2, q);
+    int *idx = sycl::malloc_shared<int>(1, q);
+    bool *hinit = sycl::malloc_shared<bool>(1, q);
+    q.memset(state, 0, slots * dim * state_len * sizeof(float)).wait();
+    q.memset(x, 0, dim * tokens * elem).wait();
+    q.memset(w, 0, dim * taps * elem).wait();
+    q.memset(bias, 0, dim * elem).wait();
+    qsl[0] = 0; qsl[1] = static_cast<int>(tokens); idx[0] = 0; hinit[0] = true;
+    auto once = [&] {
+      kernels::causal_conv1d_prefill_sycl(q, state, x, w, bias, qsl, idx,
+                                          hinit, out, true, tokens, 1, dim,
+                                          state_len, taps, slots, xs0, xs1,
+                                          xs0, xs1, cs0, cs1, cs2, dt,
+                                          DType::f32);
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    std::cout << "{\"schema_version\":2,\"kernel\":\"causal_conv1d_prefill\","
+              << "\"variant\":\"sycl\",\"dtype\":\"" << dtype_name(dt)
+              << "\",\"tokens\":" << tokens << ",\"dim\":" << dim
+              << ",\"iters\":" << iters << ",\"median_ms\":" << timing.median_ms
+              << ",\"min_ms\":" << timing.min_ms << ",\"max_ms\":" << timing.max_ms
+              << ",\"device\":\"" << q.get_device().get_info<sycl::info::device::name>() << "\"}"
+              << std::endl;
+    sycl::free(state, q); sycl::free(x, q); sycl::free(out, q);
+    sycl::free(w, q); sycl::free(bias, q); sycl::free(qsl, q);
+    sycl::free(idx, q); sycl::free(hinit, q);
+    return 0;
+  }
   if (kernel == "causal_conv1d_decode") {
     // Mamba-2 conv decode step: batch = --M rows, --dim channels, width-4
     // taps, --N state slots, f32 state, act dtype = --dtype.
