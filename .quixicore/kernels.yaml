@@ -176,6 +176,24 @@ operations:
     variants:
       - {name: xpu_sycl, status: experimental, path: kernels/norms/rms_norm/variants/xpu_sycl}
 
+  mqa_logits:
+    family: serving
+    status: experimental
+    path: kernels/serving/mqa_logits
+    dtypes: [f32]
+    shape: fp8 MQA indexer logits (DeepSeek sparse-attention scoring)
+    note: >-
+      logits[s,kv] = sum_h w[s,h] * relu((q[s,h,:] . kv[kv,:]) * kv_scale[kv])
+      with -inf outside [ks,ke); e4m3 inputs decoded to bf16 for the DPAS.
+      First consumer of the native joint_matrix building block
+      (kernels/common/xmx_tile.hpp) — correctness-proven, throughput pass
+      pending (see optimization_status). Paged variant follows with the
+      paged-attention work. Satisfies the quantized_attention /
+      indexer scoring surface.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel mqa_logits --M S --rows H --dim D --N Skv"}
+    variants:
+      - {name: xpu_sycl, status: experimental, path: kernels/serving/mqa_logits/variants/xpu_sycl}
   glu_quant:
     family: activations
     status: implemented

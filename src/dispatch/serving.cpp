@@ -2,6 +2,8 @@
 
 #include "quixicore/xpu/ops.hpp"
 
+#include "serving/mqa_logits/mqa_logits_kernel.hpp"
+
 #include "serving/serving_kernel.hpp"
 
 namespace quixicore::xpu::ops {
@@ -37,6 +39,19 @@ void pool_mean_rms_l2(sycl::queue& q, const void* x, const void* weight,
   (void)variant;
   sycl::event ev =
       kernels::pool_mean_rms_l2_sycl(q, x, weight, offsets, out, batch, dim, eps, dt);
+  if (blocking) ev.wait();
+}
+
+void mqa_logits(sycl::queue& q, const std::uint8_t* q_fp8,
+                const std::uint8_t* kv_fp8, const float* kv_scales,
+                const float* head_weights, const std::int32_t* ks,
+                const std::int32_t* ke, float* logits, std::size_t S,
+                std::size_t H, std::size_t D, std::size_t Skv, Variant variant,
+                bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::mqa_logits_sycl(q, q_fp8, kv_fp8, kv_scales,
+                                            head_weights, ks, ke, logits, S, H,
+                                            D, Skv);
   if (blocking) ev.wait();
 }
 

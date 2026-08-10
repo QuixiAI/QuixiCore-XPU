@@ -470,6 +470,21 @@ void causal_conv1d_prefill(sycl::queue& q, void* conv_state, const void* x,
                            Variant variant = Variant::sycl,
                            bool blocking = true);
 
+// DeepSeek-style fp8 MQA indexer logits (sparse-attention index scoring):
+// logits[s,kv] = sum_h head_weights[s,h] * relu((q[s,h,:] . kv[kv,:]) *
+// kv_scales[kv]), masked to -inf outside [ks[s], ke[s]). q_fp8 [S,H,D] and
+// kv_fp8 [Skv,D] are e4m3 bytes (decoded to bf16 for the DPAS — this
+// generation has no fp8 MMA); head_weights [S,H], kv_scales [Skv], logits
+// [S,Skv] f32. D must be a multiple of 16 (rejected otherwise); any H
+// (zero-padded head tiles). Runs on the native joint_matrix building block
+// (kernels/common/xmx_tile.hpp). Graph-capture-safe.
+void mqa_logits(sycl::queue& q, const std::uint8_t* q_fp8,
+                const std::uint8_t* kv_fp8, const float* kv_scales,
+                const float* head_weights, const std::int32_t* ks,
+                const std::int32_t* ke, float* logits, std::size_t S,
+                std::size_t H, std::size_t D, std::size_t Skv,
+                Variant variant = Variant::sycl, bool blocking = true);
+
 // ----------------------------------------------------------------------------
 // collectives (multi-GPU)
 // ----------------------------------------------------------------------------

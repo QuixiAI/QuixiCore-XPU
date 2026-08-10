@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -1098,6 +1099,73 @@ bool check_causal_conv1d_prefill(sycl::queue& q, DType act_dt, DType state_dt,
             << (strided_tokens ? " strided" : " packed")
             << " worst_out=" << worst_out << " state_bad=" << state_bad
             << " zero_bad=" << zero_bad << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+// fp8 MQA indexer logits (the xmx_tile proving ground). fp64 oracle on the
+// decoded e4m3 values (exact decode, so the only kernel error is the bf16
+// DPAS dot); covers band masking incl. an empty band, a clamped ke, H not a
+// multiple of the 8-row head tile, and an Skv tail.
+bool check_mqa_logits(sycl::queue& q, std::size_t S, std::size_t H,
+                      std::size_t D, std::size_t Skv) {
+  namespace codec = quixicore::xpu::turboquant_codec;
+  std::uint8_t* qf = sycl::malloc_shared<std::uint8_t>(S * H * D, q);
+  std::uint8_t* kf = sycl::malloc_shared<std::uint8_t>(Skv * D, q);
+  float* kscale = sycl::malloc_shared<float>(Skv, q);
+  float* w = sycl::malloc_shared<float>(S * H, q);
+  std::int32_t* ks = sycl::malloc_shared<std::int32_t>(S, q);
+  std::int32_t* ke = sycl::malloc_shared<std::int32_t>(S, q);
+  float* logits = sycl::malloc_shared<float>(S * Skv, q);
+  for (std::size_t i = 0; i < S * H * D; ++i)
+    qf[i] = codec::e4m3_encode(0.5f * sample(i + 3));
+  for (std::size_t i = 0; i < Skv * D; ++i)
+    kf[i] = codec::e4m3_encode(0.5f * sample(i + 7));
+  for (std::size_t i = 0; i < Skv; ++i) kscale[i] = 0.5f + 0.05f * sample(i);
+  for (std::size_t i = 0; i < S * H; ++i) w[i] = 0.25f + 0.05f * sample(i + 11);
+  for (std::size_t s = 0; s < S; ++s) {
+    ks[s] = static_cast<std::int32_t>(s % 3);
+    ke[s] = s == 1 ? ks[s]  // empty band
+                   : static_cast<std::int32_t>(s == 2 ? Skv + 5 : Skv - 2);
+  }
+
+  ops::mqa_logits(q, qf, kf, kscale, w, ks, ke, logits, S, H, D, Skv,
+                  Variant::sycl, true);
+
+  double worst = 0.0;
+  int inf_bad = 0;
+  for (std::size_t s = 0; s < S; ++s) {
+    for (std::size_t kv = 0; kv < Skv; ++kv) {
+      const bool in_band = static_cast<std::int64_t>(kv) >= ks[s] &&
+                           static_cast<std::int64_t>(kv) < ke[s];
+      const float got = logits[s * Skv + kv];
+      if (!in_band) {
+        if (!(got == -std::numeric_limits<float>::infinity())) ++inf_bad;
+        continue;
+      }
+      double ref = 0.0, mag = 0.0;
+      for (std::size_t hh = 0; hh < H; ++hh) {
+        double dot = 0.0;
+        for (std::size_t k = 0; k < D; ++k) {
+          dot += static_cast<double>(
+                     codec::e4m3_decode(qf[(s * H + hh) * D + k])) *
+                 static_cast<double>(codec::e4m3_decode(kf[kv * D + k]));
+        }
+        const double t = std::max(dot * kscale[kv], 0.0) * w[s * H + hh];
+        ref += t;
+        mag += std::abs(t);
+      }
+      // bf16 DPAS inputs: ~2^-8 relative per product, sqrt(D) accumulation.
+      const double tol = 1e-4 + 8e-3 * std::sqrt(static_cast<double>(D)) *
+                                    (mag / std::max<std::size_t>(H, 1));
+      worst = std::max(worst, std::abs(got - ref) - tol * std::max(1.0, mag));
+    }
+  }
+  sycl::free(qf, q); sycl::free(kf, q); sycl::free(kscale, q);
+  sycl::free(w, q); sycl::free(ks, q); sycl::free(ke, q); sycl::free(logits, q);
+  const bool ok = worst <= 0.0 && inf_bad == 0;
+  std::cout << "  mqa_logits S=" << S << " H=" << H << " D=" << D
+            << " Skv=" << Skv << " worst_excess=" << worst
+            << " inf_bad=" << inf_bad << (ok ? "  ok" : "  FAIL") << '\n';
   return ok;
 }
 
@@ -3879,6 +3947,10 @@ int main() {
                                                          false, false, false) ? 0 : 1;
   failures += check_causal_conv1d_decode<half_t, float>(q, DType::f16, DType::f32,
                                                         true, false, true) ? 0 : 1;
+
+  // serving: fp8 MQA indexer logits (xmx_tile proving ground).
+  failures += check_mqa_logits(q, 5, 48, 128, 100) ? 0 : 1;
+  failures += check_mqa_logits(q, 3, 8, 64, 33) ? 0 : 1;
 
   // activations: fused SwiGLU + quantization.
   failures += check_glu_quant<bf16_t>(q, DType::bf16, ops::GluQuantMode::group_fp8,

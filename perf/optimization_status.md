@@ -2664,3 +2664,32 @@ sanity across group_fp8 (groups 32/128) and mxfp4, worst_excess = 0, full
 suite PASS. Measurement (B60; --rows 4096 --dim 4096, bf16): group_fp8
 0.444 ms, mxfp4 0.580 ms. Decision: **keep** (correctness-first; shares the
 future norms/activations vectorization pass).
+
+## 2026-08-09: mqa_logits (fp8 MQA indexer logits) — first native joint_matrix rewrite consumer
+
+Semantics from vllm-xpu-kernels csrc/xpu/mqa_logits (Apache, cutlass DPAS;
+translated to raw joint_matrix — the cutlass source also converts e4m3 to
+bf16 before the MMA, so the native route loses nothing this generation).
+First consumer of kernels/common/xmx_tile.hpp: one subgroup per (q token,
+16-wide kv tile), heads on the DPAS M axis in 8-row zero-padded tiles, e4m3
+decode in the stage lambdas, relu + kv_scale + head-weighted reduce in the
+accumulator-spill epilogue (the 8x16 spill walk visits a fixed column per
+lane, so the reduce lives in one register).
+
+Correctness: `check_mqa_logits` — fp64 oracle on exactly-decoded e4m3 inputs
+(kernel error is only the bf16 DPAS dot), band mask incl. an EMPTY band and a
+past-Skv ke clamp, H=48 (head-tile remainder), Skv tails. worst_excess = 0 on
+both shapes; the xmx machinery was bit-correct on first run — the de-risking
+this milestone existed for. Full suite PASS.
+
+Measurement (B60 device 0; `--M 64 --rows 64 --dim 128 --N 4096`): 5.18 ms,
+0.83 TFLOPs vs 45.4 TFLOPs for the oneDNN bf16 dense_gemm at the same
+(4096 x 4096 x 128) MNK — ~1.8%, far below the 50% target. Known levers, in
+order: loop kv tiles inside the work-group so the staged/decoded q tile is
+reused (today it re-decodes per kv tile — the dominant cost), multiple
+subgroups per work-group sharing B tiles, wide SLM stores in the stage
+lambdas, and register-blocked multi-tile accumulators (AccTile). Decision:
+**keep** (correctness-first proving ground; the op did its job of validating
+the shared infra). Throughput pass scheduled with the paged-attention work,
+which shares every lever. The paged variant (block_tables) follows with that
+same work.

@@ -43,6 +43,7 @@
 
 #include "norms/qk_norm_rope/qk_norm_rope_kernel.hpp"
 #include "activations/glu_quant/glu_quant_kernel.hpp"
+#include "serving/mqa_logits/mqa_logits_kernel.hpp"
 #include "norms/norm_quant/norm_quant_kernel.hpp"
 #include "quantization/turboquant/turboquant_kernel.hpp"
 #include "quantization/turboquant/turboquant_tables.hpp"
@@ -645,6 +646,36 @@ int main(int argc, char** argv) {
     sycl::free(state, q); sycl::free(x, q); sycl::free(B, q); sycl::free(C, q);
     sycl::free(out, q); sycl::free(dt_raw, q); sycl::free(A, q);
     sycl::free(dt_bias, q); sycl::free(D, q); sycl::free(idx, q);
+    return 0;
+  }
+  if (kernel == "mqa_logits") {
+    // --M q tokens, --rows heads, --dim D, --N kv positions.
+    const std::size_t S = M, H = rows, D2 = dim, Skv = N;
+    auto *qf = sycl::malloc_device<std::uint8_t>(S * H * D2, q);
+    auto *kf = sycl::malloc_device<std::uint8_t>(Skv * D2, q);
+    float *kscale = sycl::malloc_device<float>(Skv, q);
+    float *w = sycl::malloc_device<float>(S * H, q);
+    auto *ks = sycl::malloc_shared<std::int32_t>(S, q);
+    auto *ke = sycl::malloc_shared<std::int32_t>(S, q);
+    float *logits = sycl::malloc_device<float>(S * Skv, q);
+    q.memset(qf, 0x30, S * H * D2).wait();
+    q.memset(kf, 0x30, Skv * D2).wait();
+    q.memset(kscale, 0, Skv * sizeof(float)).wait();
+    q.memset(w, 0, S * H * sizeof(float)).wait();
+    for (std::size_t s2 = 0; s2 < S; ++s2) { ks[s2] = 0; ke[s2] = static_cast<int>(Skv); }
+    auto once = [&] {
+      kernels::mqa_logits_sycl(q, qf, kf, kscale, w, ks, ke, logits, S, H, D2, Skv);
+    };
+    const DeviceTiming timing = time_device_batches(once);
+    const double tflops = 2.0 * S * H * D2 * Skv / (timing.median_ms * 1e-3) / 1e12;
+    std::cout << "{\"schema_version\":2,\"kernel\":\"mqa_logits\",\"variant\":\"sycl\","
+              << "\"S\":" << S << ",\"H\":" << H << ",\"D\":" << D2 << ",\"Skv\":" << Skv
+              << ",\"iters\":" << iters << ",\"median_ms\":" << timing.median_ms
+              << ",\"tflops\":" << tflops << ",\"device\":\""
+              << q.get_device().get_info<sycl::info::device::name>() << "\"}"
+              << std::endl;
+    sycl::free(qf, q); sycl::free(kf, q); sycl::free(kscale, q); sycl::free(w, q);
+    sycl::free(ks, q); sycl::free(ke, q); sycl::free(logits, q);
     return 0;
   }
   if (kernel == "glu_quant") {

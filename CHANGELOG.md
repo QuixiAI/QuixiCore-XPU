@@ -36,6 +36,9 @@ All notable QuixiCore XPU changes should be recorded here.
 - turboquant: KV-cache codec encode/decode implementing the format v2 ABI
   (rotated Lloyd-Max keys or e4m3 byte keys, per-group uniform values,
   LSB-first packing), byte-identical to the host-shared codec oracle.
+- mqa_logits: fp8 MQA indexer logits on the new native joint_matrix
+  building block (kernels/common/xmx_tile.hpp + quant_codecs.hpp) — the
+  first cutlass-free DPAS rewrite consumer.
 - Build: deterministic fp32 device arithmetic (-fp-model=precise +
   correctly-rounded offload divide/sqrt) — required for bit-exact codec
   contracts; manual integer fp16 conversions in codecs (the optimizer may
