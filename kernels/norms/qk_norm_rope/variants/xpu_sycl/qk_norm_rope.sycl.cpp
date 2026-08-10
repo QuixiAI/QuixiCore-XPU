@@ -11,7 +11,7 @@
 // the reference does. The richer launch_qkv_epilogue (which also encodes the
 // model's fused-QKV memory layout) was intentionally NOT ported.
 
-#include "attention/qk_norm_rope/qk_norm_rope_kernel.hpp"
+#include "norms/qk_norm_rope/qk_norm_rope_kernel.hpp"
 
 #include <cmath>
 

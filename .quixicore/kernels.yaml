@@ -505,9 +505,9 @@ operations:
       - {name: xpu_sycl, status: implemented, path: kernels/attention/rope/variants/xpu_sycl}
 
   qk_norm_rope:
-    family: attention
+    family: norms
     status: implemented
-    path: kernels/attention/qk_norm_rope
+    path: kernels/norms/qk_norm_rope
     dtypes: [f32, f16, bf16]
     shape: per-head RMSNorm + query-scale + RoPE
     note: >-
@@ -523,7 +523,7 @@ operations:
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     benchmarks: {harness: "perf/harness/xpu_bench.cpp --kernel qk_norm_rope --approx {fused,unfused}"}
     variants:
-      - {name: xpu_sycl, status: implemented, path: kernels/attention/qk_norm_rope/variants/xpu_sycl}
+      - {name: xpu_sycl, status: implemented, path: kernels/norms/qk_norm_rope/variants/xpu_sycl}
   adamw:
     family: optimizers
     status: implemented

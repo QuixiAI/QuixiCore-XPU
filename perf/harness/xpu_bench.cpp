@@ -41,7 +41,7 @@
 #include "attention/attention/attention_kernel.hpp"
 #include "attention/rope/rope_kernel.hpp"
 
-#include "attention/qk_norm_rope/qk_norm_rope_kernel.hpp"
+#include "norms/qk_norm_rope/qk_norm_rope_kernel.hpp"
 #include "matmul/dense_gemm/dense_gemm_kernel.hpp"
 #include "norms/norms_kernel.hpp"
 #include "optimizers/adamw/adamw_kernel.hpp"
