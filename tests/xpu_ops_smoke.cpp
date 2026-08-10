@@ -434,7 +434,8 @@ bool check_moe_route(sycl::queue& q, DType dt, std::size_t nt, std::size_t ne, i
   int* ids = sycl::malloc_shared<int>(nt * k, q);
   float* w = sycl::malloc_shared<float>(nt * k, q);
   for (std::size_t i = 0; i < nt * ne; ++i) logits[i] = static_cast<T>(sample(i) * 3.0f);
-  ops::moe_route_topk(q, logits, ids, w, nt, ne, k, dt, Variant::sycl, true);
+  ops::moe_route_topk(q, logits, ids, w, nt, ne, k, dt, ops::MoeGating::softmax,
+                      true, 1.0f, Variant::sycl, true);
 
   int bad_id = 0; double worst_w = 0.0;
   std::vector<char> taken(ne);
@@ -1099,6 +1100,130 @@ bool check_causal_conv1d_prefill(sycl::queue& q, DType act_dt, DType state_dt,
             << (strided_tokens ? " strided" : " packed")
             << " worst_out=" << worst_out << " state_bad=" << state_bad
             << " zero_bad=" << zero_bad << (ok ? "  ok" : "  FAIL") << '\n';
+  return ok;
+}
+
+// Router gating modes + the permute/unpermute round-trip. Gating oracle in
+// fp64 per mode (selection shared, weights differ); permute is validated
+// functionally: histogram matches, and unpermute(permute(hidden)) with the
+// identity GEMM equals the direct weighted sum (order-independence by
+// construction), with -1 expert ids skipped everywhere.
+template <typename T>
+bool check_moe_route_modes_and_permute(sycl::queue& q, DType dt) {
+  bool ok = true;
+  const std::size_t nt = 64, ne = 16;
+  const int k = 4;
+  {  // gating modes
+    T* logits = sycl::malloc_shared<T>(nt * ne, q);
+    int* ids = sycl::malloc_shared<int>(nt * k, q);
+    float* w = sycl::malloc_shared<float>(nt * k, q);
+    for (std::size_t i = 0; i < nt * ne; ++i)
+      logits[i] = static_cast<T>(sample(i + 3) * 3.0f);
+    for (int mode = 1; mode <= 2; ++mode) {
+      const float scaling = mode == 1 ? 2.5f : 1.0f;
+      ops::moe_route_topk(q, logits, ids, w, nt, ne, k, dt,
+                          static_cast<ops::MoeGating>(mode), true, scaling,
+                          Variant::sycl, true);
+      double worst = 0.0;
+      for (std::size_t t = 0; t < nt; ++t) {
+        // reference selection: iterative argmax, lowest-index ties
+        std::vector<char> taken(ne, 0);
+        double vals[16];
+        int sel[16];
+        for (int i = 0; i < k; ++i) {
+          double best = -1e300; int be = 0;
+          for (std::size_t e = 0; e < ne; ++e) {
+            if (taken[e]) continue;
+            const double v = static_cast<double>(logits[t * ne + e]);
+            if (v > best) { best = v; be = static_cast<int>(e); }
+          }
+          taken[be] = 1; sel[i] = be; vals[i] = best;
+        }
+        double sum = 0.0;
+        double sc[16];
+        for (int i = 0; i < k; ++i) {
+          if (mode == 1) sc[i] = 1.0 / (1.0 + std::exp(-vals[i]));
+          else {
+            const double sp = vals[i] <= 20.0 ? std::log(1.0 + std::exp(vals[i])) : vals[i];
+            sc[i] = std::sqrt(sp);
+          }
+          sum += sc[i];
+        }
+        for (int i = 0; i < k; ++i) {
+          if (ids[t * k + i] != sel[i]) ++worst;  // hard fail via excess
+          const double ref = sc[i] / sum * scaling;
+          worst = std::max(worst, std::abs(static_cast<double>(w[t * k + i]) - ref) - 2e-4);
+        }
+      }
+      ok = ok && worst <= 0.0;
+      std::cout << "  moe_route_topk mode=" << (mode == 1 ? "sigmoid" : "softplus_sqrt")
+                << " dt=" << dtype_name(dt) << " worst=" << worst
+                << (worst <= 0.0 ? "  ok" : "  FAIL") << '\n';
+    }
+    sycl::free(logits, q); sycl::free(ids, q); sycl::free(w, q);
+  }
+  {  // permute round-trip
+    const std::size_t H = 96, E = 8;
+    T* hidden = sycl::malloc_shared<T>(nt * H, q);
+    int* ids = sycl::malloc_shared<int>(nt * k, q);
+    float* w = sycl::malloc_shared<float>(nt * k, q);
+    T* permuted = sycl::malloc_shared<T>(nt * k * H, q);
+    T* out = sycl::malloc_shared<T>(nt * H, q);
+    std::int32_t* rpe = sycl::malloc_shared<std::int32_t>(E, q);
+    std::int32_t* map = sycl::malloc_shared<std::int32_t>(nt * k, q);
+    std::int32_t* cur = sycl::malloc_shared<std::int32_t>(E, q);
+    for (std::size_t i = 0; i < nt * H; ++i)
+      hidden[i] = static_cast<T>(sample(i + 5));
+    for (std::size_t i = 0; i < nt * k; ++i) {
+      ids[i] = static_cast<int>((i * 13 + 5) % (E + 1));  // some == E -> pad
+      if (ids[i] == static_cast<int>(E)) ids[i] = -1;
+      w[i] = 0.25f + 0.05f * sample(i + 9);
+    }
+    ops::moe_permute(q, hidden, ids, permuted, rpe, map, cur, nt, k, H, E, dt,
+                     Variant::sycl, true);
+    // histogram check
+    std::vector<int> ref_h(E, 0);
+    for (std::size_t i = 0; i < nt * k; ++i)
+      if (ids[i] >= 0) ++ref_h[ids[i]];
+    int hist_bad = 0;
+    for (std::size_t e = 0; e < E; ++e)
+      if (rpe[e] != ref_h[e]) ++hist_bad;
+    // gathered-row check via the map
+    int row_bad = 0;
+    for (std::size_t i = 0; i < nt * k; ++i) {
+      if (ids[i] < 0) { if (map[i] != -1) ++row_bad; continue; }
+      const std::size_t t = i / k;
+      for (std::size_t j = 0; j < H; ++j)
+        if (static_cast<float>(permuted[map[i] * H + j]) !=
+            static_cast<float>(hidden[t * H + j]))
+          ++row_bad;
+    }
+    ops::moe_unpermute_weighted_reduce(q, permuted, map, w, out, nt, k, H, dt,
+                                       Variant::sycl, true);
+    const Tol tol = tol_for(dt);
+    double worst = 0.0;
+    for (std::size_t t = 0; t < nt; ++t)
+      for (std::size_t j = 0; j < H; ++j) {
+        double acc = 0.0;
+        for (int i = 0; i < k; ++i)
+          if (ids[t * k + i] >= 0)
+            acc += static_cast<double>(w[t * k + i]) *
+                   static_cast<double>(hidden[t * H + j]);
+        const double ref = static_cast<double>(static_cast<T>(acc));
+        worst = std::max(worst,
+                         std::abs(static_cast<double>(out[t * H + j]) - ref) -
+                             (tol.atol + 4 * tol.rtol * std::abs(ref)));
+      }
+    ok = ok && hist_bad == 0 && row_bad == 0 && worst <= 0.0;
+    std::cout << "  moe_permute/unpermute dt=" << dtype_name(dt)
+              << " hist_bad=" << hist_bad << " row_bad=" << row_bad
+              << " worst=" << worst
+              << (hist_bad == 0 && row_bad == 0 && worst <= 0.0 ? "  ok" : "  FAIL")
+              << '\n';
+    sycl::free(hidden, q); sycl::free(ids, q); sycl::free(w, q);
+    sycl::free(permuted, q); sycl::free(out, q); sycl::free(rpe, q);
+    sycl::free(map, q); sycl::free(cur, q);
+  }
   return ok;
 }
 
@@ -4685,6 +4810,10 @@ int main() {
                                                          false, false, false) ? 0 : 1;
   failures += check_causal_conv1d_decode<half_t, float>(q, DType::f16, DType::f32,
                                                         true, false, true) ? 0 : 1;
+
+  // moe: router gating modes + permute/unpermute round-trip.
+  failures += check_moe_route_modes_and_permute<float>(q, DType::f32) ? 0 : 1;
+  failures += check_moe_route_modes_and_permute<bf16_t>(q, DType::bf16) ? 0 : 1;
 
   // attention/serving: LSE merge + paged gather round-trip.
   failures += check_merge_and_gather<bf16_t>(q, DType::bf16) ? 0 : 1;

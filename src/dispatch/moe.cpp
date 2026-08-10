@@ -4,18 +4,20 @@
 
 #include "moe/moe_route/moe_route_kernel.hpp"
 #include "moe/grouped_qgemm/grouped_qgemm_kernel.hpp"
+#include "moe/moe_permute/moe_permute_kernel.hpp"
 #include "moe/nvfp4_moe/nvfp4_moe_kernel.hpp"
 
 namespace quixicore::xpu::ops {
 
 void moe_route_topk(sycl::queue& q, const void* router_logits, int* expert_ids,
                     float* expert_weights, std::size_t n_tokens,
-                    std::size_t n_experts, int k, DType dt, Variant variant,
+                    std::size_t n_experts, int k, DType dt, MoeGating gating,
+                    bool renormalize, float routed_scaling, Variant variant,
                     bool blocking) {
   (void)variant;
-  sycl::event ev = kernels::moe_route_topk_sycl(q, router_logits, expert_ids,
-                                                expert_weights, n_tokens,
-                                                n_experts, k, dt);
+  sycl::event ev = kernels::moe_route_topk_sycl(
+      q, router_logits, expert_ids, expert_weights, n_tokens, n_experts, k,
+      static_cast<int>(gating), renormalize ? 1 : 0, routed_scaling, dt);
   if (blocking) ev.wait();
 }
 
@@ -110,6 +112,33 @@ void moe_grouped_qswiglu(sycl::queue& q, const void* A, const void* W,
   g.wait();  // glu launches on the same in-order-agnostic queue; serialize
   glu(q, scratch_2i, C, M_total, I, act_dt, GluMode::swiglu, Variant::sycl,
       blocking);
+}
+
+void moe_permute(sycl::queue& q, const void* hidden, const int* topk_ids,
+                 void* permuted, std::int32_t* rows_per_expert,
+                 std::int32_t* row_map, std::int32_t* cursors,
+                 std::size_t n_tokens, std::size_t top_k,
+                 std::size_t hidden_dim, std::size_t n_experts, DType dt,
+                 Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::moe_permute_sycl(q, hidden, topk_ids, permuted,
+                                             rows_per_expert, row_map, cursors,
+                                             n_tokens, top_k, hidden_dim,
+                                             n_experts, dt);
+  if (blocking) ev.wait();
+}
+
+void moe_unpermute_weighted_reduce(sycl::queue& q, const void* permuted,
+                                   const std::int32_t* row_map,
+                                   const float* topk_weights, void* out,
+                                   std::size_t n_tokens, std::size_t top_k,
+                                   std::size_t hidden_dim, DType dt,
+                                   Variant variant, bool blocking) {
+  (void)variant;  // native only
+  sycl::event ev = kernels::moe_unpermute_weighted_reduce_sycl(
+      q, permuted, row_map, topk_weights, out, n_tokens, top_k, hidden_dim,
+      dt);
+  if (blocking) ev.wait();
 }
 
 }  // namespace quixicore::xpu::ops

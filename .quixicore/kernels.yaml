@@ -570,9 +570,32 @@ operations:
     status: implemented
     path: kernels/moe/moe_route
     dtypes: [f32, f16, bf16]
+    modes: [softmax, sigmoid, softplus_sqrt]
+    note: >-
+      Gating modes with shared lowest-index-tie-break selection: softmax over
+      the selected logits (original), sigmoid scores with optional
+      renormalize + routed_scaling (the Laguna-style router), and
+      sqrt(softplus) scores. Sigmoid/softplus chains match vllm-xpu-kernels
+      topk_sigmoid / topk_softplus_sqrt (translated).
     tests: {correctness: tests/xpu_ops_smoke.cpp}
     variants:
       - {name: xpu_sycl, status: implemented, path: kernels/moe/moe_route/variants/xpu_sycl}
+  moe_permute:
+    family: moe
+    status: implemented
+    path: kernels/moe/moe_permute
+    dtypes: [f32, f16, bf16]
+    shape: expert-sorted permute (moe_route_top_k_prefix_sum_permute) + inverse
+    note: >-
+      Histogram -> exclusive prefix -> atomic-cursor scatter, all on device
+      with caller scratch (allocation-free, no host sync); -1 expert ids are
+      the EP-safe skip; feeds moe_grouped_qgemm's rows_per_expert.
+      moe_unpermute_weighted_reduce is the fp32 inverse through row_map.
+      Rows within an expert are order-free by construction. Translated from
+      remap_hidden_states + moe_gather.
+    tests: {correctness: tests/xpu_ops_smoke.cpp}
+    variants:
+      - {name: xpu_sycl, status: implemented, path: kernels/moe/moe_permute/variants/xpu_sycl}
   moe_grouped_qgemm:
     family: moe
     status: experimental

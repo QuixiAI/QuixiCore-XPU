@@ -1793,7 +1793,7 @@ int main(int argc, char** argv) {
     int* ids = sycl::malloc_device<int>(nt * kk, q);
     float* w = sycl::malloc_device<float>(nt * kk, q);
     q.memset(lg, 0, nt * ne * elem).wait();
-    const double med = time_median([&] { return kernels::moe_route_topk_sycl(q, lg, ids, w, nt, ne, kk, dt); });
+    const double med = time_median([&] { return kernels::moe_route_topk_sycl(q, lg, ids, w, nt, ne, kk, 0, 1, 1.0f, dt); });
     std::cout << "{\"schema_version\":2,\"kernel\":\"moe_route\",\"variant\":\"sycl\",\"dtype\":\""
               << dtype_name(dt) << "\",\"n_tokens\":" << nt << ",\"n_experts\":" << ne
               << ",\"k\":" << kk << ",\"iters\":" << iters << ",\"median_ms\":" << med

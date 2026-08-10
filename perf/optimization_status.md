@@ -2840,3 +2840,20 @@ paged write incl. fp8 decode-with-scales. Oracles: fp64 merge reference with
 NaN counting; scatter->gather round-trips exact (plain) / within one e4m3
 step (fp8). All green, suite PASS. Elementwise-bound ops; no standalone
 bench.
+
+## 2026-08-10: C5 MoE routing batch (gating modes + permute pipeline)
+
+moe_route_topk gains sigmoid (renormalize + routed_scaling — the router
+shape Laguna's sigmoid-routed MoE crashed on before the vLLM-side
+topk_sigmoid fix) and sqrt(softplus) gating; all modes share the
+lowest-index-tie-break selection since the scores are monotonic in the
+logit. moe_permute implements the prefix-sum permutation
+(histogram -> single-WG exclusive scan -> atomic-cursor scatter, caller
+scratch, no host reads) with -1 EP-safe skips, producing exactly the
+rows_per_expert + row_map surface moe_grouped_qgemm consumes;
+moe_unpermute_weighted_reduce is the fp32 inverse. Oracles: per-mode fp64
+weight references with exact selection match; permute validated
+functionally (histogram equality, per-row gather equality through the map,
+and unpermute equal to the direct weighted sum — row order within an expert
+is free by construction). All green, suite PASS. Elementwise/scatter-bound;
+covered by the existing moe_route bench branch.

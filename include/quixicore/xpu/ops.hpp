@@ -357,10 +357,45 @@ void hadamard(sycl::queue& q, const void* in, void* out, std::size_t rows,
 // MoE top-k routing. `router_logits` [n_tokens, n_experts] dtype dt. Selects the
 // top-k experts per token and softmax-normalizes over the selected k. Outputs
 // `expert_ids` [n_tokens, k] int32 and `expert_weights` [n_tokens, k] fp32.
+// Router gating modes: softmax over the selected logits (default),
+// sigmoid scores (Laguna-style, optionally renormalized), or
+// sqrt(softplus) scores. All are monotonic in the logit so top-k selection
+// (lowest-index tie-break) is identical; only the weights differ.
+// routed_scaling multiplies the final weights.
+enum class MoeGating { softmax, sigmoid, softplus_sqrt };
+
 void moe_route_topk(sycl::queue& q, const void* router_logits, int* expert_ids,
                     float* expert_weights, std::size_t n_tokens,
                     std::size_t n_experts, int k, DType dt,
+                    MoeGating gating = MoeGating::softmax,
+                    bool renormalize = true, float routed_scaling = 1.0f,
                     Variant variant = Variant::sycl, bool blocking = true);
+
+// Expert-sorted permutation of routed hidden rows (contract
+// moe_route_top_k_prefix_sum_permute): gathers hidden [n_tokens, H] into
+// permuted [n_valid_pairs, H] sorted by expert, fills rows_per_expert [E]
+// (the moe_grouped_qgemm segmentation input) and row_map [n_tokens*top_k]
+// (-1 for invalid expert ids — the EP-safe skip). cursors is caller scratch
+// [E] int32. Rows within one expert land in nondeterministic order; the
+// GEMM is row-symmetric and the unpermute reads through row_map, so end
+// results are order-independent. Allocation-free, no host sync.
+void moe_permute(sycl::queue& q, const void* hidden, const int* topk_ids,
+                 void* permuted, std::int32_t* rows_per_expert,
+                 std::int32_t* row_map, std::int32_t* cursors,
+                 std::size_t n_tokens, std::size_t top_k,
+                 std::size_t hidden_dim, std::size_t n_experts, DType dt,
+                 Variant variant = Variant::sycl, bool blocking = true);
+
+// Inverse weighted reduce (contract moe_unpermute_weighted_reduce):
+// out[t,:] = sum_j topk_weights[t,j] * permuted[row_map[t*top_k+j], :] in
+// fp32, skipping -1 rows.
+void moe_unpermute_weighted_reduce(sycl::queue& q, const void* permuted,
+                                   const std::int32_t* row_map,
+                                   const float* topk_weights, void* out,
+                                   std::size_t n_tokens, std::size_t top_k,
+                                   std::size_t hidden_dim, DType dt,
+                                   Variant variant = Variant::sycl,
+                                   bool blocking = true);
 
 // Grouped-GEMM weight formats (see moe_grouped_qgemm).
 enum class MoeWeightFormat {

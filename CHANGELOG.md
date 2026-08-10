@@ -36,6 +36,9 @@ All notable QuixiCore XPU changes should be recorded here.
 - turboquant: KV-cache codec encode/decode implementing the format v2 ABI
   (rotated Lloyd-Max keys or e4m3 byte keys, per-group uniform values,
   LSB-first packing), byte-identical to the host-shared codec oracle.
+- moe_route_topk gating modes (sigmoid with routed scaling, softplus_sqrt)
+  + moe_permute / moe_unpermute_weighted_reduce: the routing + permutation
+  pipeline feeding moe_grouped_qgemm, EP-safe and allocation-free.
 - merge_attn_states + kv_cache_gather_paged: the split-KV combiner (with
   the empty-partition NaN guard) and the paged gather/dequant — completing
   the paged-attention utility set.
