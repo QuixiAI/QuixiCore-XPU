@@ -10,7 +10,7 @@
       "name": "dev",
       "displayName": "Developer build",
       "generator": "Unix Makefiles",
-      "binaryDir": "${sourceDir}/build",
+      "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
@@ -20,7 +20,7 @@
       "name": "sycl",
       "displayName": "SYCL oneAPI build",
       "inherits": "dev",
-      "binaryDir": "${sourceDir}/build-sycl",
+      "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
         "CMAKE_CXX_COMPILER": "icpx",
         "QUIXICORE_XPU_ENABLE_SYCL": "ON"

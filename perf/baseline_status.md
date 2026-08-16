@@ -110,6 +110,10 @@ oneDNN/oneMKL primitive exists), each with fp64-oracle correctness and a bench.
   (shared-lib + `.sycl` source, not a version skew). Optimization pass: 52x
   categorical, 4.9x argmax, 2.8x dropout, 2.8x quantize_int4, 1.9x rope — all
   measured, correctness-gated, recorded.
+- 2026-08-15: Moved CMake preset trees to `build/<preset>` per the umbrella's
+  build conventions (`build-sycl/` and top-level `build-sycl-shared/` retired;
+  bindings now build to `build/sycl-shared`). Existing trees on the B60 bench
+  host must be reconfigured.
 
 ## Superseded (historical)
 

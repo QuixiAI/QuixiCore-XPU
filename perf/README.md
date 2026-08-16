@@ -20,7 +20,7 @@ source /opt/intel/oneapi/setvars.sh
 
 # one-off A/B during an optimization pass:
 cmake --build --preset sycl --target quixicore_xpu_bench
-./build-sycl/quixicore_xpu_bench --kernel rms_norm --dtype bf16 \
+./build/sycl/quixicore_xpu_bench --kernel rms_norm --dtype bf16 \
     --rows 8192 --dim 8192 --variant best --iters 50 --warmup 15
 
 # tracked, logged sweep over the configured kernels:

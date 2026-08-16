@@ -129,8 +129,8 @@ def compiler_version(exe: str) -> str | None:
 
 def binary_dir_for_preset(preset: str) -> Path:
     if preset == "sycl":
-        return REPO_ROOT / "build-sycl"
-    return REPO_ROOT / "build"
+        return REPO_ROOT / "build" / "sycl"
+    return REPO_ROOT / "build" / preset
 
 
 def run_command(name: str, cmd: list[str], out_dir: Path, timeout: int) -> dict:

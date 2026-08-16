@@ -14,7 +14,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-BUILD="$REPO/build-sycl-shared"
+BUILD="$REPO/build/sycl-shared"
 PYTHON="${PYTHON:-$REPO/.venv/bin/python}"
 
 if [[ ! -x "$PYTHON" ]]; then

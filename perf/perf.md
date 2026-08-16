@@ -33,7 +33,10 @@ hardware, by dtype, and by shape. Things that turned out false when measured:
 - *"rope is transcendental-bound."* Substantially **integer div/mod-bound** from
   decomposing a flat id; a 3D `nd_range` beat `pow→exp2` + `sincos` combined.
 - *"these quant formats are NVIDIA/CPU-only"* (mxfp4/nvfp4/fp8/GGUF k+i-quants).
-  False — they are data encodings; all decode natively on Intel.
+  False — they are data encodings; all decode natively on Intel. A format may
+  be marked `unsupported` in `.quixicore/quant-formats.yaml` only after an
+  actual on-B60 attempt shows a concrete blocker, never on inherited
+  assumption.
 - *"fp8 is not accelerated on B60"* — our own 2026-07-06 verdict, mostly false
   once each regime was measured with the right tool: e5m2 GEMM hits 85 TFLOP/s
   (95% of XMX peak) via `fpmath_mode::f16` up-convert + primitive caching, and
@@ -74,10 +77,13 @@ One-off A/B (the common case during an optimization pass):
 ```bash
 source /opt/intel/oneapi/setvars.sh
 cmake --build --preset sycl --target quixicore_xpu_bench
-./build-sycl/quixicore_xpu_bench --kernel argmax --dtype bf16 \
+./build/sycl/quixicore_xpu_bench --kernel argmax --dtype bf16 \
     --rows 8192 --dim 8192 --iters 50 --warmup 15
 # -> one JSON line: {"kernel":...,"variant":...,"median_ms":...,"gbps":...,"device":...}
 ```
+
+Paths in notebook entries logged before 2026-08 used the retired top-level
+`build-sycl/` tree; presets now place it at `build/sycl/`.
 
 `--variant {sycl,vendor,best}` selects the implementation; elementwise kernels
 take `--n`, row/quant kernels `--rows/--dim`, GEMM `--M/--N/--K`, GGUF
@@ -142,7 +148,7 @@ fused, and split variants before selecting a profile target.
 source /opt/intel/oneapi/setvars.sh
 cmake --build --preset sycl --target quixicore_xpu_bench
 
-./build-sycl/quixicore_xpu_bench \
+./build/sycl/quixicore_xpu_bench \
     --kernel nvfp4_moe --variant sycl --dtype bf16 --approx split \
     --M 4 --N 256 --K 2048 --rows 8 --dim 512 \
     --device 0 --warmup 15 --iters 50
@@ -172,7 +178,7 @@ vtune -collect xpu-offload \
     -knob collect-programming-api=true \
     -knob enable-tasks-stack-collection=true \
     -result-dir "$TRACE" -- \
-    ./build-sycl/quixicore_xpu_bench \
+    ./build/sycl/quixicore_xpu_bench \
         --kernel nvfp4_moe --variant sycl --dtype bf16 --approx split \
         --M 4 --N 256 --K 2048 --rows 8 --dim 512 \
         --device 0 --warmup 3 --iters 10
@@ -207,7 +213,7 @@ vtune -collect gpu-hotspots \
     -knob gpu-profiling-mode=characterization \
     -knob characterization-mode=overview \
     -result-dir "$HOT" -- \
-    ./build-sycl/quixicore_xpu_bench \
+    ./build/sycl/quixicore_xpu_bench \
         --kernel nvfp4_moe --variant sycl --dtype bf16 --approx split \
         --M 4 --N 256 --K 2048 --rows 8 --dim 512 \
         --device 0 --warmup 3 --iters 10
