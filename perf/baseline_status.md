@@ -4,6 +4,11 @@ Method and measurement policy are in `perf/perf.md`. The running experiment log
 is `perf/optimization_status.md`. Raw per-run JSON lives under `perf/results/`
 (git-ignored).
 
+Distilled companions: `perf/findings.md` holds the established findings
+(wins, rejections, and generalized rules — do not re-derive them), and
+`perf/backlog.md` holds the active optimization beam. Start there before
+reading the full notebook.
+
 ## Environment
 
 Date: 2026-07-07.
@@ -105,3 +110,7 @@ oneDNN/oneMKL primitive exists), each with fp64-oracle correctness and a bench.
   (shared-lib + `.sycl` source, not a version skew). Optimization pass: 52x
   categorical, 4.9x argmax, 2.8x dropout, 2.8x quantize_int4, 1.9x rope — all
   measured, correctness-gated, recorded.
+
+## Superseded (historical)
+
+Nothing superseded yet.

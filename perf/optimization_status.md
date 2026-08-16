@@ -59,28 +59,28 @@ re-reading their evidence, never by guessing.
 | 2026-07-07 | quantization — act_quant (w8a8 activation quant) + all formats done | UNLABELED | 536 |
 | 2026-07-07 | Track B quant depth — GGUF q6_K k-quant | UNLABELED | 552 |
 | 2026-07-07 | Track B depth begins — attention + sampling suite | UNLABELED | 620 |
-| 2026-07-07 | Optimization pass — profiled all kernels, fixed the biggest gaps | UNLABELED | 717 |
-| 2026-07-07 | Optimization pass #2 — 4-bit quant-GEMV decode (truism busted) | UNLABELED | 747 |
-| 2026-07-08 | quantization/fp8_gemm — "fp8 is not accelerated on B60" mostly busted | LANDED | 770 |
-| 2026-07-08 | quantization/nvfp4_gemv pass #3 — bit-relocation decode, 1.92x | LANDED | 819 |
-| 2026-07-08 | vLLM integration — native NVFP4 MoE + fp8 W8A16 GEMV (Qwen3.6-35B-A3B-NVFP4, 1x B60) | LANDED | 845 |
-| 2026-07-09 | Deep dive — path to 60 tok/s (launch-reduction levers, Qwen3.6-35B-A3B-NVFP4, 1x B60) | UNLABELED | 943 |
-| 2026-07-09 | Path-to-60-tok/s deep dive — the wall is launch overhead, not kernels | KEPT | 1013 |
-| 2026-07-09 | vLLM full XPU graph + split NVFP4 MoE reaches 68 tok/s | UNLABELED | 1266 |
-| 2026-07-09 | dual-B60 TP2, FP8 KV cache, 128k context | UNLABELED | 1296 |
-| 2026-07-09 | segmented XPU Graph enables TP2 decode | UNLABELED | 1317 |
-| 2026-07-10 | Port Qwen serving kernels back into QuixiCore-XPU | UNLABELED | 1350 |
-| 2026-07-10 | Qwen GDN state-slot contract synchronization | CANDIDATE | 1433 |
-| 2026-07-10 | NVFP4 split-MoE output-row tiling | UNLABELED | 1477 |
-| 2026-07-11 | NVFP4 MoE paired gate/up decode | REJECTED | 1592 |
-| 2026-07-11 | NVFP4 MoE packed-dot vector loads | REJECTED | 1690 |
-| 2026-07-22 | attention_f16ctx (fused f16 context store) | KEPT | 1772 |
-| 2026-07-22 | pool_mean_rms_l2 (sentence-embedding pooling head) | KEPT | 1833 |
-| 2026-07-22 | rms_residual_next (fused residual-add + double RMSNorm -> f16) | KEPT | 1908 |
-| 2026-07-22 | qk_norm_rope (fused per-head QK-norm + query-scale + RoPE) | KEPT | 1985 |
-| 2026-07-22 | glu_gelu_f16 (GEGLU with fused f16 output) | KEPT | 2062 |
-| 2026-07-22 | attn_swa (symmetric sliding-window attention) | KEPT | 2130 |
-| 2026-07-22 | w4a16_gemm (int4-weight x f16/bf16-activation DPAS GEMM) | KEPT | 2224 |
+| 2026-07-07 | Optimization pass — profiled all kernels, fixed the biggest gaps | UNLABELED | 719 |
+| 2026-07-07 | Optimization pass #2 — 4-bit quant-GEMV decode (truism busted) | UNLABELED | 749 |
+| 2026-07-08 | quantization/fp8_gemm — "fp8 is not accelerated on B60" mostly busted | LANDED | 772 |
+| 2026-07-08 | quantization/nvfp4_gemv pass #3 — bit-relocation decode, 1.92x | LANDED | 821 |
+| 2026-07-08 | vLLM integration — native NVFP4 MoE + fp8 W8A16 GEMV (Qwen3.6-35B-A3B-NVFP4, 1x B60) | LANDED | 847 |
+| 2026-07-09 | Deep dive — path to 60 tok/s (launch-reduction levers, Qwen3.6-35B-A3B-NVFP4, 1x B60) | UNLABELED | 945 |
+| 2026-07-09 | Path-to-60-tok/s deep dive — the wall is launch overhead, not kernels | KEPT | 1017 |
+| 2026-07-09 | vLLM full XPU graph + split NVFP4 MoE reaches 68 tok/s | UNLABELED | 1270 |
+| 2026-07-09 | dual-B60 TP2, FP8 KV cache, 128k context | UNLABELED | 1300 |
+| 2026-07-09 | segmented XPU Graph enables TP2 decode | UNLABELED | 1321 |
+| 2026-07-10 | Port Qwen serving kernels back into QuixiCore-XPU | UNLABELED | 1354 |
+| 2026-07-10 | Qwen GDN state-slot contract synchronization | CANDIDATE | 1437 |
+| 2026-07-10 | NVFP4 split-MoE output-row tiling | UNLABELED | 1481 |
+| 2026-07-11 | NVFP4 MoE paired gate/up decode | REJECTED | 1596 |
+| 2026-07-11 | NVFP4 MoE packed-dot vector loads | REJECTED | 1694 |
+| 2026-07-22 | attention_f16ctx (fused f16 context store) | KEPT | 1776 |
+| 2026-07-22 | pool_mean_rms_l2 (sentence-embedding pooling head) | KEPT | 1837 |
+| 2026-07-22 | rms_residual_next (fused residual-add + double RMSNorm -> f16) | KEPT | 1912 |
+| 2026-07-22 | qk_norm_rope (fused per-head QK-norm + query-scale + RoPE) | KEPT | 1989 |
+| 2026-07-22 | glu_gelu_f16 (GEGLU with fused f16 output) | KEPT | 2066 |
+| 2026-07-22 | attn_swa (symmetric sliding-window attention) | KEPT | 2134 |
+| 2026-07-22 | w4a16_gemm (int4-weight x f16/bf16-activation DPAS GEMM) | KEPT | 2228 |
 <!-- qx:index:end -->
 
 ## 2026-07-05: Initial Scaffold — LANDED
@@ -714,6 +714,8 @@ Open questions:
 - Which framework baseline should be primary for XPU comparisons: oneDNN,
   PyTorch XPU, IPEX, Triton XPU, or a mix?
 
+> Superseded as a queue by perf/backlog.md (2026-08-15); kept as history.
+
 ## 2026-07-07: Optimization pass — profiled all kernels, fixed the biggest gaps — UNLABELED
 
 Ran a full bench sweep vs the ~456 GB/s B60 roofline. Most elementwise/row
@@ -1009,6 +1011,8 @@ zero. Rejected as a direction.
 
 Raw: baseline bench 18.69/18.74/18.75 tok/s. Crash logs in
 scratchpad/vllm_graph.log, vllm_graph_stock.log, vllm_inductor.log.
+
+> Superseded as a queue by perf/backlog.md (2026-08-15); kept as history.
 
 ## 2026-07-09: Path-to-60-tok/s deep dive — the wall is launch overhead, not kernels — KEPT
 
