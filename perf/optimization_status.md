@@ -40,47 +40,70 @@ re-reading their evidence, never by guessing.
 
 | date | entry | verdict | line |
 |---|---|---|---:|
-| 2026-07-05 | Initial Scaffold | LANDED | 86 |
-| 2026-07-06 | GELU reference kernel (activations/gelu) — SYCL + oneDNN | KEPT | 117 |
-| 2026-07-06 | norms (rms_norm, layernorm) — SYCL + oneDNN, three truisms smashed | LANDED | 178 |
-| 2026-07-06 | softmax (activations/softmax) — SYCL + oneDNN | LANDED | 231 |
-| 2026-07-06 | 16-byte vector-load pass — bf16/f16 row kernels ~2x, one truism smashed and one own-conclusion reversed | LANDED | 258 |
-| 2026-07-06 | activations breadth — silu, gelu_backward, glu (feature-matrix pass) | KEPT | 303 |
-| 2026-07-06 | matmul/dense_gemm — native SYCL tile + oneDNN (XMX), family opened | LANDED | 329 |
-| 2026-07-06 | three more families — rope (attention), adamw (optimizers), argmax (sampling) | LANDED | 348 |
-| 2026-07-06 | quantization/qgemv int4 — Marlin/Metal-guided dequant GEMV opens the family | LANDED | 362 |
-| 2026-07-06 | quantization/qgemm int8 w8a8 — oneDNN XMX hits 182 TOPS | LANDED | 392 |
-| 2026-07-06 | quantization/fp8_gemm (e4m3, e5m2) — works natively, not yet fast on B60 | KEPT | 421 |
-| 2026-07-07 | quantization/mxfp4_gemv — OCP microscaling FP4 decodes natively on Intel | LANDED | 443 |
-| 2026-07-07 | quantization/nvfp4_gemv — NVIDIA FP4 decodes natively on Intel too | LANDED | 464 |
-| 2026-07-07 | quantization/gguf_gemv — llama.cpp q8_0/q4_0 decode natively on Intel | LANDED | 488 |
-| 2026-07-07 | FULL-MATRIX push begins (breadth-first). serving family opened | UNLABELED | 507 |
-| 2026-07-07 | Track C — PyTorch-XPU binding works end-to-end (validated vs torch.xpu) | UNLABELED | 519 |
-| 2026-07-07 | quantization — act_quant (w8a8 activation quant) + all formats done | UNLABELED | 536 |
-| 2026-07-07 | Track B quant depth — GGUF q6_K k-quant | UNLABELED | 552 |
-| 2026-07-07 | Track B depth begins — attention + sampling suite | UNLABELED | 620 |
-| 2026-07-07 | Optimization pass — profiled all kernels, fixed the biggest gaps | UNLABELED | 719 |
-| 2026-07-07 | Optimization pass #2 — 4-bit quant-GEMV decode (truism busted) | UNLABELED | 749 |
-| 2026-07-08 | quantization/fp8_gemm — "fp8 is not accelerated on B60" mostly busted | LANDED | 772 |
-| 2026-07-08 | quantization/nvfp4_gemv pass #3 — bit-relocation decode, 1.92x | LANDED | 821 |
-| 2026-07-08 | vLLM integration — native NVFP4 MoE + fp8 W8A16 GEMV (Qwen3.6-35B-A3B-NVFP4, 1x B60) | LANDED | 847 |
-| 2026-07-09 | Deep dive — path to 60 tok/s (launch-reduction levers, Qwen3.6-35B-A3B-NVFP4, 1x B60) | UNLABELED | 945 |
-| 2026-07-09 | Path-to-60-tok/s deep dive — the wall is launch overhead, not kernels | KEPT | 1017 |
-| 2026-07-09 | vLLM full XPU graph + split NVFP4 MoE reaches 68 tok/s | UNLABELED | 1270 |
-| 2026-07-09 | dual-B60 TP2, FP8 KV cache, 128k context | UNLABELED | 1300 |
-| 2026-07-09 | segmented XPU Graph enables TP2 decode | UNLABELED | 1321 |
-| 2026-07-10 | Port Qwen serving kernels back into QuixiCore-XPU | UNLABELED | 1354 |
-| 2026-07-10 | Qwen GDN state-slot contract synchronization | CANDIDATE | 1437 |
-| 2026-07-10 | NVFP4 split-MoE output-row tiling | UNLABELED | 1481 |
-| 2026-07-11 | NVFP4 MoE paired gate/up decode | REJECTED | 1596 |
-| 2026-07-11 | NVFP4 MoE packed-dot vector loads | REJECTED | 1694 |
-| 2026-07-22 | attention_f16ctx (fused f16 context store) | KEPT | 1776 |
-| 2026-07-22 | pool_mean_rms_l2 (sentence-embedding pooling head) | KEPT | 1837 |
-| 2026-07-22 | rms_residual_next (fused residual-add + double RMSNorm -> f16) | KEPT | 1912 |
-| 2026-07-22 | qk_norm_rope (fused per-head QK-norm + query-scale + RoPE) | KEPT | 1989 |
-| 2026-07-22 | glu_gelu_f16 (GEGLU with fused f16 output) | KEPT | 2066 |
-| 2026-07-22 | attn_swa (symmetric sliding-window attention) | KEPT | 2134 |
-| 2026-07-22 | w4a16_gemm (int4-weight x f16/bf16-activation DPAS GEMM) | KEPT | 2228 |
+| 2026-07-05 | Initial Scaffold | LANDED | 109 |
+| 2026-07-06 | GELU reference kernel (activations/gelu) — SYCL + oneDNN | KEPT | 140 |
+| 2026-07-06 | norms (rms_norm, layernorm) — SYCL + oneDNN, three truisms smashed | LANDED | 201 |
+| 2026-07-06 | softmax (activations/softmax) — SYCL + oneDNN | LANDED | 254 |
+| 2026-07-06 | 16-byte vector-load pass — bf16/f16 row kernels ~2x, one truism smashed and one own-conclusion reversed | LANDED | 281 |
+| 2026-07-06 | activations breadth — silu, gelu_backward, glu (feature-matrix pass) | KEPT | 326 |
+| 2026-07-06 | matmul/dense_gemm — native SYCL tile + oneDNN (XMX), family opened | LANDED | 352 |
+| 2026-07-06 | three more families — rope (attention), adamw (optimizers), argmax (sampling) | LANDED | 371 |
+| 2026-07-06 | quantization/qgemv int4 — Marlin/Metal-guided dequant GEMV opens the family | LANDED | 385 |
+| 2026-07-06 | quantization/qgemm int8 w8a8 — oneDNN XMX hits 182 TOPS | LANDED | 415 |
+| 2026-07-06 | quantization/fp8_gemm (e4m3, e5m2) — works natively, not yet fast on B60 | KEPT | 444 |
+| 2026-07-07 | quantization/mxfp4_gemv — OCP microscaling FP4 decodes natively on Intel | LANDED | 466 |
+| 2026-07-07 | quantization/nvfp4_gemv — NVIDIA FP4 decodes natively on Intel too | LANDED | 487 |
+| 2026-07-07 | quantization/gguf_gemv — llama.cpp q8_0/q4_0 decode natively on Intel | LANDED | 511 |
+| 2026-07-07 | FULL-MATRIX push begins (breadth-first). serving family opened | UNLABELED | 530 |
+| 2026-07-07 | Track C — PyTorch-XPU binding works end-to-end (validated vs torch.xpu) | UNLABELED | 542 |
+| 2026-07-07 | quantization — act_quant (w8a8 activation quant) + all formats done | UNLABELED | 559 |
+| 2026-07-07 | Track B quant depth — GGUF q6_K k-quant | UNLABELED | 575 |
+| 2026-07-07 | Track B depth begins — attention + sampling suite | UNLABELED | 643 |
+| 2026-07-07 | Optimization pass — profiled all kernels, fixed the biggest gaps | UNLABELED | 742 |
+| 2026-07-07 | Optimization pass #2 — 4-bit quant-GEMV decode (truism busted) | UNLABELED | 772 |
+| 2026-07-08 | quantization/fp8_gemm — "fp8 is not accelerated on B60" mostly busted | LANDED | 795 |
+| 2026-07-08 | quantization/nvfp4_gemv pass #3 — bit-relocation decode, 1.92x | LANDED | 844 |
+| 2026-07-08 | vLLM integration — native NVFP4 MoE + fp8 W8A16 GEMV (Qwen3.6-35B-A3B-NVFP4, 1x B60) | LANDED | 870 |
+| 2026-07-09 | Deep dive — path to 60 tok/s (launch-reduction levers, Qwen3.6-35B-A3B-NVFP4, 1x B60) | UNLABELED | 968 |
+| 2026-07-09 | Path-to-60-tok/s deep dive — the wall is launch overhead, not kernels | KEPT | 1040 |
+| 2026-07-09 | vLLM full XPU graph + split NVFP4 MoE reaches 68 tok/s | UNLABELED | 1293 |
+| 2026-07-09 | dual-B60 TP2, FP8 KV cache, 128k context | UNLABELED | 1323 |
+| 2026-07-09 | segmented XPU Graph enables TP2 decode | UNLABELED | 1344 |
+| 2026-07-10 | Port Qwen serving kernels back into QuixiCore-XPU | UNLABELED | 1377 |
+| 2026-07-10 | Qwen GDN state-slot contract synchronization | CANDIDATE | 1460 |
+| 2026-07-10 | NVFP4 split-MoE output-row tiling | UNLABELED | 1504 |
+| 2026-07-11 | NVFP4 MoE paired gate/up decode | REJECTED | 1619 |
+| 2026-07-11 | NVFP4 MoE packed-dot vector loads | REJECTED | 1717 |
+| 2026-07-22 | attention_f16ctx (fused f16 context store) | KEPT | 1799 |
+| 2026-07-22 | pool_mean_rms_l2 (sentence-embedding pooling head) | KEPT | 1860 |
+| 2026-07-22 | rms_residual_next (fused residual-add + double RMSNorm -> f16) | KEPT | 1935 |
+| 2026-07-22 | qk_norm_rope (fused per-head QK-norm + query-scale + RoPE) | KEPT | 2012 |
+| 2026-07-22 | glu_gelu_f16 (GEGLU with fused f16 output) | KEPT | 2089 |
+| 2026-07-22 | attn_swa (symmetric sliding-window attention) | KEPT | 2157 |
+| 2026-07-22 | w4a16_gemm (int4-weight x f16/bf16-activation DPAS GEMM) | KEPT | 2251 |
+| 2026-08-09 | Port Mamba-2 SSD decode (ssd_decode) from the vLLM XPU serving work | UNLABELED | 2347 |
+| 2026-08-09 | Port causal_conv1d_decode from the vLLM XPU serving work | UNLABELED | 2392 |
+| 2026-08-09 | Port ssd_prefill (varlen Mamba-2 SSD prefill scan) from the vLLM XPU serving work | KEPT | 2428 |
+| 2026-08-09 | Port causal_conv1d_prefill from the vLLM XPU serving work | UNLABELED | 2472 |
+| 2026-08-09 | Port nvfp4_moe_relu2 (NemotronH ungated ReLU² experts) from the vLLM XPU serving work | UNLABELED | 2513 |
+| 2026-08-09 | Production P2P all-reduce (all_reduce) — capturable one-shot/two-shot | KEPT | 2550 |
+| 2026-08-09 | TurboQuant KV-cache codec (turboquant) — SYCL implementation of the declared ABI | UNLABELED | 2617 |
+| 2026-08-09 | Add group_rms_norm_gated (Mamba-2 mixer norm) | UNLABELED | 2672 |
+| 2026-08-09 | Add norm_quant (fused RMSNorm + fp8/mxfp4 activation quant) | UNLABELED | 2713 |
+| 2026-08-09 | Add glu_quant (fused SwiGLU + fp8/mxfp4 quant) | UNLABELED | 2740 |
+| 2026-08-09 | mqa_logits (fp8 MQA indexer logits) — first native joint_matrix rewrite consumer | UNLABELED | 2751 |
+| 2026-08-09 | Native paged attention (decode split-KV + varlen prefill) — the big contract gap | KEPT | 2780 |
+| 2026-08-09 | moe_grouped_qgemm — segmented grouped GEMM on the xmx block (honest baseline) | KEPT | 2832 |
+| 2026-08-09 | gated_delta_rule_varlen + gdn_l2norm_qk (general GDN) | UNLABELED | 2866 |
+| 2026-08-09 | kv_cache_scatter_paged — the paged-attention write side | UNLABELED | 2892 |
+| 2026-08-10 | mrope + rotary_positioned (C3 wave opens) | UNLABELED | 2905 |
+| 2026-08-10 | merge_attn_states + kv_cache_gather_paged (C4) | UNLABELED | 2916 |
+| 2026-08-10 | C5 MoE routing batch (gating modes + permute pipeline) | UNLABELED | 2927 |
+| 2026-08-10 | top_k_renorm + top_p_renorm (C6) | UNLABELED | 2944 |
+| 2026-08-10 | lora_apply (C7) + the DeepSeek-family deferral ledger | UNLABELED | 2956 |
+| 2026-08-10 | Wave D — dsv4_hc_post landed; pre/comb deferred (ledger) | UNLABELED | 2975 |
+| 2026-08-10 | Wave E — oneDNN int4/fp4/w8a8 vendor variants: probed, blocked, deferred (ledger) | UNLABELED | 2987 |
+| 2026-08-10 | PORT CAMPAIGN CLOSE-OUT | UNLABELED | 3006 |
 <!-- qx:index:end -->
 
 ## 2026-07-05: Initial Scaffold — LANDED
@@ -2321,7 +2344,7 @@ Raw results: interleaved best-of-7 min_ms above; feasibility probe
 /tmp/jm_probe.cpp (bf16 joint_matrix worst_abs=0); machine-specific JSON not
 archived (git-ignored perf/results/).
 
-## 2026-08-09: Port Mamba-2 SSD decode (ssd_decode) from the vLLM XPU serving work
+## 2026-08-09: Port Mamba-2 SSD decode (ssd_decode) from the vLLM XPU serving work — UNLABELED
 
 Provenance: adapted from the QuixiAI MIT decode kernel set
 (`vllm-xpu-kernels csrc/xpu/sycl/decode/mamba2_ssd_decode_kernel.hpp`, commit
@@ -2366,7 +2389,7 @@ later ssm throughput pass: vectorized state row loads (sycl::vec on s3==1 fast
 path), multiple heads per work-group at small batch, and subgroup-cooperative
 dstate tiling. Raw JSON not archived (git-ignored perf/results/).
 
-## 2026-08-09: Port causal_conv1d_decode from the vLLM XPU serving work
+## 2026-08-09: Port causal_conv1d_decode from the vLLM XPU serving work — UNLABELED
 
 Provenance: adapted from the QuixiAI MIT decode kernel set
 (`vllm-xpu-kernels csrc/xpu/sycl/decode/mamba2_conv1d_decode_kernel.hpp`,
@@ -2402,7 +2425,7 @@ At batch 96 the kernel moves ~13.8 MB in 45.5 us — ~66% of the ~456 GB/s
 roofline; adequate for a kernel this small (it is ~1.6% of the ssd_decode step
 cost at the same batch). Decision: **keep** — port baseline, correctness-first.
 
-## 2026-08-09: Port ssd_prefill (varlen Mamba-2 SSD prefill scan) from the vLLM XPU serving work
+## 2026-08-09: Port ssd_prefill (varlen Mamba-2 SSD prefill scan) from the vLLM XPU serving work — KEPT
 
 Provenance: adapted from the QuixiAI MIT decode kernel set
 (`vllm-xpu-kernels csrc/xpu/sycl/decode/mamba2_ssd_prefill_kernel.hpp`, commit
@@ -2446,7 +2469,7 @@ chunked parallel-scan variant (ssd_torch._prefill_chunked tiling) must beat.
 Decision: **keep** — port baseline, correctness-first; chunked variant is the
 follow-up throughput lever with a cross-variant equality gate.
 
-## 2026-08-09: Port causal_conv1d_prefill from the vLLM XPU serving work
+## 2026-08-09: Port causal_conv1d_prefill from the vLLM XPU serving work — UNLABELED
 
 Provenance: adapted from the QuixiAI MIT decode kernel set
 (`vllm-xpu-kernels csrc/xpu/sycl/decode/mamba2_conv1d_prefill_kernel.hpp`,
@@ -2487,7 +2510,7 @@ consecutive lanes walk consecutive tokens within a channel row is the obvious
 lever for a later ssm throughput pass. Decision: **keep** — port baseline,
 correctness-first.
 
-## 2026-08-09: Port nvfp4_moe_relu2 (NemotronH ungated ReLU² experts) from the vLLM XPU serving work
+## 2026-08-09: Port nvfp4_moe_relu2 (NemotronH ungated ReLU² experts) from the vLLM XPU serving work — UNLABELED
 
 Provenance: ported back from the vLLM XPU serving prototype
 (`vllm-xpu-kernels csrc/xpu/sycl/decode/nvfp4_moe_kernel.hpp` relu2 section,
@@ -2524,7 +2547,7 @@ guidance mirrors nvfp4_moe: split for decode/graph-replay, fused only once
 M*top_k fills the device. Decision: **keep** both as co-equal experimental
 variants under the nvfp4_moe manifest entry.
 
-## 2026-08-09: Production P2P all-reduce (all_reduce) — capturable one-shot/two-shot
+## 2026-08-09: Production P2P all-reduce (all_reduce) — capturable one-shot/two-shot — KEPT
 
 Provenance: the algorithm semantics come from the vLLM XPU serving collective
 (`vllm-xpu-kernels csrc/xpu/sycl/p2p_all_reduce.cpp`, commit dffcab7,
@@ -2591,7 +2614,7 @@ socketpair, two processes on two B60s, fd exchange, `ops::all_reduce`, both
 ranks verify the fixed-order reference bitwise. Verified on this box:
 `quixicore_xpu_p2p_all_reduce_mp` -> both ranks bitwise OK, PASS.
 
-## 2026-08-09: TurboQuant KV-cache codec (turboquant) — SYCL implementation of the declared ABI
+## 2026-08-09: TurboQuant KV-cache codec (turboquant) — SYCL implementation of the declared ABI — UNLABELED
 
 Completes the ABI declared at 53a9f87 (kernels/quantization/turboquant/
 turboquant_kernel.hpp) against QuixiCore specs/formats/turboquant.md (format
@@ -2646,7 +2669,7 @@ a subgroup-cooperative variant is the obvious throughput lever if KV codec
 time ever matters. Decision: **keep** — correctness-first implementation of
 the declared codec ABI; quant-formats.yaml turboquant is now `implemented`.
 
-## 2026-08-09: Add group_rms_norm_gated (Mamba-2 mixer norm)
+## 2026-08-09: Add group_rms_norm_gated (Mamba-2 mixer norm) — UNLABELED
 
 The gated group-RMSNorm that runs EAGER TORCH on XPU in vLLM today
 (Mixer2RMSNormGated.forward_native — the Triton rms_norm_gated is never
@@ -2687,7 +2710,7 @@ and intermediate chunk states need caller scratch
 on a >=3% median win over xpu_sycl_seq at NemotronH prefill shapes with a
 cross-variant equality test (rel ~1e-4 f32; different summation order).
 
-## 2026-08-09: Add norm_quant (fused RMSNorm + fp8/mxfp4 activation quant)
+## 2026-08-09: Add norm_quant (fused RMSNorm + fp8/mxfp4 activation quant) — UNLABELED
 
 Chains translated from vllm-xpu-kernels csrc/layernorm_quant.cpp and
 csrc/quantization/fp4/mxfp4_quant.h (Apache; read, not imported). One
@@ -2714,7 +2737,7 @@ vectorized; the gap is scalar loads + the extra absmax pass). Decision:
 pass. Per-block fp8 (DeepSeek 128-group) deliberately deferred: planned in
 the manifest, needs its own layout decision.
 
-## 2026-08-09: Add glu_quant (fused SwiGLU + fp8/mxfp4 quant)
+## 2026-08-09: Add glu_quant (fused SwiGLU + fp8/mxfp4 quant) — UNLABELED
 
 Companion to norm_quant, sharing its scale rules and integer-exact encoders;
 chains translated from vllm-xpu-kernels fused_silu_mul_{block,mxfp4}_quant.
@@ -2725,7 +2748,7 @@ suite PASS. Measurement (B60; --rows 4096 --dim 4096, bf16): group_fp8
 0.444 ms, mxfp4 0.580 ms. Decision: **keep** (correctness-first; shares the
 future norms/activations vectorization pass).
 
-## 2026-08-09: mqa_logits (fp8 MQA indexer logits) — first native joint_matrix rewrite consumer
+## 2026-08-09: mqa_logits (fp8 MQA indexer logits) — first native joint_matrix rewrite consumer — UNLABELED
 
 Semantics from vllm-xpu-kernels csrc/xpu/mqa_logits (Apache, cutlass DPAS;
 translated to raw joint_matrix — the cutlass source also converts e4m3 to
@@ -2754,7 +2777,7 @@ the shared infra). Throughput pass scheduled with the paged-attention work,
 which shares every lever. The paged variant (block_tables) follows with that
 same work.
 
-## 2026-08-09: Native paged attention (decode split-KV + varlen prefill) — the big contract gap
+## 2026-08-09: Native paged attention (decode split-KV + varlen prefill) — the big contract gap — KEPT
 
 Semantics from vllm-xpu-kernels csrc/xpu/attn/xe_2 chunk_prefill +
 paged_decode (Apache, cutlass-sycl; translated to pure SYCL — house policy
@@ -2806,7 +2829,7 @@ Decision: **keep, experimental** — the contract's biggest gap is closed
 correctness-first with an honest perf ledger; the throughput pass is the
 attention depth wave.
 
-## 2026-08-09: moe_grouped_qgemm — segmented grouped GEMM on the xmx block (honest baseline)
+## 2026-08-09: moe_grouped_qgemm — segmented grouped GEMM on the xmx block (honest baseline) — KEPT
 
 Semantics from the vllm-xpu-kernels cutlass grouped GEMM including its local
 NVFP4 graft (Apache; translated): expert-sorted rows + device
@@ -2840,7 +2863,7 @@ moe_grouped_qswiglu contract stubs with exact NVFP4 semantics; the GEMV
 split remains the production route until the throughput pass (which gates
 the fused swiglu + fp8/mxfp4 formats).
 
-## 2026-08-09: gated_delta_rule_varlen + gdn_l2norm_qk (general GDN)
+## 2026-08-09: gated_delta_rule_varlen + gdn_l2norm_qk (general GDN) — UNLABELED
 
 Port decision per plan: the GENERAL pure-SYCL kernel from
 vllm-xpu-kernels csrc/xpu/gdn_attn/gated_delta_rule.hpp (Apache; translated
@@ -2866,7 +2889,7 @@ prefill batches parallelize fully across (seq, head). Decision: **keep** —
 coverage + real speedup; the chunked variant owns the single-sequence
 occupancy problem.
 
-## 2026-08-09: kv_cache_scatter_paged — the paged-attention write side
+## 2026-08-09: kv_cache_scatter_paged — the paged-attention write side — UNLABELED
 
 vLLM reshape_and_cache_flash semantics (Apache; translated): flat int64
 slot_mapping into the same [n_pages, page_size, heads, d] layout the new
@@ -2879,7 +2902,7 @@ scatter; covered by the serving family traffic numbers). With this, the
 paged KV story is closed end-to-end: write (this op), decode
 (paged_attention_decode), prefill (paged_attention_prefill).
 
-## 2026-08-10: mrope + rotary_positioned (C3 wave opens)
+## 2026-08-10: mrope + rotary_positioned (C3 wave opens) — UNLABELED
 
 Translated from vllm-xpu-kernels multimodal_rope.cpp (Apache): per-section
 position axes select the cos/sin row per rotary pair; rotary_positioned is
@@ -2890,7 +2913,7 @@ Correctness-first per-(token, head, pair) geometry; elementwise-bound, no
 standalone bench beyond the suite (RoPE-class ops are covered by the row
 kernels' vectorization pass when it lands).
 
-## 2026-08-10: merge_attn_states + kv_cache_gather_paged (C4)
+## 2026-08-10: merge_attn_states + kv_cache_gather_paged (C4) — UNLABELED
 
 merge_attn_states: the standard LSE-weighted two-way combiner (max-shifted
 exp weights, log-sum output), translated from vllm-xpu-kernels — with the
@@ -2901,7 +2924,7 @@ NaN counting; scatter->gather round-trips exact (plain) / within one e4m3
 step (fp8). All green, suite PASS. Elementwise-bound ops; no standalone
 bench.
 
-## 2026-08-10: C5 MoE routing batch (gating modes + permute pipeline)
+## 2026-08-10: C5 MoE routing batch (gating modes + permute pipeline) — UNLABELED
 
 moe_route_topk gains sigmoid (renormalize + routed_scaling — the router
 shape Laguna's sigmoid-routed MoE crashed on before the vLLM-side
@@ -2918,7 +2941,7 @@ and unpermute equal to the direct weighted sum — row order within an expert
 is free by construction). All green, suite PASS. Elementwise/scatter-bound;
 covered by the existing moe_route bench branch.
 
-## 2026-08-10: top_k_renorm + top_p_renorm (C6)
+## 2026-08-10: top_k_renorm + top_p_renorm (C6) — UNLABELED
 
 Threshold formulations (per the vLLM/FlashInfer renorm lineage, translated):
 top-k finds the k-th value by iterative masked max and keeps >= it (ties
@@ -2930,7 +2953,7 @@ minimal). The fused bias/penalties/sample composite remains planned; the
 existing sample_categorical/top_k_sample ops cover the sampling step. All
 green, suite PASS.
 
-## 2026-08-10: lora_apply (C7) + the DeepSeek-family deferral ledger
+## 2026-08-10: lora_apply (C7) + the DeepSeek-family deferral ledger — UNLABELED
 
 lora_apply: BGMV shrink (fp32 out, scaled) + expand (slice offset/stride for
 fused-QKV destinations, accumulate-into-base), per-row adapter ids with -1
@@ -2949,7 +2972,7 @@ coherent unit with a DeepSeek bring-up that can exercise real shapes and
 oracles. Mamba1 varlen selective_scan stays deferred for the same reason
 (superseded by native SSD for every model on the box).
 
-## 2026-08-10: Wave D — dsv4_hc_post landed; pre/comb deferred (ledger)
+## 2026-08-10: Wave D — dsv4_hc_post landed; pre/comb deferred (ledger) — UNLABELED
 
 dsv4_hc_post implements the mhc_post source's own documented formula (a pure
 stream-axis contraction, fp64-oracle-testable standalone); all green. The
@@ -2961,7 +2984,7 @@ evidence. Both stay planned; sources pinned (vllm-xpu-kernels dffcab7); the
 D5 split-K rewrite design (bf16 joint_matrix on xmx_tile, caller scratch)
 is recorded in the plan for when the bring-up happens.
 
-## 2026-08-10: Wave E — oneDNN int4/fp4/w8a8 vendor variants: probed, blocked, deferred (ledger)
+## 2026-08-10: Wave E — oneDNN int4/fp4/w8a8 vendor variants: probed, blocked, deferred (ledger) — UNLABELED
 
 Actual on-B60 attempt per the house rule (never mark unsupported from
 inherited wisdom): system oneDNN 3.11.2 exposes the s4/u4 data types, but
@@ -2980,7 +3003,7 @@ port — and stay planned with this probe as the recorded blocker
 existing co-equal vendor variants (gelu, softmax, layernorm, dense_gemm,
 qgemm_int8, fp8_gemm) already exercise the vendor architecture end-to-end.
 
-## 2026-08-10: PORT CAMPAIGN CLOSE-OUT
+## 2026-08-10: PORT CAMPAIGN CLOSE-OUT — UNLABELED
 
 The vLLM-XPU -> QuixiCore-XPU port plan (plan file
 make-a-plan-to-federated-hearth.md) is complete: Waves 0/A/B/C/D/F landed
