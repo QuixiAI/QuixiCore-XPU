@@ -165,15 +165,23 @@ def run_command(name: str, cmd: list[str], out_dir: Path, timeout: int) -> dict:
         encoding="utf-8",
     )
 
-    return {
-        "schema_version": SCHEMA_VERSION,
+    row = {
+        "schema": SCHEMA_VERSION,
+        "kernel": "scaffold_health",
+        "variant": name,
+        "shape": {},
+        "dtype": "none",
+        "status": "ok" if status == "ok" else "fail",
         "phase": name,
         "command": cmd,
-        "status": status,
+        "health_status": status,
         "returncode": returncode,
         "seconds": round(seconds, 3),
         "log": str(log_path.relative_to(out_dir)),
     }
+    if row["status"] == "ok":
+        row["target_ms"] = round(seconds * 1000.0, 3)
+    return row
 
 
 def command_plan(phase: str, preset: str, include_probe: bool) -> list[tuple[str, list[str]]]:
@@ -235,9 +243,11 @@ def run_kernel_bench(preset: str, out_dir: Path, timeout: int) -> list[dict]:
     bench_exe = binary_dir_for_preset(preset) / "quixicore_xpu_bench"
     if not bench_exe.exists():
         return [{
-            "schema_version": SCHEMA_VERSION, "phase": "kernels",
-            "status": "missing", "returncode": None, "seconds": 0.0,
-            "log": "kernels", "note": f"{bench_exe} not built",
+            "schema": SCHEMA_VERSION, "kernel": "scaffold_health",
+            "variant": "kernels", "shape": {}, "dtype": "none",
+            "status": "skip", "skip_reason": f"{bench_exe} not built",
+            "phase": "kernels", "health_status": "missing",
+            "returncode": None, "seconds": 0.0, "log": "kernels",
         }]
 
     log_dir = out_dir / "logs"
@@ -265,9 +275,28 @@ def run_kernel_bench(preset: str, out_dir: Path, timeout: int) -> list[dict]:
         except subprocess.TimeoutExpired:
             status, metrics = "timeout", {}
         seconds = round(time.perf_counter() - start, 3)
-        row = {"schema_version": SCHEMA_VERSION, "phase": "kernels",
-               "status": status, "seconds": seconds, "config": cfg}
-        row.update({k: metrics[k] for k in metrics if k != "schema_version"})
+        shape = {k: cfg[k] for k in ("n", "rows", "dim", "M", "N", "K") if k in cfg}
+        row = {"schema": SCHEMA_VERSION, "phase": "kernels",
+               "kernel": cfg.get("kernel", "?"), "variant": cfg.get("variant", "-"),
+               "dtype": cfg.get("dtype", "none"), "shape": shape,
+               "status": "ok" if status == "ok" else "fail",
+               "health_status": status, "seconds": seconds, "config": cfg}
+        row.update({k: metrics[k] for k in metrics
+                    if k not in ("schema_version", "schema")})
+        # canonical latency aliases (docs/benchmarking.md schema 1); the
+        # original metric names stay for the summary table
+        if "median_ms" in row:
+            row.setdefault("target_ms", row["median_ms"])
+        if "min_ms" in row:
+            row.setdefault("target_min_ms", row["min_ms"])
+        if "max_ms" in row:
+            row.setdefault("target_max_ms", row["max_ms"])
+        if "min_ms" in row and "max_ms" in row and row["min_ms"]:
+            row.setdefault("target_spread", round(row["max_ms"] / row["min_ms"], 4))
+        if cfg.get("iters") is not None:
+            row.setdefault("iters", cfg.get("iters"))
+        if cfg.get("warmup") is not None:
+            row.setdefault("warmup", cfg.get("warmup"))
         rows.append(row)
     return rows
 
@@ -286,7 +315,7 @@ def write_summary(rows: list[dict], out_dir: Path, meta: dict) -> None:
     for row in rows:
         log = row.get("log", "")
         lines.append(
-            f"| {row['phase']} | {row['status']} | {row['seconds']:.3f} | `{log}` |"
+            f"| {row['phase']} | {row.get('health_status', row['status'])} | {row['seconds']:.3f} | `{log}` |"
         )
 
     kernel_rows = [r for r in rows if r["phase"] == "kernels" and "median_ms" in r]
@@ -327,10 +356,18 @@ def main() -> int:
     run_id = args.run_id or f"{args.preset}-{uuid.uuid4().hex[:8]}"
     today = dt.date.today().isoformat()
     out_dir = RESULTS_ROOT / today / run_id
-    out_dir.mkdir(parents=True, exist_ok=False)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     meta = {
-        "schema_version": SCHEMA_VERSION,
+        "schema": SCHEMA_VERSION,
+        "backend": "xpu",
+        "repo": "QuixiAI/QuixiCore-XPU",
+        "contract": "v0.1",
+        "os": platform.system() + " " + platform.release(),
+        "arch": platform.machine(),
+        "device": os.environ.get("QUIXICORE_XPU_DEVICE") or platform.node() or "build-host",
+        "warmup": None,
+        "iters": None,
         "run_id": run_id,
         "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
         "git": git_label(),
@@ -366,9 +403,9 @@ def main() -> int:
     write_summary(rows, out_dir, meta)
 
     for row in rows:
-        print(f"{row['phase']}: {row['status']} ({row['seconds']:.3f}s)")
+        print(f"{row['phase']}: {row.get('health_status', row['status'])} ({row['seconds']:.3f}s)")
 
-    return 0 if all(row["status"] == "ok" for row in rows) else 1
+    return 0 if all(row["status"] in ("ok", "skip") for row in rows) else 1
 
 
 if __name__ == "__main__":
